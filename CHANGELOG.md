@@ -17,7 +17,24 @@ All notable changes to `vst3-host` are documented here. The format is based on
   unaffected because they drive their own event loop. Verified end-to-end against sfizz
   (VSTGUI): the editor paints, its knobs and file dialog respond, and audio renders. Timers
   and fd handlers are serviced snapshot-then-invoke so a callback can safely re-register from
-  inside itself (VSTGUI does). No-op on non-Linux and under process isolation.
+  inside itself (VSTGUI does). No-op on non-Linux and under process isolation. Contributed by
+  [@Rodvader8](https://github.com/Rodvader8) ([#10]).
+
+### Fixed
+
+- **`outputParameterChanges` is cleared before each process block.** The container is reused
+  across blocks; without a reset, a plugin emitting output parameter changes for the same id
+  every block kept being handed its own already-active queue and appending to it — mixing
+  stale points into later blocks, making sample offsets describe more than the current block,
+  and growing point storage without bound (so the audio thread could reallocate long after
+  warm-up). The clear resets the active count only, so pooled queues keep their capacity and
+  the reset stays allocation-free. Reported by [@Boscop](https://github.com/Boscop) ([#8],
+  fixed in [#9]).
+- The Linux run-loop registry is cleared in `close_editor`, so a plugin that doesn't
+  unregister its own event handlers or timers can't leave the host dispatching into a removed
+  view on the next `service_run_loop()`.
+
+## [0.7.0] - 2026-07-14
 
 ### Added
 
@@ -356,3 +373,6 @@ offline audio I/O, richer process isolation, metering, and a much more capable i
 [#4]: https://github.com/HelgeSverre/rust-vst3-host/issues/4
 [#6]: https://github.com/HelgeSverre/rust-vst3-host/issues/6
 [#7]: https://github.com/HelgeSverre/rust-vst3-host/pull/7
+[#8]: https://github.com/HelgeSverre/rust-vst3-host/issues/8
+[#9]: https://github.com/HelgeSverre/rust-vst3-host/pull/9
+[#10]: https://github.com/HelgeSverre/rust-vst3-host/pull/10

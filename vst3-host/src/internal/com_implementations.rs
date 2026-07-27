@@ -1281,6 +1281,7 @@ mod plug_frame_tests {
         // Null size is rejected and leaves the slot unchanged.
         let r = unsafe { frame.resizeView(std::ptr::null_mut(), std::ptr::null_mut()) };
         assert_eq!(r, kResultFalse);
+        assert_eq!(*slot.lock().unwrap(), Some((640, 480)));
     }
 
     #[cfg(target_os = "linux")]

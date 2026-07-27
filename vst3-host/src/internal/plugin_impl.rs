@@ -1472,6 +1472,16 @@ impl PluginInternal for PluginImpl {
                 view.removed();
             }
         }
+        // Drop any run-loop registrations the editor left behind. A well-behaved plugin
+        // unregisters its own handlers and timers during `removed()`, but one that doesn't would
+        // otherwise leave live ComPtrs into a view that no longer exists — and since
+        // `Plugin::service_run_loop` is public with no editor-open guard, a host driving it from
+        // its frame loop would then dispatch straight into the removed view.
+        #[cfg(target_os = "linux")]
+        if let Ok(mut reg) = self.run_loop.lock() {
+            reg.handlers.clear();
+            reg.timers.clear();
+        }
         Ok(())
     }
 
