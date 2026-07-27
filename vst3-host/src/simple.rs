@@ -249,10 +249,19 @@ pub fn discover_plugins_in<P: AsRef<Path>>(path: P) -> Result<Vec<PluginInfo>> {
     host.discover_plugins()
 }
 
-/// Get information about a specific plugin without loading it.
+/// Read a plugin's metadata by loading it in this process.
 ///
-/// This is useful for checking plugin compatibility or displaying plugin
-/// information before deciding whether to load it.
+/// # This loads the plugin
+///
+/// Despite reading like a cheap lookup, this performs a full in-process load — the plugin's
+/// own initialization code runs inside your process. A plugin that `abort()`s or makes a
+/// pure-virtual call while initializing (a licensed plugin failing its auth check, say) takes
+/// the host down with it, and no Rust `catch_unwind` can prevent that.
+///
+/// For an untrusted plugin use [`crate::discovery::probe_plugin_info_isolated`], which does the
+/// same introspection in a throwaway child process, or
+/// [`crate::discovery::discover_plugins_safe`] to scan a whole folder that way. Use this
+/// function when you already trust the plugin (or intend to load it regardless).
 ///
 /// # Arguments
 /// * `path` - Path to the VST3 plugin
@@ -326,6 +335,41 @@ pub fn is_valid_plugin<P: AsRef<Path>>(path: P) -> bool {
     false
 }
 
+/// Upper bound on one offline render, in total `f32` samples across all output channels.
+///
+/// The `.wav` container itself tops out at a 4 GiB `u32` chunk size, so a render past this
+/// could not be written back out anyway. Bounding it here turns an allocator abort into an
+/// error a caller can handle.
+const MAX_RENDER_SAMPLES: usize = (u32::MAX / 4) as usize;
+
+/// Frame count for an offline render of `duration_secs`, rejecting the durations that would
+/// otherwise reach `Vec::with_capacity` as a request no allocator can serve.
+///
+/// `duration_secs` comes straight from a caller: `f64::INFINITY` saturates through `as usize`
+/// to `usize::MAX` (a capacity-overflow panic), `f64::NAN` casts to `0` and silently renders
+/// nothing, and any absurd-but-finite value asks for tens of gigabytes.
+fn render_frame_count(duration_secs: f64, sample_rate: f64, out_channels: usize) -> Result<usize> {
+    if !duration_secs.is_finite() || duration_secs < 0.0 {
+        return Err(Error::InvalidParameter(format!(
+            "duration must be finite and non-negative, got {duration_secs}"
+        )));
+    }
+    let frames = (duration_secs * sample_rate).round();
+    if !frames.is_finite() || frames < 0.0 {
+        return Err(Error::InvalidParameter(format!(
+            "duration {duration_secs}s at {sample_rate} Hz is not a renderable frame count"
+        )));
+    }
+    let max_frames = MAX_RENDER_SAMPLES / out_channels.max(1);
+    if frames > max_frames as f64 {
+        return Err(Error::InvalidParameter(format!(
+            "duration {duration_secs}s at {sample_rate} Hz is {frames} frames across \
+             {out_channels} channels, past the {max_frames}-frame render limit"
+        )));
+    }
+    Ok(frames as usize)
+}
+
 /// Render a plugin offline to a 32-bit float WAV file.
 ///
 /// Drives `process_audio` faster-than-realtime for `duration_secs` (at the plugin's
@@ -333,6 +377,9 @@ pub fn is_valid_plugin<P: AsRef<Path>>(path: P) -> bool {
 /// the output to `path`. Any `midi` events are sent at the start — pass a held `NoteOn` to
 /// bounce an instrument, or an empty slice for an effect (feed input via the lower-level
 /// `process_audio` loop if you need to process a signal). No audio hardware is used.
+///
+/// `duration_secs` must be finite, non-negative, and short enough that the rendered audio
+/// fits a `.wav` file; anything else is an [`Error::InvalidParameter`].
 ///
 /// ```no_run
 /// use vst3_host::{simple, midi::{MidiEvent, MidiChannel}};
@@ -349,13 +396,10 @@ pub fn render_to_wav<P: AsRef<Path>>(
     midi: &[MidiEvent],
     path: P,
 ) -> Result<()> {
-    if duration_secs < 0.0 {
-        return Err(Error::Other("duration must be non-negative".to_string()));
-    }
     let sample_rate = plugin.sample_rate();
     let block = plugin.block_size().max(1);
     let out_channels = plugin.output_channel_count().max(1);
-    let total_frames = (duration_secs * sample_rate).round() as usize;
+    let total_frames = render_frame_count(duration_secs, sample_rate, out_channels)?;
 
     plugin.start_processing()?;
     for &event in midi {
@@ -382,7 +426,8 @@ pub fn render_to_wav<P: AsRef<Path>>(
 
 /// Offline-render a plugin to a WAV while feeding its audio input from an [`InputSource`]
 /// (a generated test signal or a loaded file) — for auditioning/regression-testing effects
-/// with a known input. Like [`render_to_wav`] but with `input_channels` filled each block.
+/// with a known input. Like [`render_to_wav`] but with `input_channels` filled each block,
+/// and with the same limits on `duration_secs`.
 ///
 /// [`InputSource`]: crate::audio::InputSource
 pub fn render_to_wav_with_input<P: AsRef<Path>>(
@@ -392,14 +437,11 @@ pub fn render_to_wav_with_input<P: AsRef<Path>>(
     source: &mut dyn crate::audio::InputSource,
     path: P,
 ) -> Result<()> {
-    if duration_secs < 0.0 {
-        return Err(Error::Other("duration must be non-negative".to_string()));
-    }
     let sample_rate = plugin.sample_rate();
     let block = plugin.block_size().max(1);
     let out_channels = plugin.output_channel_count().max(1);
     let in_channels = plugin.info().audio_inputs.max(1) as usize;
-    let total_frames = (duration_secs * sample_rate).round() as usize;
+    let total_frames = render_frame_count(duration_secs, sample_rate, out_channels)?;
 
     plugin.start_processing()?;
     for &event in midi {
@@ -439,6 +481,37 @@ mod tests {
         assert!(!is_valid_plugin("plugin.so"));
 
         // Would need actual plugin files to test positive cases
+    }
+
+    /// `duration_secs` reaches `Vec::with_capacity` through an `as usize` cast that saturates:
+    /// `INFINITY` became `usize::MAX` (a capacity-overflow panic), `NAN` became `0` (a silent
+    /// empty render), and any absurd finite value asked the allocator for tens of gigabytes.
+    #[test]
+    fn render_frame_count_rejects_unrenderable_durations() {
+        for bad in [
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            -1.0,
+            1.0e12,
+            f64::MAX,
+        ] {
+            assert!(
+                render_frame_count(bad, 44_100.0, 2).is_err(),
+                "duration {bad} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn render_frame_count_accepts_ordinary_durations() {
+        assert_eq!(render_frame_count(0.0, 44_100.0, 2).unwrap(), 0);
+        assert_eq!(render_frame_count(2.0, 44_100.0, 2).unwrap(), 88_200);
+        assert_eq!(render_frame_count(0.5, 48_000.0, 6).unwrap(), 24_000);
+        // Right at the limit: the largest render that still fits a .wav.
+        let max_frames = MAX_RENDER_SAMPLES / 2;
+        let secs = max_frames as f64 / 44_100.0;
+        assert!(render_frame_count(secs, 44_100.0, 2).is_ok());
     }
 
     #[test]

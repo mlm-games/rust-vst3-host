@@ -148,7 +148,16 @@ impl<'a> ParameterUpdate<'a> {
         self
     }
 
-    /// Apply all parameter updates
+    /// Apply the queued parameter updates, in the order they were [`set`](Self::set).
+    ///
+    /// # This batch is not atomic
+    ///
+    /// The first failure stops the batch and is returned. The updates queued *before* it have
+    /// already reached the plugin and are **not** rolled back; the ones after it were never
+    /// attempted, and the error does not say how far the batch got. Call
+    /// [`Plugin::set_parameter`](crate::Plugin::set_parameter) per parameter if you need to
+    /// know which landed, or re-read them with
+    /// [`Plugin::get_parameters`](crate::Plugin::get_parameters) afterwards.
     pub fn apply(self) -> Result<()> {
         for (id, value) in self.updates {
             self.plugin.set_parameter(id, value)?;
@@ -318,7 +327,9 @@ impl ParameterAutomation {
             let offset = ((i as u128 * frames as u128) / n as u128) as usize;
             let time = block_start_secs + offset as f64 / sample_rate;
             if let Some(value) = self.value_at_time(time) {
-                out.push((offset as i32, value));
+                // Saturating: a `frames` past `i32::MAX` wraps into a negative sample offset,
+                // which `Plugin::set_parameter_at` would carry into the plugin's event list.
+                out.push((offset.min(i32::MAX as usize) as i32, value));
             }
         }
         out
@@ -374,7 +385,8 @@ mod tests {
     }
 
     /// `frames` reaches here from `Timeline::advance_block`, so the sub-block offset maths must
-    /// not overflow on an absurd block length.
+    /// not overflow on an absurd block length — and the offsets it emits must stay a valid
+    /// sample offset, not a value wrapped negative by the `as i32` cast.
     #[test]
     fn points_for_block_survives_an_absurd_block_length() {
         let a = ParameterAutomation::new()
@@ -382,6 +394,13 @@ mod tests {
             .add_point(1.0, 1.0);
         let points = a.points_for_block(0.0, usize::MAX, 48_000.0, 4);
         assert!(points.iter().all(|(_, v)| v.is_finite()));
+        assert!(
+            points.iter().all(|(offset, _)| *offset >= 0),
+            "offsets wrapped negative: {points:?}"
+        );
+        // The offsets are still ordered, saturating at the largest offset VST3 can express.
+        assert!(points.windows(2).all(|w| w[0].0 <= w[1].0));
+        assert_eq!(points.last().map(|(offset, _)| *offset), Some(i32::MAX));
     }
 
     #[test]

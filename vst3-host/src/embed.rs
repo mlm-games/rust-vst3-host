@@ -75,7 +75,11 @@ impl EmbeddedEditor {
     }
 
     /// Reposition/resize the embedded editor to track `rect`. Call each frame so the editor
-    /// follows the host layout (scroll, window resize). No-op off macOS.
+    /// follows the host layout (scroll, window resize).
+    ///
+    /// Implemented on macOS, Windows and Linux/X11 — the same platforms
+    /// [`Self::embed`] supports. A no-op on any other platform, where `embed` cannot have
+    /// succeeded in the first place.
     pub fn set_rect(&self, rect: EditorRect) {
         #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
         self.inner.set_rect(rect);
@@ -135,9 +139,14 @@ mod macos {
             let child = NSView::initWithFrame(NSView::alloc(mtm), frame);
             parent.addSubview(&child);
 
-            let handle = crate::plugin::WindowHandle::from_nsview(
-                Retained::as_ptr(&child) as *mut std::ffi::c_void
-            );
+            // SAFETY: `child` is a live NSView, retained by this `MacEmbed` for as long as the
+            // editor is attached — `Drop` removes it from its superview only after
+            // `EmbeddedEditor::drop` has closed the editor.
+            let handle = unsafe {
+                crate::plugin::WindowHandle::from_nsview(
+                    Retained::as_ptr(&child) as *mut std::ffi::c_void
+                )
+            };
             plugin
                 .lock()
                 .map_err(|_| Error::Other("plugin lock poisoned".to_string()))?
@@ -232,6 +241,8 @@ mod windows {
                     return Err(Error::Other("Failed to create child window".to_string()));
                 }
 
+                // SAFETY: `child` was just created above and null-checked; it is destroyed only
+                // after the editor is detached (the error arm below, or `Drop`).
                 let handle = crate::plugin::WindowHandle::from_hwnd(child as *mut std::ffi::c_void);
                 if let Err(e) = plugin
                     .lock()

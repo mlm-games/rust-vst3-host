@@ -8,6 +8,22 @@ use crate::{
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+/// Ceiling on the output channel count this host will size meters and buffers from.
+///
+/// Matches the isolation layer's own wire limit. The channel count of an isolated plugin is
+/// whatever the helper says it is, and this boundary sizes an allocation from it directly, so
+/// it defends itself rather than trusting the peer to have clamped first.
+const MAX_OUTPUT_CHANNELS: usize = 256;
+
+/// Turn a reported output channel count into one this host can size buffers from: fall back
+/// to stereo when the plugin reports none, and never exceed [`MAX_OUTPUT_CHANNELS`].
+fn clamp_output_channels(reported: i32) -> usize {
+    match reported {
+        n if n <= 0 => 2,
+        n => (n as usize).min(MAX_OUTPUT_CHANNELS),
+    }
+}
+
 /// VST3 host instance
 pub struct Vst3Host {
     /// Audio configuration
@@ -182,6 +198,9 @@ impl Vst3Host {
     /// The probe timeout per plugin defaults to
     /// [`DEFAULT_PROBE_TIMEOUT`](crate::discovery::DEFAULT_PROBE_TIMEOUT); override it with
     /// [`Vst3HostBuilder::probe_timeout`].
+    ///
+    /// If the `vst3-host-probe` binary cannot be located the scan never runs; the report is
+    /// empty and says why in [`SafeDiscoveryReport::error`](crate::discovery::SafeDiscoveryReport::error).
     pub fn discover_plugins_safe(&self) -> crate::discovery::SafeDiscoveryReport {
         let mut all_paths = self.custom_paths.clone();
         if self.scan_default_paths {
@@ -331,11 +350,7 @@ impl Vst3Host {
                     has_midi_input,
                     has_midi_output,
                 };
-                let channels = if output_channels > 0 {
-                    output_channels as usize
-                } else {
-                    2
-                };
+                let channels = clamp_output_channels(output_channels);
                 (info, channels)
             }
             HostResponse::Error { message } => {
@@ -454,13 +469,14 @@ impl Vst3HostBuilder {
     }
 
     /// Set the transport time signature advertised to plugins in the host
-    /// `ProcessContext` (`num`/`den`, e.g. `4, 4`). Defaults to `4/4`. Non-positive values
-    /// are ignored (a malformed time signature), keeping the previous setting.
+    /// `ProcessContext` (`num`/`den`, e.g. `4, 4`). Defaults to `4/4`.
+    ///
+    /// Validated by [`Self::build`] against the same rule every runtime entry point applies
+    /// (see [`Plugin::set_time_signature`](crate::Plugin::set_time_signature)): `num` positive
+    /// and `den` one of `1, 2, 4, 8, 16`.
     pub fn time_signature(mut self, num: i32, den: i32) -> Self {
-        if num > 0 && den > 0 {
-            self.config.time_sig_numerator = num;
-            self.config.time_sig_denominator = den;
-        }
+        self.config.time_sig_numerator = num;
+        self.config.time_sig_denominator = den;
         self
     }
 
@@ -528,11 +544,14 @@ impl Vst3HostBuilder {
 
     /// Build the configured host.
     ///
-    /// Rejects a sample rate or block size the plugin setup can't honour, using the same rules as
-    /// [`Plugin::reconfigure`](crate::Plugin::reconfigure) — the two configuration entry points
-    /// previously disagreed, so a `block_size(0)` accepted here produced permanent silence and a
-    /// `sample_rate(0.0)` reached `setupProcessing`, where plugins computing `1.0 / sampleRate`
-    /// generate NaN coefficients.
+    /// Rejects a sample rate, block size or time signature the plugin setup can't honour, using
+    /// the same rules as the corresponding runtime entry points
+    /// ([`Plugin::reconfigure`](crate::Plugin::reconfigure),
+    /// [`Plugin::set_time_signature`](crate::Plugin::set_time_signature)) — the configuration
+    /// entry points previously disagreed, so a `block_size(0)` accepted here produced permanent
+    /// silence, a `sample_rate(0.0)` reached `setupProcessing` where plugins computing
+    /// `1.0 / sampleRate` generate NaN coefficients, and a `time_signature(4, 3)` built a host
+    /// whose transport every runtime setter refuses.
     pub fn build(self) -> Result<Vst3Host> {
         if !self.config.sample_rate.is_finite() || self.config.sample_rate <= 0.0 {
             return Err(Error::InvalidParameter(format!(
@@ -545,6 +564,18 @@ impl Vst3HostBuilder {
                 "block size must be in 1..={}, got {}",
                 i32::MAX,
                 self.config.block_size
+            )));
+        }
+        if self.config.time_sig_numerator <= 0 {
+            return Err(Error::InvalidParameter(format!(
+                "time signature numerator must be positive, got {}",
+                self.config.time_sig_numerator
+            )));
+        }
+        if !matches!(self.config.time_sig_denominator, 1 | 2 | 4 | 8 | 16) {
+            return Err(Error::InvalidParameter(format!(
+                "time signature denominator must be one of 1, 2, 4, 8, 16, got {}",
+                self.config.time_sig_denominator
             )));
         }
         Ok(Vst3Host {
@@ -705,6 +736,37 @@ mod tests {
         assert_eq!(host.config().tempo, 120.0);
         assert_eq!(host.config().time_sig_numerator, 4);
         assert_eq!(host.config().time_sig_denominator, 4);
+    }
+
+    /// The builder used to accept any positive denominator, so a `4/3` host built fine and then
+    /// had a transport that `Plugin::set_time_signature` and `RtControl` both refuse.
+    #[test]
+    fn builder_rejects_time_signatures_the_runtime_rejects() {
+        for (num, den) in [(4, 3), (4, 0), (0, 4), (-1, 4), (4, 5), (4, 32), (4, -4)] {
+            let built = Vst3HostBuilder::default().time_signature(num, den).build();
+            assert!(
+                built.is_err(),
+                "builder accepted {num}/{den}, which every runtime setter rejects"
+            );
+        }
+        // The denominators VST3 transports actually express still build.
+        for den in [1, 2, 4, 8, 16] {
+            assert!(Vst3HostBuilder::default()
+                .time_signature(3, den)
+                .build()
+                .is_ok());
+        }
+    }
+
+    /// The isolated load path sizes an `AudioLevels` allocation from a count the helper reports,
+    /// so this boundary clamps it instead of trusting the peer.
+    #[test]
+    fn output_channel_count_from_a_peer_is_clamped() {
+        assert_eq!(clamp_output_channels(2), 2);
+        assert_eq!(clamp_output_channels(0), 2);
+        assert_eq!(clamp_output_channels(-5), 2);
+        assert_eq!(clamp_output_channels(MAX_OUTPUT_CHANNELS as i32), 256);
+        assert_eq!(clamp_output_channels(i32::MAX), MAX_OUTPUT_CHANNELS);
     }
 
     #[test]

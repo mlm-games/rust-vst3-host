@@ -430,9 +430,16 @@ pub mod cc {
     pub const POLY_MODE_ON: u8 = 127;
 }
 
-/// Convert MIDI note number to note name
-/// Using the convention where C3 = MIDI 60
+/// Convert a MIDI note number to its note name, using the convention where C3 = MIDI 60.
+///
+/// The MIDI note domain is `0..=127`; the parameter is a `u8`, so larger values are
+/// representable and are rendered as `"Invalid(<n>)"`. They used to be given a fabricated
+/// name (`"D#19"` for 255) that [`name_to_note`] correctly rejects, silently breaking the
+/// round trip at the boundary where a note number becomes text and back.
 pub fn note_to_name(note: u8) -> String {
+    if note > 127 {
+        return format!("Invalid({note})");
+    }
     let note_names = [
         "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
     ];
@@ -696,6 +703,28 @@ mod tests {
         // Round-trip every note through its own name.
         for n in 0..=127u8 {
             assert_eq!(name_to_note(&note_to_name(n)), Some(n), "round-trip {n}");
+        }
+    }
+
+    /// `note_to_name` takes a `u8`, so 128..=255 are representable but outside the MIDI note
+    /// domain. They used to be given a fabricated name ("D#19") that `name_to_note` rejects,
+    /// so the two functions disagreed about what a valid note name is.
+    #[test]
+    fn note_to_name_marks_out_of_domain_notes_instead_of_fabricating_one() {
+        for n in 128..=255u8 {
+            let name = note_to_name(n);
+            assert_eq!(name, format!("Invalid({n})"));
+            assert_eq!(
+                name_to_note(&name),
+                None,
+                "{name} must not parse back as a note"
+            );
+        }
+        // And the domain that does round-trip is unchanged, in both directions.
+        for n in 0..=127u8 {
+            let name = note_to_name(n);
+            assert!(!name.starts_with("Invalid"), "note {n} rendered as {name}");
+            assert_eq!(name_to_note(&name), Some(n), "round-trip {n}");
         }
     }
 

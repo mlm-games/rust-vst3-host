@@ -109,7 +109,7 @@ pub use playback::{
 };
 pub use plugin::{
     OutputMidiConsumer, ParameterEdit, ParameterEditKind, Plugin, PluginInfo, PluginPreset,
-    PluginUnit, ProcessMode, WindowHandle,
+    PluginUnit, ProcessMode, RestartFlags, WindowHandle,
 };
 pub use realtime::{RealtimePluginRunner, RtControl};
 pub use transport::{AutomationLane, BlockEvents, MidiClip, Timeline};

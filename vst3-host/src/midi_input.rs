@@ -106,8 +106,10 @@ pub fn list_midi_input_ports() -> Result<Vec<MidiInputPort>> {
 
 /// Open `port` and deliver each parseable incoming message to `callback` as a [`MidiEvent`].
 ///
-/// Raw bytes are parsed with [`MidiEvent::from_midi_bytes`]; messages that don't parse (SysEx,
-/// realtime, program change, truncated data) are silently ignored.
+/// Raw bytes are parsed with [`MidiEvent::from_midi_bytes`], which covers every channel-voice
+/// message — note on/off, control change, program change, pitch bend, and both aftertouch
+/// forms. Anything else (SysEx, system/realtime, running status, truncated data) does not
+/// parse and is silently ignored.
 ///
 /// `callback` runs on a `midir`-owned thread — see the [module docs](self#threading). It must be
 /// `Send + 'static`. The returned [`MidiInputConnection`] keeps the port open until dropped.

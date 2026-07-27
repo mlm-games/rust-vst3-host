@@ -530,6 +530,19 @@ pub struct SafeDiscoveryReport {
     pub plugins: Vec<DetailedPluginInfo>,
     /// Plugins that were skipped (crashed / timed out / failed), with the reason.
     pub skipped: Vec<SafeDiscoverySkip>,
+    /// Why the scan could not run at all, if it could not — the probe binary was missing or
+    /// unusable, so **no plugin was examined**. An empty report with `error: None` means the
+    /// scan ran and found nothing; an empty report with `error: Some(..)` means it never ran,
+    /// and a host should say so rather than claim there are no plugins installed.
+    pub error: Option<String>,
+}
+
+impl SafeDiscoveryReport {
+    /// Whether the scan actually ran. `false` means [`Self::error`] explains why not, and
+    /// [`Self::plugins`] / [`Self::skipped`] are empty for that reason alone.
+    pub fn scan_ran(&self) -> bool {
+        self.error.is_none()
+    }
 }
 
 /// Whether this executable is itself running from a cargo `target/{debug,release}` tree — i.e.
@@ -634,9 +647,21 @@ enum ProbeOutcome {
     Failed(String),
 }
 
+/// Extra time allowed for the probe's already-written output to reach us after the child has
+/// exited, when the timeout budget is already spent. Bounded, unlike waiting for pipe EOF.
+const PROBE_OUTPUT_GRACE: Duration = Duration::from_millis(250);
+
 /// Run the probe binary against one plugin path with a timeout, returning the parsed
 /// outcome. The crash of a misbehaving plugin kills *the probe child*, surfacing here as
 /// [`ProbeOutcome::Crashed`] rather than taking down this process.
+///
+/// Every wait here is bounded. A plugin that spawns a grandchild (a license daemon, say)
+/// hands it the inherited stdout pipe, whose write end then stays open after the probe itself
+/// exits or is killed — so a read-to-EOF, or a `join()` on the thread performing it, would
+/// outlive the timeout by the grandchild's lifetime and defeat the very timeout the safe scan
+/// exists for. The reader thread is therefore detached and reports through a channel we only
+/// ever wait on with a deadline; it reads a line at a time so the probe's single JSON line
+/// arrives without EOF.
 fn run_probe(probe: &Path, plugin: &Path, timeout: Duration) -> ProbeOutcome {
     use std::process::{Command, Stdio};
 
@@ -651,27 +676,41 @@ fn run_probe(probe: &Path, plugin: &Path, timeout: Duration) -> ProbeOutcome {
         Err(e) => return ProbeOutcome::Failed(format!("failed to spawn probe: {e}")),
     };
 
-    // Read stdout on a thread so we can enforce a wall-clock timeout on the child.
+    // Read stdout on a detached thread so we can enforce a wall-clock timeout on the child.
     let stdout = match child.stdout.take() {
         Some(s) => s,
-        None => return ProbeOutcome::Failed("probe produced no stdout pipe".to_string()),
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return ProbeOutcome::Failed("probe produced no stdout pipe".to_string());
+        }
     };
     let (tx, rx) = std::sync::mpsc::channel::<String>();
-    let reader = std::thread::spawn(move || {
-        use std::io::Read;
-        let mut buf = String::new();
-        let mut stdout = stdout;
-        let _ = stdout.read_to_string(&mut buf);
-        let _ = tx.send(buf);
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let mut line = String::new();
+        // One JSON object on one line is the probe's entire protocol, so a line read (rather
+        // than read-to-end) completes as soon as it is written, whoever else holds the pipe.
+        let mut reader = std::io::BufReader::new(stdout);
+        let _ = reader.read_line(&mut line);
+        // The receiver is gone once `run_probe` has returned; dropping the line is correct.
+        let _ = tx.send(line);
     });
+
+    /// Time left before `deadline`, never zero: a bounded grace so output the child already
+    /// wrote is not thrown away just because the budget ran out at the same moment.
+    fn remaining(deadline: std::time::Instant) -> Duration {
+        deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .max(PROBE_OUTPUT_GRACE)
+    }
 
     let deadline = std::time::Instant::now() + timeout;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                // Child exited; collect whatever it printed.
-                let output = rx.recv().unwrap_or_default();
-                let _ = reader.join();
+                // Child exited; collect what it printed, still under a deadline.
+                let output = rx.recv_timeout(remaining(deadline)).unwrap_or_default();
                 if status.success() {
                     let line = output.trim();
                     return match serde_json::from_str::<DetailedPluginInfo>(line) {
@@ -690,14 +729,13 @@ fn run_probe(probe: &Path, plugin: &Path, timeout: Duration) -> ProbeOutcome {
                 if std::time::Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    let _ = reader.join();
                     return ProbeOutcome::TimedOut;
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
             Err(e) => {
                 let _ = child.kill();
-                let _ = reader.join();
+                let _ = child.wait();
                 return ProbeOutcome::Failed(format!("failed to wait on probe: {e}"));
             }
         }
@@ -737,12 +775,20 @@ pub fn probe_plugin_info_isolated(path: &Path, timeout: Duration) -> Result<Deta
 /// Trade-off: this spawns one `vst3-host-probe` process per plugin, so it is slower than
 /// the in-process [`crate::Vst3Host::discover_plugins`]. Use it for a robust "safe scan"
 /// of an untrusted folder; keep the in-process path for speed when you trust the plugins.
+///
+/// If the probe binary cannot be located the scan cannot run at all: the returned report is
+/// empty and carries the reason in [`SafeDiscoveryReport::error`]. Check
+/// [`SafeDiscoveryReport::scan_ran`] before reporting "no plugins found" — the two are
+/// otherwise indistinguishable.
 pub fn discover_plugins_safe(paths: &[PathBuf], timeout: Duration) -> SafeDiscoveryReport {
     let probe = match find_probe_binary() {
         Ok(p) => p,
         Err(e) => {
             log::warn!("Safe discovery unavailable: {e}");
-            return SafeDiscoveryReport::default();
+            return SafeDiscoveryReport {
+                error: Some(e),
+                ..Default::default()
+            };
         }
     };
 

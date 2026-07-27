@@ -139,6 +139,68 @@ pub struct ParameterEdit {
     pub value: Option<f64>,
 }
 
+/// What a plugin asked the host to re-read, reported through `IComponentHandler::restartComponent`
+/// and drained with [`Plugin::take_restart_flags`].
+///
+/// A plugin raises these when something about it changed behind the host's back — a preset load
+/// that renamed its parameters, a mode switch that changed its latency, an oversampling toggle
+/// that changed its bus layout. **This library records the flags but does not act on any of
+/// them**: reacting is the host's call, since only the host knows whether it can afford to
+/// re-read parameters or rebuild its graph mid-stream. Poll this alongside
+/// [`Plugin::take_parameter_edits`] and respond to the flags you care about:
+///
+/// - [`param_values_changed`](Self::param_values_changed) — re-read values with
+///   [`Plugin::get_parameters`].
+/// - [`param_titles_changed`](Self::param_titles_changed) — re-read the parameter list itself
+///   (ids, names, ranges may all differ).
+/// - [`latency_changed`](Self::latency_changed) — re-read [`Plugin::latency_samples`] and adjust
+///   delay compensation. Requires stopping processing first, per the VST3 spec.
+/// - [`io_changed`](Self::io_changed) — the bus layout changed; re-query
+///   [`Plugin::bus_arrangements`] and reconfigure. Nothing is rebuilt for you.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RestartFlags(i32);
+
+impl RestartFlags {
+    /// Wrap the raw VST3 `RestartFlags` bitmask.
+    pub(crate) fn from_bits(bits: i32) -> Self {
+        Self(bits)
+    }
+
+    /// The raw VST3 bitmask (`Steinberg::Vst::RestartFlags`), for flags this type doesn't name.
+    pub fn bits(self) -> i32 {
+        self.0
+    }
+
+    /// True when the plugin raised no flags since the last drain.
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    fn has(self, flag: i32) -> bool {
+        self.0 & flag != 0
+    }
+
+    /// `kParamValuesChanged`: parameter *values* changed (e.g. a preset was loaded).
+    pub fn param_values_changed(self) -> bool {
+        self.has(vst3::Steinberg::Vst::RestartFlags_::kParamValuesChanged)
+    }
+
+    /// `kParamTitlesChanged`: the parameter list itself changed (ids, names, ranges, count).
+    pub fn param_titles_changed(self) -> bool {
+        self.has(vst3::Steinberg::Vst::RestartFlags_::kParamTitlesChanged)
+    }
+
+    /// `kLatencyChanged`: the plugin's reported latency changed.
+    pub fn latency_changed(self) -> bool {
+        self.has(vst3::Steinberg::Vst::RestartFlags_::kLatencyChanged)
+    }
+
+    /// `kIoChanged`: the plugin's bus configuration changed.
+    pub fn io_changed(self) -> bool {
+        self.has(vst3::Steinberg::Vst::RestartFlags_::kIoChanged)
+    }
+}
+
 /// How the plugin should run: real-time (live playback) or offline (faster-than-real-time
 /// bounce/render). Maps to VST3 `kRealtime` / `kOffline`; plugins may switch quality or
 /// look-ahead accordingly. Defaults to [`ProcessMode::Realtime`].
@@ -312,6 +374,11 @@ pub(crate) trait PluginInternal: Send {
     /// gestures.
     fn take_parameter_edits(&mut self) -> Vec<ParameterEdit> {
         Vec::new()
+    }
+    /// Take the `restartComponent` flags the plugin has raised since the last call. Defaults to
+    /// empty for implementations that don't record them.
+    fn take_restart_flags(&mut self) -> RestartFlags {
+        RestartFlags::default()
     }
     /// Take the MIDI events the plugin has emitted since the last call. Defaults to empty
     /// for implementations that don't capture output MIDI.
@@ -756,12 +823,8 @@ impl Plugin {
 
     /// Send a MIDI note on event
     pub fn send_midi_note(&mut self, note: u8, velocity: u8, channel: MidiChannel) -> Result<()> {
-        if note > 127 {
-            return Err(Error::MidiError(format!("Invalid note number: {}", note)));
-        }
-        if velocity > 127 {
-            return Err(Error::MidiError(format!("Invalid velocity: {}", velocity)));
-        }
+        validate_note(note)?;
+        validate_velocity(velocity)?;
 
         let event = MidiEvent::NoteOn {
             channel,
@@ -773,9 +836,7 @@ impl Plugin {
 
     /// Send a MIDI note off event
     pub fn send_midi_note_off(&mut self, note: u8, channel: MidiChannel) -> Result<()> {
-        if note > 127 {
-            return Err(Error::MidiError(format!("Invalid note number: {}", note)));
-        }
+        validate_note(note)?;
 
         let event = MidiEvent::NoteOff {
             channel,
@@ -787,15 +848,8 @@ impl Plugin {
 
     /// Send a MIDI control change event
     pub fn send_midi_cc(&mut self, controller: u8, value: u8, channel: MidiChannel) -> Result<()> {
-        if controller > 127 {
-            return Err(Error::MidiError(format!(
-                "Invalid controller number: {}",
-                controller
-            )));
-        }
-        if value > 127 {
-            return Err(Error::MidiError(format!("Invalid CC value: {}", value)));
-        }
+        validate_controller(controller)?;
+        validate_cc_value(value)?;
 
         let event = MidiEvent::ControlChange {
             channel,
@@ -805,8 +859,14 @@ impl Plugin {
         self.send_midi_event(event)
     }
 
-    /// Send a generic MIDI event
+    /// Send a generic MIDI event.
+    ///
+    /// Every data field is range-checked against the MIDI spec (`0–127`, or `0–16383` for
+    /// pitch bend) before the event reaches the plugin, the same way
+    /// [`send_midi_note`](Self::send_midi_note) and [`send_midi_cc`](Self::send_midi_cc)
+    /// check theirs.
     pub fn send_midi_event(&mut self, event: MidiEvent) -> Result<()> {
+        validate_midi_event(&event)?;
         self.internal
             .as_mut()
             .ok_or_else(|| Error::Other("Plugin not initialized".to_string()))?
@@ -821,10 +881,12 @@ impl Plugin {
     /// a negative offset is treated as 0, and an offset past the block end is plugin-defined.
     ///
     /// Works both in-process and across process isolation — the offset is carried across the
-    /// boundary and applied by the helper's in-process plugin.
+    /// boundary and applied by the helper's in-process plugin. The event's data fields are
+    /// range-checked exactly as in [`send_midi_event`](Self::send_midi_event).
     ///
     /// [`process_audio`]: Self::process_audio
     pub fn send_midi_event_at(&mut self, event: MidiEvent, sample_offset: i32) -> Result<()> {
+        validate_midi_event(&event)?;
         self.internal
             .as_mut()
             .ok_or_else(|| Error::Other("Plugin not initialized".to_string()))?
@@ -839,6 +901,9 @@ impl Plugin {
     /// individually expressed), this allocates a unique voice id. Pair it with
     /// [`note_off`](Self::note_off). Per-note expression works both in-process and under
     /// process isolation — the calls marshal across the boundary.
+    ///
+    /// `note` and `velocity` are range-checked (`0–127`), as in
+    /// [`send_midi_note`](Self::send_midi_note).
     pub fn note_on(
         &mut self,
         channel: MidiChannel,
@@ -849,6 +914,9 @@ impl Plugin {
     }
 
     /// [`note_on`](Self::note_on) scheduled at a sample offset within the next block.
+    ///
+    /// `note` and `velocity` must be `0–127`, as for
+    /// [`send_midi_note`](Self::send_midi_note).
     pub fn note_on_at(
         &mut self,
         channel: MidiChannel,
@@ -856,6 +924,8 @@ impl Plugin {
         velocity: u8,
         sample_offset: i32,
     ) -> Result<crate::midi::NoteId> {
+        validate_note(note)?;
+        validate_velocity(velocity)?;
         self.internal
             .as_mut()
             .ok_or_else(|| Error::Other("Plugin not initialized".to_string()))?
@@ -947,10 +1017,15 @@ impl Plugin {
         Ok(())
     }
 
-    /// Process audio buffers
+    /// Process audio buffers.
+    ///
+    /// # Thread safety
+    ///
+    /// Both playback paths call this from the **audio thread**, so any callback registered
+    /// with [`Self::on_audio_process`] runs there too — see that method's warning.
     pub fn process_audio(&mut self, buffers: &mut AudioBuffers) -> Result<()> {
         if !self.is_processing {
-            return Err(Error::Other("Plugin is not processing".to_string()));
+            return Err(Error::NotProcessing);
         }
 
         self.internal
@@ -988,7 +1063,18 @@ impl Plugin {
         self.is_processing
     }
 
-    /// Set a callback for parameter changes
+    /// Set a callback invoked whenever [`Self::set_parameter`] succeeds, with the parameter id
+    /// and its new normalized value.
+    ///
+    /// # This callback runs on the caller's thread — including the audio thread
+    ///
+    /// It fires inline from `set_parameter`, so it runs on whichever thread made that call.
+    /// Driven through either playback path that is the **audio thread**:
+    /// [`AudioHandle`](crate::AudioHandle) applies queued parameter changes inside the audio
+    /// callback, and [`RealtimePluginRunner`](crate::RealtimePluginRunner) drains its command
+    /// ring there. Keep the body real-time safe — no allocation, no locks, no I/O, no
+    /// blocking on a UI thread. To drive a UI, push into a lock-free queue here and read it
+    /// from the UI thread, or poll [`Self::get_parameter_changes`] instead.
     pub fn on_parameter_change<F>(&mut self, callback: F)
     where
         F: Fn(u32, f64) + Send + 'static,
@@ -996,7 +1082,15 @@ impl Plugin {
         self.parameter_change_callback = Some(Box::new(callback));
     }
 
-    /// Set a callback for audio processing (called after each process cycle)
+    /// Set a callback invoked after each [`Self::process_audio`] cycle with the freshly
+    /// computed output levels.
+    ///
+    /// # This callback runs on the AUDIO thread
+    ///
+    /// It fires from inside `process_audio`, which both playback paths call on the audio
+    /// callback thread, while the level mutex is held. Keep the body real-time safe — no
+    /// allocation, no locks, no I/O, no blocking on a UI thread. For metering in a UI, poll
+    /// [`Self::get_output_levels`] from the UI thread instead.
     pub fn on_audio_process<F>(&mut self, callback: F)
     where
         F: Fn(&AudioLevels) + Send + 'static,
@@ -1048,7 +1142,16 @@ impl Plugin {
             .get_editor_size()
     }
 
-    /// Create a batch parameter update
+    /// Collect several parameter changes with a [`ParameterUpdate`] and apply them in one call.
+    ///
+    /// # This batch is not atomic
+    ///
+    /// The queued changes are applied in the order they were `set`, and the first failure
+    /// stops the batch and is returned — the changes queued *before* it have already been
+    /// applied to the plugin and are **not** rolled back, and the ones after it were never
+    /// attempted. The error does not say how far the batch got. If that matters, call
+    /// [`Self::set_parameter`] per parameter and handle each result, or re-read the values
+    /// with [`Self::get_parameters`] after an error.
     pub fn update_parameters<F>(&mut self, f: F) -> Result<()>
     where
         F: FnOnce(&mut ParameterUpdate) -> Result<()>,
@@ -1098,6 +1201,20 @@ impl Plugin {
         self.internal
             .as_mut()
             .map(|i| i.take_parameter_edits())
+            .unwrap_or_default()
+    }
+
+    /// Take the flags the plugin raised via `IComponentHandler::restartComponent` since the
+    /// last call — its way of saying "something about me changed, re-read it".
+    ///
+    /// Poll this next to [`Self::take_parameter_edits`] (e.g. each UI frame). The library
+    /// records the flags but acts on none of them; see [`RestartFlags`] for what each one asks
+    /// of the host. Returns an empty set for a plugin that hasn't raised anything, and for the
+    /// process-isolated path (flags are not marshalled across the boundary yet).
+    pub fn take_restart_flags(&mut self) -> RestartFlags {
+        self.internal
+            .as_mut()
+            .map(|i| i.take_restart_flags())
             .unwrap_or_default()
     }
 
@@ -1291,6 +1408,101 @@ impl Plugin {
     }
 }
 
+/// Highest value a 7-bit MIDI data byte can carry.
+const MIDI_DATA_MAX: u8 = 127;
+
+/// Highest value a 14-bit MIDI pitch-bend can carry.
+const MIDI_PITCH_BEND_MAX: u16 = 16383;
+
+fn validate_note(note: u8) -> Result<()> {
+    if note > MIDI_DATA_MAX {
+        return Err(Error::MidiError(format!("Invalid note number: {}", note)));
+    }
+    Ok(())
+}
+
+fn validate_velocity(velocity: u8) -> Result<()> {
+    if velocity > MIDI_DATA_MAX {
+        return Err(Error::MidiError(format!("Invalid velocity: {}", velocity)));
+    }
+    Ok(())
+}
+
+fn validate_controller(controller: u8) -> Result<()> {
+    if controller > MIDI_DATA_MAX {
+        return Err(Error::MidiError(format!(
+            "Invalid controller number: {}",
+            controller
+        )));
+    }
+    Ok(())
+}
+
+fn validate_cc_value(value: u8) -> Result<()> {
+    if value > MIDI_DATA_MAX {
+        return Err(Error::MidiError(format!("Invalid CC value: {}", value)));
+    }
+    Ok(())
+}
+
+fn validate_pressure(pressure: u8) -> Result<()> {
+    if pressure > MIDI_DATA_MAX {
+        return Err(Error::MidiError(format!(
+            "Invalid pressure value: {}",
+            pressure
+        )));
+    }
+    Ok(())
+}
+
+/// Range-check every data field of a [`MidiEvent`] before it reaches a plugin.
+///
+/// `MidiEvent`'s fields are plain `u8`/`u16`, so nothing stops a caller from building an
+/// out-of-spec event by hand. The conversion below this layer masks nothing: a note of `255`
+/// becomes a `255` pitch in the VST3 event, a velocity of `255` becomes `2.008` where the
+/// spec's maximum is `1.0`, and a legacy CC value of `200` becomes a *negative* MIDI byte
+/// once cast to `c_char`. Reject them here, with the same messages the typed senders use.
+///
+/// The match below has no wildcard arm on purpose: `MidiEvent` is `#[non_exhaustive]` only to
+/// downstream crates, so a variant added here fails to compile until it states its own ranges.
+fn validate_midi_event(event: &MidiEvent) -> Result<()> {
+    match *event {
+        MidiEvent::NoteOn { note, velocity, .. } | MidiEvent::NoteOff { note, velocity, .. } => {
+            validate_note(note)?;
+            validate_velocity(velocity)
+        }
+        MidiEvent::ControlChange {
+            controller, value, ..
+        } => {
+            validate_controller(controller)?;
+            validate_cc_value(value)
+        }
+        MidiEvent::ProgramChange { program, .. } => {
+            if program > MIDI_DATA_MAX {
+                return Err(Error::MidiError(format!(
+                    "Invalid program number: {}",
+                    program
+                )));
+            }
+            Ok(())
+        }
+        MidiEvent::PitchBend { value, .. } => {
+            if value > MIDI_PITCH_BEND_MAX {
+                return Err(Error::MidiError(format!(
+                    "Invalid pitch bend value: {} (0-{})",
+                    value, MIDI_PITCH_BEND_MAX
+                )));
+            }
+            Ok(())
+        }
+        MidiEvent::ChannelAftertouch { pressure, .. } => validate_pressure(pressure),
+        MidiEvent::PolyAftertouch { note, pressure, .. } => {
+            validate_note(note)?;
+            validate_pressure(pressure)
+        }
+    }
+}
+
 /// Platform-specific window handle
 pub struct WindowHandle(pub(crate) *mut std::ffi::c_void);
 
@@ -1309,16 +1521,29 @@ unsafe impl Send for WindowHandle {}
 
 #[cfg(target_os = "macos")]
 impl WindowHandle {
-    /// Create from an NSView pointer on macOS
-    pub fn from_nsview(view: *mut std::ffi::c_void) -> Self {
+    /// Create from an `NSView` pointer on macOS.
+    ///
+    /// # Safety
+    ///
+    /// `view` must be a live `NSView` that stays alive for as long as the editor is attached
+    /// to it. [`Plugin::open_editor`] hands the pointer straight to the plugin's
+    /// `IPlugView::attached`, which dereferences it; nothing on that path can tell a valid
+    /// view from a dangling or foreign pointer.
+    pub unsafe fn from_nsview(view: *mut std::ffi::c_void) -> Self {
         Self(view)
     }
 }
 
 #[cfg(target_os = "windows")]
 impl WindowHandle {
-    /// Create from an HWND on Windows
-    pub fn from_hwnd(hwnd: *mut std::ffi::c_void) -> Self {
+    /// Create from an `HWND` on Windows.
+    ///
+    /// # Safety
+    ///
+    /// `hwnd` must be a live window handle that stays valid for as long as the editor is
+    /// attached to it. [`Plugin::open_editor`] hands it straight to the plugin's
+    /// `IPlugView::attached`, which uses it as a window; nothing on that path validates it.
+    pub unsafe fn from_hwnd(hwnd: *mut std::ffi::c_void) -> Self {
         Self(hwnd)
     }
 }
@@ -1477,6 +1702,186 @@ mod vstpreset {
 
     fn read_i64(b: &[u8]) -> i64 {
         i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+    }
+}
+
+#[cfg(test)]
+mod public_surface_tests {
+    use super::*;
+
+    /// A `Plugin` with no backing implementation. Enough to exercise the checks the public
+    /// surface performs *before* it reaches into `internal`.
+    fn unloaded_plugin() -> Plugin {
+        Plugin {
+            info: PluginInfo {
+                path: std::path::PathBuf::from("/none.vst3"),
+                name: "None".to_string(),
+                vendor: String::new(),
+                version: String::new(),
+                category: String::new(),
+                uid: String::new(),
+                audio_inputs: 0,
+                audio_outputs: 2,
+                has_midi_input: true,
+                has_midi_output: false,
+                has_gui: false,
+            },
+            is_processing: false,
+            sample_rate: 44_100.0,
+            block_size: 512,
+            audio_levels: Arc::new(Mutex::new(AudioLevels::new(2))),
+            parameter_change_callback: None,
+            audio_callback: None,
+            internal: None,
+        }
+    }
+
+    /// The "not processing" rejection happens once per block on the audio thread, so it must
+    /// be the allocation-free unit variant rather than a freshly formatted `Error::Other`.
+    #[test]
+    fn process_audio_while_stopped_is_the_allocation_free_variant() {
+        let mut plugin = unloaded_plugin();
+        let mut buffers = AudioBuffers::new(0, 2, 64, 44_100.0);
+        let err = plugin
+            .process_audio(&mut buffers)
+            .expect_err("processing is stopped");
+        assert!(
+            matches!(err, Error::NotProcessing),
+            "expected Error::NotProcessing, got {err:?}"
+        );
+    }
+
+    /// `send_midi_event`/`send_midi_event_at` used to forward whatever a caller built by hand,
+    /// so an out-of-range field reached the VST3 conversion unmasked (velocity 255 → 2.008
+    /// where the spec maximum is 1.0; a legacy CC value of 200 → a negative MIDI byte).
+    #[test]
+    fn send_midi_event_rejects_out_of_range_fields() {
+        let mut plugin = unloaded_plugin();
+        let bad = [
+            MidiEvent::NoteOn {
+                channel: MidiChannel::Ch1,
+                note: 255,
+                velocity: 100,
+            },
+            MidiEvent::NoteOn {
+                channel: MidiChannel::Ch1,
+                note: 60,
+                velocity: 255,
+            },
+            MidiEvent::NoteOff {
+                channel: MidiChannel::Ch1,
+                note: 128,
+                velocity: 0,
+            },
+            MidiEvent::ControlChange {
+                channel: MidiChannel::Ch1,
+                controller: 200,
+                value: 0,
+            },
+            MidiEvent::ControlChange {
+                channel: MidiChannel::Ch1,
+                controller: 1,
+                value: 200,
+            },
+            MidiEvent::ProgramChange {
+                channel: MidiChannel::Ch1,
+                program: 200,
+            },
+            MidiEvent::PitchBend {
+                channel: MidiChannel::Ch1,
+                value: 16_384,
+            },
+            MidiEvent::ChannelAftertouch {
+                channel: MidiChannel::Ch1,
+                pressure: 200,
+            },
+            MidiEvent::PolyAftertouch {
+                channel: MidiChannel::Ch1,
+                note: 200,
+                pressure: 1,
+            },
+            MidiEvent::PolyAftertouch {
+                channel: MidiChannel::Ch1,
+                note: 60,
+                pressure: 200,
+            },
+        ];
+        for event in bad {
+            for err in [
+                plugin.send_midi_event(event).expect_err("out of range"),
+                plugin
+                    .send_midi_event_at(event, 0)
+                    .expect_err("out of range"),
+            ] {
+                assert!(
+                    matches!(err, Error::MidiError(_)),
+                    "expected a MidiError for {event:?}, got {err:?}"
+                );
+            }
+        }
+    }
+
+    /// In-range events pass validation and fail later, at the uninitialized plugin — proof the
+    /// check rejects the field values and not the events themselves.
+    #[test]
+    fn send_midi_event_accepts_in_range_fields() {
+        let mut plugin = unloaded_plugin();
+        let ok = [
+            MidiEvent::NoteOn {
+                channel: MidiChannel::Ch1,
+                note: 127,
+                velocity: 127,
+            },
+            MidiEvent::ControlChange {
+                channel: MidiChannel::Ch1,
+                controller: 127,
+                value: 127,
+            },
+            MidiEvent::ProgramChange {
+                channel: MidiChannel::Ch1,
+                program: 127,
+            },
+            MidiEvent::PitchBend {
+                channel: MidiChannel::Ch1,
+                value: 16_383,
+            },
+            MidiEvent::ChannelAftertouch {
+                channel: MidiChannel::Ch1,
+                pressure: 127,
+            },
+            MidiEvent::PolyAftertouch {
+                channel: MidiChannel::Ch1,
+                note: 127,
+                pressure: 127,
+            },
+        ];
+        for event in ok {
+            let err = plugin.send_midi_event(event).expect_err("no plugin loaded");
+            assert!(
+                matches!(err, Error::Other(_)),
+                "expected the uninitialized-plugin error for {event:?}, got {err:?}"
+            );
+        }
+    }
+
+    /// `note_on`/`note_on_at` mint a per-voice id, and skipped the range check its
+    /// `send_midi_note` sibling performs.
+    #[test]
+    fn note_on_rejects_out_of_range_note_and_velocity() {
+        let mut plugin = unloaded_plugin();
+        for (note, velocity) in [(128, 100), (60, 128), (255, 255)] {
+            let err = plugin
+                .note_on(MidiChannel::Ch1, note, velocity)
+                .expect_err("out of range");
+            assert!(
+                matches!(err, Error::MidiError(_)),
+                "expected a MidiError for note {note} velocity {velocity}, got {err:?}"
+            );
+            let err = plugin
+                .note_on_at(MidiChannel::Ch1, note, velocity, 0)
+                .expect_err("out of range");
+            assert!(matches!(err, Error::MidiError(_)), "got {err:?}");
+        }
     }
 }
 
