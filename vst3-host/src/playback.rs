@@ -59,24 +59,26 @@ struct AudioSideChannels {
 }
 
 impl AudioSideChannels {
-    /// Apply all queued control commands to the plugin. The caller already holds the lock.
+    /// Apply queued control commands to the plugin. The caller already holds the lock.
+    ///
+    /// Drains at most one ring's worth per block: a control thread pushing in a tight loop
+    /// refills the ring as fast as this drains it, so an unbounded loop would pin the audio
+    /// callback indefinitely. Anything still queued is applied on the next block.
     fn apply_control(&mut self, plugin: &mut Plugin) {
-        while let Ok(cmd) = self.control_rx.pop() {
-            match cmd {
-                HybridCommand::Midi { event, offset } => {
-                    let _ = plugin.send_midi_event_at(event, offset);
-                }
-                HybridCommand::Param { id, value } => {
-                    let _ = plugin.set_parameter(id, value);
-                }
-                HybridCommand::Transport(change) => {
-                    change.apply(plugin);
-                }
-                HybridCommand::Panic => {
-                    let _ = plugin.midi_panic();
-                }
+        crate::realtime::drain_commands(&mut self.control_rx, |command| match command {
+            HybridCommand::Midi { event, offset } => {
+                let _ = plugin.send_midi_event_at(event, offset);
             }
-        }
+            HybridCommand::Param { id, value } => {
+                let _ = plugin.set_parameter(id, value);
+            }
+            HybridCommand::Transport(change) => {
+                change.apply(plugin);
+            }
+            HybridCommand::Panic => {
+                let _ = plugin.midi_panic();
+            }
+        });
     }
 
     /// Publish per-channel output peaks into the atomics. Only meaningful after a successful
@@ -114,6 +116,17 @@ struct UiSideChannels {
     levels: Arc<[AtomicU32]>,
 }
 
+/// Push a control command onto the shared lock-free ring, never blocking. Returns `false` if
+/// the ring is full (the command is dropped) or if the ring mutex was poisoned.
+///
+/// The mutex here is only ever contended between control threads — the audio callback holds
+/// the consumer end and never touches it.
+fn queue_command(tx: &Mutex<Producer<HybridCommand>>, command: HybridCommand) -> bool {
+    tx.lock()
+        .map(|mut tx| tx.push(command).is_ok())
+        .unwrap_or(false)
+}
+
 /// Build a fresh set of side channels for `channels` output channels, returning the audio-side
 /// half (move into the callback) and the UI-side half (store in the handle).
 fn make_side_channels(channels: usize) -> (AudioSideChannels, UiSideChannels) {
@@ -142,6 +155,20 @@ fn make_side_channels(channels: usize) -> (AudioSideChannels, UiSideChannels) {
 /// Dropping the handle stops playback (the underlying device stream is released).
 /// While it lives, the plugin keeps running on the audio thread; use [`Self::lock`]
 /// to send MIDI or change parameters from your control thread.
+///
+/// # Thread affinity
+///
+/// `AudioHandle` owns the device stream, which backends make thread-affine (cpal's `Stream`
+/// is `!Send` for exactly this reason: open, control and *drop* must happen on one thread).
+/// So the handle is `!Send` and has to stay on the thread that started playback:
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>() {}
+/// assert_send::<vst3_host::AudioHandle>(); // AudioHandle is deliberately not Send
+/// ```
+///
+/// To drive the plugin from another thread, move a [`MidiSink`] ([`Self::midi_sink`]) or the
+/// shared `Arc<Mutex<Plugin>>` ([`Self::plugin`]) there instead — both are `Send`.
 pub struct AudioHandle {
     // Boxed as a trait object so `AudioHandle` is not generic over the backend.
     // Kept solely to hold the stream open — dropping it stops audio.
@@ -160,6 +187,11 @@ pub struct AudioHandle {
 /// Obtained from [`AudioHandle::midi_sink`]. It holds only the (shared) lock-free command ring,
 /// not the device stream, so unlike [`AudioHandle`] it is `Send` and can be moved into a
 /// background thread or a MIDI input callback. Cloning is cheap (an `Arc` bump).
+///
+/// ```
+/// fn assert_send<T: Send>() {}
+/// assert_send::<vst3_host::MidiSink>();
+/// ```
 #[derive(Clone)]
 pub struct MidiSink {
     control_tx: Arc<Mutex<Producer<HybridCommand>>>,
@@ -178,16 +210,13 @@ impl MidiSink {
     /// sample-accurate sequencing. A negative offset is floored to `0`. Returns `false` if the
     /// ring is full.
     pub fn send_midi_at(&self, event: MidiEvent, sample_offset: i32) -> bool {
-        self.control_tx
-            .lock()
-            .map(|mut tx| {
-                tx.push(HybridCommand::Midi {
-                    event,
-                    offset: sample_offset.max(0),
-                })
-                .is_ok()
-            })
-            .unwrap_or(false)
+        queue_command(
+            &self.control_tx,
+            HybridCommand::Midi {
+                event,
+                offset: sample_offset.max(0),
+            },
+        )
     }
 }
 
@@ -231,17 +260,13 @@ impl AudioHandle {
     /// sample-accurate sequencing, without locking the audio thread. A negative offset is
     /// floored to `0`. Returns `false` if the ring is full.
     pub fn send_midi_at(&self, event: MidiEvent, sample_offset: i32) -> bool {
-        self.ui
-            .control_tx
-            .lock()
-            .map(|mut tx| {
-                tx.push(HybridCommand::Midi {
-                    event,
-                    offset: sample_offset.max(0),
-                })
-                .is_ok()
-            })
-            .unwrap_or(false)
+        queue_command(
+            &self.ui.control_tx,
+            HybridCommand::Midi {
+                event,
+                offset: sample_offset.max(0),
+            },
+        )
     }
 
     /// Obtain a [`MidiSink`]: a cheap, cloneable, `Send` handle that can queue MIDI to this
@@ -257,14 +282,14 @@ impl AudioHandle {
         }
     }
 
-    /// Queue a normalized parameter change (`0.0..=1.0`) without locking the audio thread.
-    /// Applied at the start of the next block. Returns `false` if the ring is full.
+    /// Queue a normalized parameter change without locking the audio thread; applied at the
+    /// start of the next block. `value` must be finite and within `0.0..=1.0` — an invalid
+    /// value is rejected here (returns `false`) rather than queued, so the caller learns about
+    /// it instead of the audio thread silently discarding it. Returns `false` if the ring is
+    /// full.
     pub fn set_parameter(&self, id: u32, value: f64) -> bool {
-        self.ui
-            .control_tx
-            .lock()
-            .map(|mut tx| tx.push(HybridCommand::Param { id, value }).is_ok())
-            .unwrap_or(false)
+        crate::realtime::is_normalized(value)
+            && queue_command(&self.ui.control_tx, HybridCommand::Param { id, value })
     }
 
     /// Queue a transport tempo change (BPM) without locking the audio thread; applied at the
@@ -274,14 +299,10 @@ impl AudioHandle {
         if !(bpm.is_finite() && bpm > 0.0) {
             return false;
         }
-        self.ui
-            .control_tx
-            .lock()
-            .map(|mut tx| {
-                tx.push(HybridCommand::Transport(TransportCommand::Tempo(bpm)))
-                    .is_ok()
-            })
-            .unwrap_or(false)
+        queue_command(
+            &self.ui.control_tx,
+            HybridCommand::Transport(TransportCommand::Tempo(bpm)),
+        )
     }
 
     /// Queue a transport time-signature change without locking the audio thread; applied at the
@@ -292,40 +313,25 @@ impl AudioHandle {
         if numerator <= 0 || !matches!(denominator, 1 | 2 | 4 | 8 | 16) {
             return false;
         }
-        self.ui
-            .control_tx
-            .lock()
-            .map(|mut tx| {
-                tx.push(HybridCommand::Transport(TransportCommand::TimeSignature(
-                    numerator,
-                    denominator,
-                )))
-                .is_ok()
-            })
-            .unwrap_or(false)
+        queue_command(
+            &self.ui.control_tx,
+            HybridCommand::Transport(TransportCommand::TimeSignature(numerator, denominator)),
+        )
     }
 
     /// Queue a transport playing-state toggle without locking the audio thread; applied at the
     /// start of the next block. Returns `false` if the ring is full.
     pub fn set_playing(&self, playing: bool) -> bool {
-        self.ui
-            .control_tx
-            .lock()
-            .map(|mut tx| {
-                tx.push(HybridCommand::Transport(TransportCommand::Playing(playing)))
-                    .is_ok()
-            })
-            .unwrap_or(false)
+        queue_command(
+            &self.ui.control_tx,
+            HybridCommand::Transport(TransportCommand::Playing(playing)),
+        )
     }
 
     /// Queue an all-notes-off "panic" (CC 123/120/121 on every channel) without locking the
     /// audio thread. Returns `false` if the ring is full.
     pub fn midi_panic(&self) -> bool {
-        self.ui
-            .control_tx
-            .lock()
-            .map(|mut tx| tx.push(HybridCommand::Panic).is_ok())
-            .unwrap_or(false)
+        queue_command(&self.ui.control_tx, HybridCommand::Panic)
     }
 
     /// Read the latest per-channel output peak levels without locking the audio thread.
@@ -401,6 +407,77 @@ pub(crate) fn interleave_outputs(outputs: &[Vec<f32>], out: &mut [f32], channels
             out[frame * channels + ch] = src[frame];
         }
     }
+}
+
+/// Push interleaved capture frames onto the duplex bridge ring, **whole frames only**.
+///
+/// The ring carries interleaved samples but its meaning is frame-major: sample *n* belongs to
+/// channel `n % channels`. Dropping an individual sample when the ring is full would shift
+/// every later sample by one channel — stereo would come out L/R-swapped for the rest of the
+/// stream, with nothing to resync it. So a frame is either pushed in full or dropped in full.
+///
+/// Returns the number of frames pushed. `data` is interleaved; a trailing partial frame (a
+/// device handing over a non-multiple of `channels`) is ignored.
+fn push_capture_frames(producer: &mut Producer<f32>, data: &[f32], channels: usize) -> usize {
+    if channels == 0 {
+        return 0;
+    }
+    // `slots()` is a conservative estimate (never an over-count), so every push below fits.
+    let room_frames = producer.slots() / channels;
+    let mut pushed = 0;
+    for frame in data.chunks_exact(channels).take(room_frames) {
+        for &sample in frame {
+            let _ = producer.push(sample);
+        }
+        pushed += 1;
+    }
+    pushed
+}
+
+/// Pop whole interleaved frames off the duplex bridge ring into per-channel buffers.
+///
+/// Mirrors [`push_capture_frames`]: consuming a partial frame (the producer may be mid-frame
+/// when this runs) would leave the ring's head on a non-channel-0 sample and permanently swap
+/// the channel assignment. Frames beyond what the ring can supply are left untouched — the
+/// caller has already cleared the buffers, so an underrun reads as silence.
+///
+/// Returns the number of frames written.
+fn pop_capture_frames(
+    consumer: &mut Consumer<f32>,
+    inputs: &mut [Vec<f32>],
+    frames: usize,
+) -> usize {
+    let channels = inputs.len();
+    if channels == 0 {
+        return 0;
+    }
+    let available = (consumer.slots() / channels).min(frames);
+    for f in 0..available {
+        for ch in inputs.iter_mut() {
+            let sample = consumer.pop().unwrap_or(0.0);
+            if let Some(slot) = ch.get_mut(f) {
+                *slot = sample;
+            }
+        }
+    }
+    available
+}
+
+/// Capacity, in interleaved samples, of the duplex input→output bridge ring: about eight
+/// device blocks of headroom so the two independent device clocks don't starve each other.
+///
+/// Sized in **frames** and multiplied up, so the capacity is always a whole number of frames —
+/// one that wasn't would strand a partial frame at the wrap point, exactly the split the
+/// push/pop pair goes out of its way to avoid. Bounded at both ends: a floor so a tiny block
+/// size still buys real headroom, and a ceiling so an absurd configured block size can't ask
+/// for a multi-gigabyte allocation.
+fn bridge_ring_capacity(block_size: usize, channels: usize) -> usize {
+    const MIN_BRIDGE_FRAMES: usize = 1024;
+    const MAX_BRIDGE_FRAMES: usize = 1 << 18; // ~5.5 s at 48 kHz
+    let frames = block_size
+        .saturating_mul(8)
+        .clamp(MIN_BRIDGE_FRAMES, MAX_BRIDGE_FRAMES);
+    frames.saturating_mul(channels.max(1))
 }
 
 /// Resize a scratch buffer's output channels to exactly `frames`, clearing them.
@@ -535,14 +612,13 @@ pub fn play_with_input_backend<B: AudioBackend>(
 
     // SPSC bridge: input callback (producer) -> output callback (consumer). Hold a few
     // blocks of interleaved input so the independent device clocks don't starve immediately.
-    let ring_cap = (config.block_size * in_channels * 8).max(2048);
-    let (mut producer, mut consumer) = rtrb::RingBuffer::<f32>::new(ring_cap);
+    let (mut producer, mut consumer) =
+        rtrb::RingBuffer::<f32>::new(bridge_ring_capacity(config.block_size, in_channels));
 
     let in_data_cb = Box::new(move |data: &[f32]| {
-        // Drop on full (output side fell behind) rather than block the capture callback.
-        for &s in data {
-            let _ = producer.push(s);
-        }
+        // Drop on full (output side fell behind) rather than block the capture callback —
+        // whole frames at a time, so overflow never shifts the interleave boundary.
+        push_capture_frames(&mut producer, data, in_channels);
     });
     let in_err_cb = Box::new(|e: B::Error| log::error!("input stream error: {}", e));
     let input_stream = backend
@@ -562,12 +638,9 @@ pub fn play_with_input_backend<B: AudioBackend>(
         let frames = data.len() / out_channels;
         prepare_scratch(&mut scratch, frames);
         // Deinterleave captured input from the ring into the plugin's input buffers
-        // (interleaved frame-major order matches the input callback's push order).
-        for f in 0..frames {
-            for ch in scratch.inputs.iter_mut() {
-                ch[f] = consumer.pop().unwrap_or(0.0);
-            }
-        }
+        // (interleaved frame-major order matches the input callback's push order). Frames the
+        // ring can't supply stay at the silence `prepare_scratch` just wrote.
+        pop_capture_frames(&mut consumer, &mut scratch.inputs, frames);
         let mut p = match plugin_cb.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -602,6 +675,10 @@ pub fn play_with_input_backend<B: AudioBackend>(
 /// A running real-time audio stream (the [`RealtimePluginRunner`] variant of
 /// [`AudioHandle`]). Holds the device stream open and exposes the lock-free [`RtControl`];
 /// dropping it stops playback.
+///
+/// Like [`AudioHandle`], it owns the thread-affine device stream and is therefore `!Send`.
+/// Build the runner and its [`RtControl`] yourself ([`RealtimePluginRunner::new`]) if you need
+/// the control half on a different thread than the stream.
 pub struct RtAudioHandle {
     _stream: Box<dyn AudioStream>,
     control: RtControl,
@@ -750,6 +827,137 @@ mod tests {
         let mut out = vec![7.0, 7.0];
         interleave_outputs(&outputs, &mut out, 0);
         assert_eq!(out, vec![7.0, 7.0]);
+    }
+
+    /// Push more than the ring holds, then drain it: every frame that survived must still be a
+    /// whole frame. Dropping a single *sample* on overflow shifts the interleave boundary, and
+    /// the ring never resyncs — stereo comes out L/R-swapped for the rest of the stream.
+    #[test]
+    fn bridge_overflow_drops_whole_frames_never_splits_one() {
+        const CH: usize = 2;
+        let (mut producer, mut consumer) = RingBuffer::<f32>::new(4 * CH);
+
+        // 8 stereo frames into a 4-frame ring: frame f is (f, -f) so a swap is visible.
+        let data: Vec<f32> = (0..8).flat_map(|f| [f as f32, -(f as f32)]).collect();
+        let pushed = push_capture_frames(&mut producer, &data, CH);
+        assert_eq!(pushed, 4, "only the frames that fit are pushed");
+
+        let mut inputs = vec![vec![0.0f32; 8], vec![0.0f32; 8]];
+        let popped = pop_capture_frames(&mut consumer, &mut inputs, 8);
+        assert_eq!(popped, 4);
+        // Left channel holds the non-negative half of each frame, right the negative half —
+        // i.e. no frame was split. Frames past the underrun stay at the pre-cleared silence.
+        assert_eq!(inputs[0], vec![0.0, 1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(inputs[1], vec![-0.0, -1.0, -2.0, -3.0, 0.0, 0.0, 0.0, 0.0]);
+    }
+
+    /// After an overflow the bridge must still be frame-aligned for every later block: this is
+    /// the permanent-channel-swap regression, observed across successive push/pop rounds.
+    #[test]
+    fn bridge_stays_frame_aligned_across_overflow_rounds() {
+        const CH: usize = 2;
+        let (mut producer, mut consumer) = RingBuffer::<f32>::new(4 * CH);
+
+        for round in 0..5 {
+            // Over-produce every round so the ring is permanently in overflow.
+            let base = round * 100;
+            let data: Vec<f32> = (0..6)
+                .flat_map(|f| [(base + f) as f32, -((base + f) as f32)])
+                .collect();
+            push_capture_frames(&mut producer, &data, CH);
+
+            let mut inputs = vec![vec![0.0f32; 3], vec![0.0f32; 3]];
+            let popped = pop_capture_frames(&mut consumer, &mut inputs, 3);
+            for f in 0..popped {
+                assert_eq!(
+                    inputs[1][f], -inputs[0][f],
+                    "round {round} frame {f} lost channel alignment: {:?}",
+                    inputs
+                );
+            }
+        }
+    }
+
+    /// A partial trailing frame (a device handing over a non-multiple of the channel count) is
+    /// ignored rather than half-pushed, for the same alignment reason.
+    #[test]
+    fn bridge_ignores_a_partial_trailing_frame() {
+        const CH: usize = 3;
+        let (mut producer, mut consumer) = RingBuffer::<f32>::new(8 * CH);
+        // Two whole frames plus two stray samples.
+        let data = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        assert_eq!(push_capture_frames(&mut producer, &data, CH), 2);
+        assert_eq!(consumer.slots() % CH, 0, "ring holds whole frames only");
+
+        let mut inputs = vec![vec![0.0f32; 2], vec![0.0f32; 2], vec![0.0f32; 2]];
+        assert_eq!(pop_capture_frames(&mut consumer, &mut inputs, 2), 2);
+        assert_eq!(inputs[0], vec![1.0, 4.0]);
+        assert_eq!(inputs[1], vec![2.0, 5.0]);
+        assert_eq!(inputs[2], vec![3.0, 6.0]);
+    }
+
+    /// The consumer must not take a partial frame either: with an odd number of samples parked
+    /// in the ring (the producer caught mid-frame), popping sample-by-sample would leave the
+    /// head on a channel-1 sample and swap every later frame.
+    #[test]
+    fn bridge_consumer_leaves_an_incomplete_frame_alone() {
+        const CH: usize = 2;
+        let (mut producer, mut consumer) = RingBuffer::<f32>::new(4 * CH);
+        // Simulate the producer being pre-empted between the two samples of a frame.
+        producer.push(1.0).expect("room for the first sample");
+
+        let mut inputs = vec![vec![0.0f32; 2], vec![0.0f32; 2]];
+        assert_eq!(pop_capture_frames(&mut consumer, &mut inputs, 2), 0);
+        assert_eq!(consumer.slots(), 1, "the half frame is still queued");
+
+        // Once the frame is complete it is consumed as a unit, channel 0 first.
+        producer.push(-1.0).expect("room for the second sample");
+        assert_eq!(pop_capture_frames(&mut consumer, &mut inputs, 2), 1);
+        assert_eq!(inputs[0][0], 1.0);
+        assert_eq!(inputs[1][0], -1.0);
+    }
+
+    /// The bridge ring must hold a whole number of frames, or a partial frame is stranded at
+    /// the wrap point. `(block_size * in_channels * 8).max(2048)` did not: with 3 channels and
+    /// a small block it clamped to 2048, which is not a multiple of 3.
+    #[test]
+    fn bridge_capacity_is_a_whole_number_of_frames() {
+        for block_size in [0usize, 1, 32, 64, 128, 512, 1024, usize::MAX] {
+            for channels in 1..=8usize {
+                let cap = bridge_ring_capacity(block_size, channels);
+                assert_eq!(
+                    cap % channels,
+                    0,
+                    "block {block_size} x {channels} ch: capacity {cap} splits a frame"
+                );
+                assert!(
+                    cap >= channels,
+                    "block {block_size} x {channels} ch: capacity {cap} holds no frame"
+                );
+            }
+        }
+        // The old expression, for contrast: `(32 * 3 * 8).max(2048)` clamps up to 2048 samples,
+        // which across 3 channels is 682.67 frames — the ring wraps mid-frame.
+        assert_ne!(2048 % 3, 0);
+    }
+
+    /// A zero channel count would make the frame arithmetic divide by zero.
+    #[test]
+    fn bridge_capacity_survives_zero_channels() {
+        assert!(bridge_ring_capacity(512, 0) > 0);
+    }
+
+    /// `queue_command` is the single push path behind every `AudioHandle` / `MidiSink` control
+    /// method: never blocking, dropping on a full ring and reporting that as `false`.
+    #[test]
+    fn queue_command_drops_on_a_full_ring() {
+        let (tx, mut rx) = RingBuffer::<HybridCommand>::new(2);
+        let tx = Mutex::new(tx);
+        assert!(queue_command(&tx, HybridCommand::Panic));
+        assert!(queue_command(&tx, HybridCommand::Panic));
+        assert!(!queue_command(&tx, HybridCommand::Panic), "ring is full");
+        assert_eq!(rx.slots(), 2);
+        assert!(rx.pop().is_ok());
     }
 
     #[test]

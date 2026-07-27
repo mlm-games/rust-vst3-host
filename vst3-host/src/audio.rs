@@ -465,8 +465,13 @@ impl Default for AudioConfig {
     }
 }
 
-/// Audio stream trait for controlling playback
-pub trait AudioStream: Send {
+/// Audio stream trait for controlling playback.
+///
+/// Deliberately **not** `Send`: real backends (cpal among them) make their stream handle
+/// thread-affine — construction, `play`/`pause` and teardown must all happen on the thread
+/// that opened the device. Implementations that *are* movable simply also implement `Send`;
+/// nothing here takes that away.
+pub trait AudioStream {
     /// Start playback
     fn play(&self) -> Result<(), Box<dyn std::error::Error>>;
 
@@ -477,8 +482,8 @@ pub trait AudioStream: Send {
 /// Audio backend trait for creating audio streams
 #[allow(clippy::type_complexity)] // Box<dyn FnMut...> callbacks are intrinsic to the API
 pub trait AudioBackend: Send + Sync {
-    /// The stream type this backend produces
-    type Stream: AudioStream + Send + 'static;
+    /// The stream type this backend produces. Not required to be `Send` — see [`AudioStream`].
+    type Stream: AudioStream + 'static;
     /// The device type this backend uses
     type Device: Send + Sync;
     /// The error type this backend returns

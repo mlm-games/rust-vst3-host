@@ -83,15 +83,16 @@ fn resolve_input_buffer_size(device: &Device, config: &AudioConfig) -> BufferSiz
     }
 }
 
-/// CPAL stream wrapper
+/// CPAL stream wrapper.
+///
+/// Inherits cpal's thread affinity: `cpal::Stream` is deliberately `!Send`, because on some
+/// backends the stream must be constructed, controlled and torn down on the same thread. This
+/// wrapper adds no synchronization, so it is `!Send` too and must stay on the thread that
+/// created it (which is why [`AudioHandle`](crate::AudioHandle), holding one, is also `!Send`).
 pub struct CpalStream {
     // We use Option to allow moving the stream in drop
     stream: Option<Stream>,
 }
-
-// Manually implement Send for CpalStream
-// This is safe because we only use the stream for play/pause operations
-unsafe impl Send for CpalStream {}
 
 impl AudioStream for CpalStream {
     fn play(&self) -> std::result::Result<(), Box<dyn std::error::Error>> {

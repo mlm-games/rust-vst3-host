@@ -94,6 +94,20 @@ pub struct BlockEvents {
     pub params: Vec<(u32, i32, f64)>,
 }
 
+/// How many frames [`Plugin::process_audio`] will render for `buffers`: the length of the first
+/// channel buffer (outputs first, then inputs), falling back to `block_size` when the buffers
+/// carry no channels at all. Mirrors the plugin's own derivation so the timeline windows events
+/// over exactly the span the plugin advances.
+fn rendered_frames(buffers: &AudioBuffers) -> usize {
+    buffers
+        .outputs
+        .iter()
+        .chain(buffers.inputs.iter())
+        .map(|channel| channel.len())
+        .next()
+        .unwrap_or(buffers.block_size)
+}
+
 /// A sample-accurate musical timeline driving MIDI clips and automation lanes into a plugin.
 #[derive(Debug, Clone)]
 pub struct Timeline {
@@ -216,9 +230,14 @@ impl Timeline {
     }
 
     /// Advance one block and drive it into `plugin`: schedule its MIDI and parameter changes at
-    /// their sample offsets, then render `buffers`. The block length is `buffers`' block size.
+    /// their sample offsets, then render `buffers`.
+    ///
+    /// The block length is the number of frames [`Plugin::process_audio`] will actually render
+    /// — the length of `buffers`' first channel buffer, not its `block_size` field. The two are
+    /// independent (both are public), and windowing by a different count than the plugin renders
+    /// would slip the timeline clock against the plugin's transport by the difference every block.
     pub fn drive_block(&mut self, plugin: &mut Plugin, buffers: &mut AudioBuffers) -> Result<()> {
-        let frames = buffers.block_size;
+        let frames = rendered_frames(buffers);
         let events = self.advance_block(frames);
         for (event, offset) in events.midi {
             plugin.send_midi_event_at(event, offset)?;
@@ -242,6 +261,30 @@ mod tests {
         t.seek_frame(u64::MAX);
         let _ = t.advance_block(1);
         let _ = t.advance_block(4096);
+    }
+
+    /// `AudioBuffers`' fields are public, so `block_size` can disagree with the channel buffers
+    /// the plugin actually renders. `drive_block` must window by the latter, or the timeline
+    /// clock and the plugin's transport drift apart by the difference every block.
+    #[test]
+    fn rendered_frames_follows_the_channel_buffers_not_block_size() {
+        let mut buffers = AudioBuffers::new(0, 2, 512, 48_000.0);
+        assert_eq!(rendered_frames(&buffers), 512);
+
+        // A caller (or a resizing bridge) hands over shorter channel buffers than `block_size`.
+        for channel in &mut buffers.outputs {
+            channel.resize(128, 0.0);
+        }
+        assert_eq!(rendered_frames(&buffers), 128);
+
+        // Input-only buffers fall through to the input channels.
+        let mut input_only = AudioBuffers::new(1, 0, 512, 48_000.0);
+        input_only.inputs[0].resize(64, 0.0);
+        assert_eq!(rendered_frames(&input_only), 64);
+
+        // No channels at all: nothing to measure, so `block_size` is the only answer.
+        let empty = AudioBuffers::new(0, 0, 256, 48_000.0);
+        assert_eq!(rendered_frames(&empty), 256);
     }
 
     use crate::midi::MidiChannel;

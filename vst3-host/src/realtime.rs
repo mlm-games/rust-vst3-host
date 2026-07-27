@@ -31,6 +31,36 @@
 use crate::{audio::AudioBuffers, error::Result, midi::MidiEvent, plugin::Plugin};
 use rtrb::{Consumer, Producer, RingBuffer};
 
+/// Whether `value` is a usable normalized parameter value: finite and within `0.0..=1.0`.
+///
+/// Checked on the control thread before a parameter change is queued. A bad value that reached
+/// the ring would be rejected inside the plugin on the *audio* thread, where the rejection
+/// allocates an error string and is then discarded — long after the caller was told the change
+/// had been accepted.
+pub(crate) fn is_normalized(value: f64) -> bool {
+    value.is_finite() && (0.0..=1.0).contains(&value)
+}
+
+/// Drain at most one ring's worth of queued commands from `rx`, handing each to `apply`.
+/// Returns how many were applied.
+///
+/// The bound is what makes this safe to call from an audio callback: the ring never fills while
+/// a drain keeps pace with it, so an unbounded `while let Ok(..) = pop()` lets a control thread
+/// pushing in a tight loop pin the callback for as long as it keeps pushing. Commands still
+/// queued when the budget runs out are applied on the next block.
+pub(crate) fn drain_commands<T>(rx: &mut Consumer<T>, mut apply: impl FnMut(T)) -> usize {
+    let budget = rx.buffer().capacity();
+    let mut applied = 0;
+    for _ in 0..budget {
+        let Ok(command) = rx.pop() else {
+            break;
+        };
+        apply(command);
+        applied += 1;
+    }
+    applied
+}
+
 /// A runtime transport change applied to the plugin's host `ProcessContext` on the audio
 /// thread, taking effect on the next block. Shared by the lock-free runner and the
 /// mutex-based playback path so both apply transport mutation the same way.
@@ -67,6 +97,14 @@ enum RtCommand {
     /// Deliver a MIDI event at `offset` samples into the next block.
     Midi { event: MidiEvent, offset: i32 },
     /// Set a normalized parameter value on the next block.
+    ///
+    /// Applying this calls `IEditController::setParamNormalized`, which the VST3 threading
+    /// model places in the main-thread domain — and the runner calls it from the audio thread.
+    /// That is a deliberate trade-off for this mode: the runner *owns* the plugin outright, so
+    /// no other thread can touch the controller concurrently, and no editor can be open (the
+    /// plugin cannot be shared with a GUI while the runner holds it). If you need an editor,
+    /// use the mutex path ([`crate::Vst3Host::play`]) instead, where control is applied under
+    /// the same lock the UI takes.
     Param { id: u32, value: f64 },
     /// Apply a transport change (tempo / time signature / playing) on the next block.
     Transport(TransportCommand),
@@ -91,6 +129,17 @@ enum RtCommand {
 /// alloc/realloc/free over a steady-state run driving parameters and MIDI). The host cannot
 /// guarantee the *plugin's* own `process()` is allocation-free — that is the plugin's
 /// responsibility; the guarantee is about the host code around it.
+///
+/// # Threading model
+///
+/// Applying a queued parameter change calls `IEditController::setParamNormalized`, which the
+/// VST3 threading model assigns to the **main-thread domain** — and [`process`](Self::process)
+/// calls it from the audio thread. That is accepted by design here, not an oversight: the
+/// runner takes ownership of the plugin, so nothing else can touch the controller concurrently,
+/// and no editor can be open in this mode (opening one requires sharing the plugin, which
+/// ownership rules out). If you need a plugin editor, use the mutex path
+/// ([`Vst3Host::play`](crate::Vst3Host::play)), where control is applied under the same lock
+/// the UI thread takes.
 ///
 /// It is **not yet fully lock-free**: `process` still takes a few short, uncontended mutexes
 /// per block (the parameter-change and event queues, and the level meter). They are uncontended
@@ -134,26 +183,29 @@ impl RealtimePluginRunner {
         self.plugin.stop_processing()
     }
 
-    /// Drain all queued control commands and render one block.
+    /// Drain queued control commands and render one block.
     ///
     /// Call this from the audio thread (e.g. inside your device callback). It performs only
     /// the lock-free queue drain plus the plugin's own processing — it never blocks on a lock
     /// a control thread could hold.
+    ///
+    /// The drain is bounded by the command queue's capacity. A control thread pushing in a
+    /// tight loop refills the queue as fast as this drains it, so an unbounded drain would pin
+    /// the audio callback; anything still queued is applied on the next block instead.
     pub fn process(&mut self, buffers: &mut AudioBuffers) -> Result<()> {
-        while let Ok(cmd) = self.rx.pop() {
-            match cmd {
-                RtCommand::Midi { event, offset } => {
-                    let _ = self.plugin.send_midi_event_at(event, offset);
-                }
-                RtCommand::Param { id, value } => {
-                    let _ = self.plugin.set_parameter(id, value);
-                }
-                RtCommand::Transport(change) => {
-                    change.apply(&mut self.plugin);
-                }
+        let Self { plugin, rx } = self;
+        drain_commands(rx, |command| match command {
+            RtCommand::Midi { event, offset } => {
+                let _ = plugin.send_midi_event_at(event, offset);
             }
-        }
-        self.plugin.process_audio(buffers)
+            RtCommand::Param { id, value } => {
+                let _ = plugin.set_parameter(id, value);
+            }
+            RtCommand::Transport(change) => {
+                change.apply(plugin);
+            }
+        });
+        plugin.process_audio(buffers)
     }
 
     /// Borrow the underlying plugin (e.g. to read parameters or info). Do **not** call this
@@ -189,9 +241,14 @@ impl RtControl {
         self.track(ok)
     }
 
-    /// Queue a normalized parameter change (`0.0..=1.0`) for the next block. Returns `false`
-    /// if the queue is full.
+    /// Queue a normalized parameter change for the next block. `value` must be finite and
+    /// within `0.0..=1.0`; an invalid value is rejected here (returns `false`) rather than
+    /// queued, so the caller learns about it instead of the audio thread silently discarding
+    /// it. Returns `false` if the queue is full.
     pub fn set_parameter(&mut self, id: u32, value: f64) -> bool {
+        if !is_normalized(value) {
+            return false;
+        }
         let ok = self.tx.push(RtCommand::Param { id, value }).is_ok();
         self.track(ok)
     }
@@ -328,6 +385,84 @@ mod tests {
             RtCommand::Midi { offset, .. } => assert_eq!(offset, 0),
             _ => panic!("expected a MIDI command"),
         }
+    }
+
+    /// `set_parameter` documents normalized values. A NaN or a `7.3` that reached the ring is
+    /// rejected on the *audio* thread — allocating an error string there and vanishing silently
+    /// after the caller was told the change succeeded.
+    #[test]
+    fn out_of_range_parameter_values_are_rejected_not_queued() {
+        let (tx, mut rx) = RingBuffer::<RtCommand>::new(8);
+        let mut control = RtControl { tx, dropped: 0 };
+
+        for bad in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            -0.1,
+            1.000_001,
+            7.3,
+        ] {
+            assert!(!control.set_parameter(1, bad), "{bad} must be rejected");
+        }
+        assert!(rx.pop().is_err(), "no invalid value reached the ring");
+        // Rejected on validation, not because the queue was full.
+        assert_eq!(control.dropped_command_count(), 0);
+
+        // Both endpoints of the normalized range are valid.
+        assert!(control.set_parameter(1, 0.0));
+        assert!(control.set_parameter(1, 1.0));
+        assert_eq!(rx.slots(), 2);
+    }
+
+    #[test]
+    fn is_normalized_accepts_exactly_the_unit_interval() {
+        assert!(is_normalized(0.0) && is_normalized(0.5) && is_normalized(1.0));
+        for bad in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            -1e-9,
+            1.0 + 1e-9,
+        ] {
+            assert!(!is_normalized(bad), "{bad} is not normalized");
+        }
+    }
+
+    /// An unbounded `while let Ok(..) = pop()` on the audio thread can be pinned indefinitely by
+    /// a control thread that pushes as fast as the callback drains: the ring never fills, so the
+    /// loop never ends. The drain is capped at one ring's worth per block instead.
+    #[test]
+    fn drain_commands_stops_after_one_ring_even_while_the_producer_refills() {
+        let (mut tx, mut rx) = RingBuffer::<u32>::new(4);
+        for i in 0..4 {
+            tx.push(i).expect("ring holds 4");
+        }
+
+        // Refill from inside the drain, standing in for the tight-loop control thread.
+        let mut seen = Vec::new();
+        let applied = drain_commands(&mut rx, |command| {
+            seen.push(command);
+            let _ = tx.push(100 + command);
+        });
+
+        assert_eq!(applied, 4, "exactly one ring's worth per call");
+        assert_eq!(seen, vec![0, 1, 2, 3]);
+        assert_eq!(
+            rx.slots(),
+            4,
+            "the commands pushed during the drain wait for the next block"
+        );
+    }
+
+    #[test]
+    fn drain_commands_stops_early_on_an_empty_ring() {
+        let (mut tx, mut rx) = RingBuffer::<u32>::new(64);
+        tx.push(7).expect("room");
+        let mut seen = Vec::new();
+        assert_eq!(drain_commands(&mut rx, |c| seen.push(c)), 1);
+        assert_eq!(seen, vec![7]);
+        assert_eq!(drain_commands(&mut rx, |c| seen.push(c)), 0);
     }
 
     #[test]
