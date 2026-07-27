@@ -6,6 +6,92 @@ All notable changes to `vst3-host` are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed (third pass — five parallel subsystem reviews)
+
+Five reviewers went over the whole workspace — COM internals, the realtime path, process
+isolation, the public surface, the inspector — and every confirmed finding was fixed and
+regression-tested (four new test files, ~50 findings). Highlights:
+
+- **Plugin stdout could permanently desync the isolation protocol.** The helper's protocol
+  channel was fd 1, shared with the plugin it hosts; one `printf` line and every later
+  command received the *previous* command's reply — silently. The helper now claims a
+  private fd for the protocol and points fd 1 at stderr before any plugin code runs.
+  Relatedly, NaN/Inf samples no longer break the Process exchange: audio crosses the wire
+  as base64 bit patterns instead of JSON numbers (which encode non-finite as `null`).
+- **The VST3 lifecycle order was wrong on the primary path**: `setActive` ran before any
+  `setupProcessing`, so a plugin that sizes its DSP during activation prepared at its
+  default rate. Measured on Dexed at 96 kHz: envelope timing was 48% off, now 1.2%. Setup
+  now runs first, and a changed configuration deactivates before re-running setup, as the
+  spec requires and `reconfigure` already enforced.
+- **`IComponent::initialize` failures were ignored**, and error unwind after a successful
+  init released COM objects without `terminate()` before unloading the bundle — a plugin
+  thread started in init could be executing unmapped code. Both fixed; teardown is a scope
+  guard sharing its implementation with `Drop`.
+- **The duplex input bridge dropped samples, not frames, on ring overflow** — one overflow
+  left stereo permanently L/R-swapped. Push/pop are now frame-atomic and the ring capacity
+  is always a whole number of frames.
+- **A probed plugin's grandchild could hang `discover_plugins_safe` forever** (and
+  `Plugin::drop`, via the same unbounded pipe-reader join in the isolation supervisor):
+  the pipe only hits EOF when *every* write end closes, and license-daemon-style children
+  inherit it. All waits are bounded now; readers detach instead of joining.
+- **Split blocks fired every queued event in chunk 0** with clamped offsets — up to ~20 ms
+  early, collapsing relative timing between events. Events and parameter changes now land
+  in the chunk containing their offset, rebased.
+- **`MemoryStream` could be panicked across the FFI boundary** (process abort) by a huge
+  seek followed by a write; now checked arithmetic against a 64 MiB cap with proper COM
+  error codes instead of unwinding out of an `extern "system"` thunk.
+- Isolation robustness: a helper crash mid-response is classified as `PluginCrashed`
+  immediately (was `Error::Other` for one command cycle); recovery replays live transport
+  (tempo, time signature, playing) instead of load-time values; load/save-state commands
+  get their own 30 s deadline and a timeout on them is not auto-retried into a
+  helper-killing loop; all helper output is bounded and wire-provided counts clamped.
+- Panics and contract gaps reachable from safe code: `render_to_wav(f64::INFINITY)`
+  capacity-overflow panic; unvalidated `MidiEvent` fields reaching plugins as out-of-spec
+  values (pitch 255, velocity 2.0, negative CC bytes); `points_for_block` offsets wrapping
+  past `i32::MAX`; `note_to_name` fabricating names for 128–255 that `name_to_note`
+  rejects; the builder accepting time signatures the runtime rejects;
+  `process_audio`-while-stopped allocating a String per block on the audio thread instead
+  of returning `Error::NotProcessing`; unbounded `pending_param_changes` growth while
+  stopped; and audio-callback command drains with no iteration cap.
+- `restartComponent` flags are recorded and exposed (`Plugin::take_restart_flags`) instead
+  of acknowledged and dropped; multi-class factories report the class actually
+  instantiated, not the first audio class; macOS bundle loading honors
+  `CFBundleExecutable` before falling back to scanning `Contents/MacOS`.
+
+### Changed (breaking — lands in the next release)
+
+- `WindowHandle::from_nsview` / `from_hwnd` are now `unsafe fn`: they grant exactly the
+  capability `from_raw` guards, and a safe caller could previously make the plugin
+  dereference a garbage pointer. `from_x11` remains safe (X11 ids are integers).
+- `AudioHandle` / `RtAudioHandle` are now genuinely `!Send`, as their docs always claimed:
+  the `unsafe impl Send` on the cpal stream wrapper is gone (`AudioStream` and
+  `AudioBackend::Stream` dropped their `Send` bounds). `MidiSink`, `RtControl` and
+  `RealtimePluginRunner` remain `Send`.
+- The isolation wire format changed (base64 audio, tagged non-finite floats): the
+  `vst3-host-helper` binary must come from the same build as the library (`just helper`).
+  A hosted plugin's stdout now appears on the host's stderr.
+- `SafeDiscoveryReport` gained a public `error` field (plus `scan_ran()`), so a scan that
+  could not run is distinguishable from "no plugins installed".
+- `Vst3HostBuilder::build()` rejects time signatures the runtime rejects (denominator not
+  in 1|2|4|8|16); previously they were accepted and advertised to every plugin.
+
+### vst3-inspector
+
+- Loading a plugin resets per-plugin UI state: automation detaches from its parameter id
+  (it previously kept writing the old id into the newly loaded plugin at ~60 fps), the
+  stale edit highlight clears, and held virtual-keyboard keys are released.
+- A failed load can be retried — a plugin is only "Current" once its load succeeded — and
+  the session file remembers the loaded path, not the last attempt.
+- The headless selftest fails on silence instead of printing `SELFTEST OK` regardless.
+- MIDI handling: file playback resyncs its clock after a UI stall instead of flushing the
+  backlog through the command ring (dropped NoteOffs no longer leave notes stuck), MIDI
+  input connects by port name so device hotplug can't bind the wrong port, file-player
+  events show up in the MIDI Monitor, and plugin channel aftertouch is labeled correctly.
+- The native editor window's close button is detected (macOS visibility probe; Windows
+  handles `WM_CLOSE` itself instead of letting the HWND die under a live `IPlugView`) and
+  the GUI state resyncs; file dialogs run async so they no longer freeze the plugin
+  editor's run loop.
+
 ### Fixed (second review pass)
 
 Three more reviewers went at the crate — one debugging a real crash, one attacking the changes
