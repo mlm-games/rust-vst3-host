@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::ptr;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use vst3::{Class, ComWrapper, Interface, Steinberg::Vst::*, Steinberg::*};
 
@@ -307,6 +307,15 @@ struct MemBuf {
     pos: usize,
 }
 
+/// Cap on how large a plugin can grow a host-provided state stream (and how far it may seek
+/// into one). The cursor and the write length both come from the plugin, and the buffer grows
+/// to `cursor + length`: without a bound, a wild seek turns the following write into a
+/// multi-gigabyte `Vec::resize` — a capacity-overflow panic inside an `extern "system"` vtable
+/// thunk, which aborts the process rather than unwinding. 64 MiB is far above any real plugin
+/// state (the largest sample-library presets are a few MiB). Mirrors the `MAX_*` caps on every
+/// other host-side buffer; over-cap operations fail with a result code instead of allocating.
+pub const MAX_STREAM_BYTES: usize = 64 * 1024 * 1024;
+
 /// Host implementation of `IBStream` over an in-memory buffer.
 pub struct MemoryStream {
     inner: Mutex<MemBuf>,
@@ -328,19 +337,23 @@ impl MemoryStream {
     }
 
     // Safe inner ops — also the unit-test surface for the read/write/seek logic.
-    fn write_at_cursor(&self, src: &[u8]) -> usize {
-        if let Ok(mut b) = self.inner.lock() {
-            let end = b.pos + src.len();
-            if end > b.data.len() {
-                b.data.resize(end, 0);
-            }
-            let pos = b.pos;
-            b.data[pos..end].copy_from_slice(src);
-            b.pos = end;
-            src.len()
-        } else {
-            0
+
+    /// Write `src` at the cursor, zero-filling any gap a prior seek left past the end, and
+    /// return the number of bytes written. `None` when the write would grow the buffer past
+    /// [`MAX_STREAM_BYTES`] (or overflow `usize`), leaving the stream untouched.
+    fn write_at_cursor(&self, src: &[u8]) -> Option<usize> {
+        let mut b = self.inner.lock().ok()?;
+        let end = b.pos.checked_add(src.len())?;
+        if end > MAX_STREAM_BYTES {
+            return None;
         }
+        if end > b.data.len() {
+            b.data.resize(end, 0);
+        }
+        let pos = b.pos;
+        b.data[pos..end].copy_from_slice(src);
+        b.pos = end;
+        Some(src.len())
     }
 
     fn read_at_cursor(&self, n: usize) -> Vec<u8> {
@@ -355,19 +368,23 @@ impl MemoryStream {
         }
     }
 
-    fn seek_to(&self, pos: i64, mode: u32) -> i64 {
-        if let Ok(mut b) = self.inner.lock() {
-            let base = match mode {
-                SEEK_CUR => b.pos as i64,
-                SEEK_END => b.data.len() as i64,
-                _ => 0, // SEEK_SET
-            };
-            let new = (base + pos).max(0);
-            b.pos = new as usize;
-            new
-        } else {
-            0
+    /// Move the cursor and return its new absolute position. A position before the start is
+    /// clamped to 0 (a lenient plugin seeking past the beginning still lands on a valid
+    /// stream); one past [`MAX_STREAM_BYTES`] is rejected with `None`, because the cursor is
+    /// what the next write grows the buffer to.
+    fn seek_to(&self, pos: i64, mode: u32) -> Option<i64> {
+        let mut b = self.inner.lock().ok()?;
+        let base = match mode {
+            SEEK_CUR => b.pos as i64,
+            SEEK_END => b.data.len() as i64,
+            _ => 0, // SEEK_SET
+        };
+        let new = base.checked_add(pos)?.max(0);
+        if new > MAX_STREAM_BYTES as i64 {
+            return None;
         }
+        b.pos = new as usize;
+        Some(new)
     }
 
     fn position(&self) -> i64 {
@@ -411,7 +428,15 @@ impl IBStreamTrait for MemoryStream {
             return kResultFalse;
         }
         let src = std::slice::from_raw_parts(buffer as *const u8, num_bytes as usize);
-        let written = self.write_at_cursor(src);
+        // A refused write reports zero bytes written and kOutOfMemory: the plugin's own error
+        // path is the only correct answer here, since panicking (or aborting on a capacity
+        // overflow) would unwind out of a C++ call.
+        let Some(written) = self.write_at_cursor(src) else {
+            if !num_bytes_written.is_null() {
+                *num_bytes_written = 0;
+            }
+            return kOutOfMemory;
+        };
         if !num_bytes_written.is_null() {
             *num_bytes_written = written as i32;
         }
@@ -419,7 +444,9 @@ impl IBStreamTrait for MemoryStream {
     }
 
     unsafe fn seek(&self, pos: i64, mode: i32, result: *mut i64) -> tresult {
-        let new = self.seek_to(pos, mode as u32);
+        let Some(new) = self.seek_to(pos, mode as u32) else {
+            return kInvalidArgument;
+        };
         if !result.is_null() {
             *result = new;
         }
@@ -649,6 +676,11 @@ pub struct ComponentHandler {
     // the host can reconstruct each gesture (drained via `take_parameter_edits`). This is the
     // richer superset of `parameter_changes` (which keeps only the value changes for the DSP).
     edits: Arc<Mutex<Vec<crate::plugin::ParameterEdit>>>,
+    // Union of every `restartComponent` flag the plugin has raised since the host last drained
+    // it. A bitmask rather than a log: the flags are idempotent requests ("my latency changed",
+    // "re-read my parameters"), so accumulating them is both complete and inherently bounded —
+    // a plugin that spams restartComponent while nothing polls costs one word, not a queue.
+    restart_flags: AtomicI32,
 }
 
 impl ComponentHandler {
@@ -656,7 +688,13 @@ impl ComponentHandler {
         ComponentHandler {
             parameter_changes,
             edits: Arc::new(Mutex::new(Vec::with_capacity(MAX_EDITOR_FEEDBACK))),
+            restart_flags: AtomicI32::new(0),
         }
+    }
+
+    /// Take the accumulated `restartComponent` flags, clearing them.
+    pub fn take_restart_flags(&self) -> crate::plugin::RestartFlags {
+        crate::plugin::RestartFlags::from_bits(self.restart_flags.swap(0, Ordering::AcqRel))
     }
 
     /// Drain the ordered parameter-edit gesture log accumulated since the last call.
@@ -726,7 +764,11 @@ impl IComponentHandlerTrait for ComponentHandler {
     }
 
     unsafe fn restartComponent(&self, flags: i32) -> i32 {
-        log::debug!("Host: Restart component requested with flags: {}", flags);
+        log::debug!("Host: Restart component requested with flags: {flags:#x}");
+        // Recorded for the host to poll (`Plugin::take_restart_flags`), not acted on here: the
+        // host decides what a restart means for it. See `RestartFlags` for which flags this
+        // library handles on the host's behalf (none, currently) and which need host action.
+        self.restart_flags.fetch_or(flags, Ordering::AcqRel);
         kResultOk
     }
 }
@@ -784,14 +826,31 @@ impl HostEventList {
         }
     }
 
-    /// Clamp every queued event's `sampleOffset` into `[0, max_offset]`, so an event scheduled
-    /// beyond a (possibly smaller-than-nominal) processed block lands at the block edge rather
-    /// than past it. Called at the start of `process()` once the real frame count is known.
-    pub fn clamp_offsets(&self, max_offset: i32) {
+    /// Move every queued event into `out` (replacing its contents), leaving the list empty and
+    /// both buffers' capacities intact. `process()` takes a block's events aside this way and
+    /// then stages them back one chunk at a time.
+    pub fn take_into(&self, out: &mut Vec<Event>) {
+        out.clear();
         if let Ok(mut events) = self.events.lock() {
-            for e in events.iter_mut() {
-                e.sampleOffset = e.sampleOffset.clamp(0, max_offset);
+            out.extend_from_slice(&events);
+            events.clear();
+        }
+    }
+
+    /// Replace the queued events with `events`, reusing the existing allocation. Capped like
+    /// every other path into the list; the excess is dropped with a warning.
+    pub fn reset_with(&self, events: impl IntoIterator<Item = Event>) {
+        let Ok(mut queued) = self.events.lock() else {
+            log::error!("HostEventList: Failed to lock events for reset_with");
+            return;
+        };
+        queued.clear();
+        for event in events {
+            if queued.len() >= MAX_QUEUED_EVENTS {
+                log::warn!("HostEventList: dropping event, queue full at {MAX_QUEUED_EVENTS}");
+                break;
             }
+            queued.push(event);
         }
     }
 
@@ -1315,6 +1374,40 @@ mod component_handler_tests {
         assert!(handler.take_parameter_edits().is_empty());
         assert!(handler.edits.lock().unwrap().capacity() >= MAX_EDITOR_FEEDBACK);
     }
+
+    /// `restartComponent` is how a plugin tells the host something about it changed. Every flag
+    /// used to be acknowledged and dropped; they must survive until the host drains them.
+    #[test]
+    fn restart_flags_accumulate_until_drained() {
+        use vst3::Steinberg::Vst::RestartFlags_ as Flags;
+        let handler = ComponentHandler::new(Arc::new(Mutex::new(Vec::new())));
+        assert!(handler.take_restart_flags().is_empty());
+
+        // Two separate restarts, e.g. a preset load followed by a mode switch.
+        unsafe {
+            handler.restartComponent(Flags::kParamValuesChanged | Flags::kParamTitlesChanged);
+            handler.restartComponent(Flags::kLatencyChanged);
+        }
+
+        let flags = handler.take_restart_flags();
+        assert!(flags.param_values_changed());
+        assert!(flags.param_titles_changed());
+        assert!(flags.latency_changed());
+        assert!(!flags.io_changed());
+
+        // Draining clears them, so the host doesn't act on the same request twice.
+        assert!(handler.take_restart_flags().is_empty());
+
+        // A plugin that spams restarts while nothing polls costs one word, not a queue.
+        unsafe {
+            for _ in 0..10_000 {
+                handler.restartComponent(Flags::kIoChanged);
+            }
+        }
+        let flags = handler.take_restart_flags();
+        assert!(flags.io_changed());
+        assert_eq!(flags.bits(), Flags::kIoChanged);
+    }
 }
 
 #[cfg(test)]
@@ -1529,12 +1622,12 @@ mod memory_stream_tests {
     #[test]
     fn write_then_read_round_trips_from_start() {
         let s = MemoryStream::new(Vec::new());
-        assert_eq!(s.write_at_cursor(&[1, 2, 3, 4]), 4);
+        assert_eq!(s.write_at_cursor(&[1, 2, 3, 4]), Some(4));
         assert_eq!(s.position(), 4);
         assert_eq!(s.to_vec(), vec![1, 2, 3, 4]);
 
         // Rewind (mode 0 = SEEK_SET) and read it all back.
-        assert_eq!(s.seek_to(0, 0), 0);
+        assert_eq!(s.seek_to(0, 0), Some(0));
         assert_eq!(s.read_at_cursor(4), vec![1, 2, 3, 4]);
     }
 
@@ -1550,14 +1643,85 @@ mod memory_stream_tests {
     fn seek_modes_and_overwrite() {
         let s = MemoryStream::new(vec![0, 0, 0, 0]);
         // SEEK_END then write appends.
-        assert_eq!(s.seek_to(0, SEEK_END), 4);
+        assert_eq!(s.seek_to(0, SEEK_END), Some(4));
         s.write_at_cursor(&[5]);
         assert_eq!(s.to_vec(), vec![0, 0, 0, 0, 5]);
         // SEEK_SET to 1 then overwrite in place.
-        assert_eq!(s.seek_to(1, 0), 1);
+        assert_eq!(s.seek_to(1, 0), Some(1));
         s.write_at_cursor(&[7, 7]);
         assert_eq!(s.to_vec(), vec![0, 7, 7, 0, 5]);
-        // SEEK_CUR is relative.
-        assert_eq!(s.seek_to(-3, SEEK_CUR), 0);
+        // SEEK_CUR is relative, and a seek before the start clamps to it.
+        assert_eq!(s.seek_to(-3, SEEK_CUR), Some(0));
+        assert_eq!(s.seek_to(-100, SEEK_CUR), Some(0));
+    }
+
+    /// The cursor and the write length both come from the plugin, and the buffer grows to
+    /// `cursor + length`. A wild seek followed by any write must not turn into a multi-gigabyte
+    /// allocation — that panics on capacity overflow inside a vtable thunk, which aborts the
+    /// process instead of unwinding.
+    #[test]
+    fn huge_seek_then_write_is_refused_instead_of_allocating() {
+        let s = MemoryStream::new(Vec::new());
+
+        // Past the cap: the seek itself is refused, so the cursor never gets there.
+        assert_eq!(s.seek_to(i64::MAX / 2, 0), None);
+        assert_eq!(s.position(), 0);
+        assert_eq!(s.seek_to(MAX_STREAM_BYTES as i64 + 1, 0), None);
+        assert_eq!(s.position(), 0);
+
+        // At the cap the seek is allowed, but the write that would grow past it is not, and
+        // the stream is left untouched.
+        assert_eq!(
+            s.seek_to(MAX_STREAM_BYTES as i64, 0),
+            Some(MAX_STREAM_BYTES as i64)
+        );
+        assert_eq!(s.write_at_cursor(&[1]), None);
+        assert!(s.to_vec().is_empty());
+    }
+
+    /// The same refusal through the COM vtable, which is where a real plugin arrives: a result
+    /// code and a zero byte count, never a panic.
+    #[test]
+    fn com_write_past_the_cap_reports_an_error_code() {
+        let s = MemoryStream::new(Vec::new());
+        let mut byte = 0u8;
+        let mut written: i32 = -1;
+
+        unsafe {
+            // A seek beyond the cap is rejected outright...
+            let mut pos: i64 = -1;
+            assert_eq!(
+                s.seek(MAX_STREAM_BYTES as i64 * 4, 0, &mut pos),
+                kInvalidArgument
+            );
+
+            // ...and a write from a legal cursor that would cross it fails cleanly.
+            assert_eq!(s.seek(MAX_STREAM_BYTES as i64, 0, &mut pos), kResultOk);
+            assert_eq!(pos, MAX_STREAM_BYTES as i64);
+            let result = s.write(
+                &mut byte as *mut u8 as *mut std::ffi::c_void,
+                1,
+                &mut written,
+            );
+            assert_eq!(result, kOutOfMemory);
+            assert_eq!(written, 0);
+        }
+        assert!(s.to_vec().is_empty());
+    }
+
+    /// Growth is bounded like every other host-side buffer: a plugin that keeps writing hits
+    /// the cap and is told so, rather than growing the host's memory without limit.
+    #[test]
+    fn total_size_is_capped() {
+        let s = MemoryStream::new(Vec::new());
+        // Land one byte short of the cap, then write two.
+        assert_eq!(
+            s.seek_to(MAX_STREAM_BYTES as i64 - 1, 0),
+            Some(MAX_STREAM_BYTES as i64 - 1)
+        );
+        assert_eq!(s.write_at_cursor(&[1]), Some(1));
+        assert_eq!(s.to_vec().len(), MAX_STREAM_BYTES);
+        assert_eq!(s.write_at_cursor(&[2]), None);
+        assert_eq!(s.to_vec().len(), MAX_STREAM_BYTES);
     }
 }

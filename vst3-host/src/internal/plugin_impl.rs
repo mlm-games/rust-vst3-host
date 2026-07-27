@@ -22,7 +22,7 @@ use super::{
     com_implementations::{
         create_event_list, create_host_application, create_host_plug_frame, create_memory_stream,
         create_memory_stream_from, ComponentHandler, HostApplication, HostEventList, HostPlugFrame,
-        ParameterChanges, MAX_EDITOR_FEEDBACK,
+        ParameterChanges, MAX_EDITOR_FEEDBACK, MAX_QUEUED_EVENTS,
     },
     module_loader::{load_module, VstModule},
 };
@@ -34,6 +34,14 @@ const MAX_OUTPUT_MIDI: usize = 4096;
 /// Cap on simultaneously tracked `note_on` ids (see `PluginImpl::active_notes`). Far above any
 /// real polyphony, and bounds a caller that starts notes it never releases.
 const MAX_TRACKED_NOTES: usize = 1024;
+
+/// Cap on parameter changes queued for the next block (see `PluginImpl::pending_param_changes`).
+/// The queue's only drain is `process()`, which returns early while the plugin isn't processing —
+/// so a host whose stream keeps running after `stop_processing`, or one automating parameters
+/// before playback starts, would otherwise grow it forever and then flood a single block with the
+/// whole backlog. The sibling of `MAX_QUEUED_EVENTS` on the MIDI side: pre-reserved so the audio
+/// path never reallocates, and changes past the cap are dropped (and counted).
+const MAX_PENDING_PARAM_CHANGES: usize = 4096;
 
 /// Internal plugin implementation that handles all VST3 COM interactions
 pub struct PluginImpl {
@@ -54,6 +62,10 @@ pub struct PluginImpl {
     is_processing: bool,
     sample_rate: f64,
     block_size: usize,
+    /// The configuration the plugin's last successful `setupProcessing` carried, so
+    /// `start_processing` can tell a re-start (nothing to do) from a configuration change
+    /// (which has to be applied while the component is inactive). `None` until the first setup.
+    applied_setup: Option<AppliedSetup>,
     /// Transport tempo (BPM) advertised in the host `ProcessContext`.
     tempo: f64,
     /// Time signature numerator advertised in the host `ProcessContext`.
@@ -78,7 +90,11 @@ pub struct PluginImpl {
     // Parameter changes queued by the host (set_parameter / automation) to be fed into the
     // processor's input parameter queue at the start of the next process() block. Serialized
     // with process() by the caller's &mut access, so a plain Vec (no lock) is sufficient.
+    // Pre-reserved to MAX_PENDING_PARAM_CHANGES and capped there — see the constant.
     pending_param_changes: Vec<ParameterChange>,
+    // How many parameter changes have been dropped because the queue was full. Reported in the
+    // warning so a host sees a running total rather than one line per lost change.
+    dropped_param_changes: u64,
 
     // Parameter edits the plugin's *own editor* reported via `IComponentHandler::performEdit`,
     // after `process()` has routed them into the processor's input queue. Drained by the host
@@ -90,6 +106,11 @@ pub struct PluginImpl {
     // Event handling
     input_events: ComWrapper<HostEventList>,
     output_events: ComWrapper<HostEventList>,
+    // Holds a block's queued input events while `process` distributes them over the block's
+    // chunks: each chunk is staged into `input_events` with only the events that fall inside it.
+    // Pre-reserved to MAX_QUEUED_EVENTS (the input list's own cap), so splitting a block never
+    // allocates on the audio thread.
+    chunk_events: Vec<Event>,
     // MIDI the plugin has emitted (captured from output_events after each process block,
     // converted to MidiEvent), buffered for the host to poll. A lock-free bounded queue so the
     // audio thread can push without locking and a UI thread can drain concurrently; when full
@@ -131,6 +152,18 @@ struct HostProcessData {
     // them every block — keeping the steady-state audio path allocation-free.
     input_channel_ptrs: SendChannelPtrs,
     output_channel_ptrs: SendChannelPtrs,
+}
+
+/// The processing configuration handed to the plugin by `setupProcessing`, cached so a
+/// re-start can tell "nothing changed" (skip setup, the plugin still has it) from "the host
+/// reconfigured me" (setup must be re-run, and only while the component is inactive).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct AppliedSetup {
+    sample_rate: f64,
+    block_size: usize,
+    /// The VST3 `ProcessModes` value, not the safe enum — this is compared against what was
+    /// actually written into `ProcessSetup`.
+    process_mode: i32,
 }
 
 /// Per-bus channel pointers into the (audio-thread-owned) audio buffers.
@@ -228,7 +261,10 @@ impl PluginImpl {
             log::info!("=== PLUGIN LOADING START ===");
             log::info!("Loading plugin from: {}", path.display());
 
-            // Load the VST3 module using platform-specific loader
+            // Load the VST3 module using platform-specific loader. Declared first so it drops
+            // LAST: everything below lives in the module's address space, and the COM teardown
+            // (whether via `InitializedComponent` or `Drop for PluginImpl`) must complete before
+            // the module unmaps.
             log::debug!("Step 1: Loading VST3 module...");
             let module = load_module(path)?;
             log::debug!("VST3 module loaded successfully");
@@ -251,8 +287,8 @@ impl PluginImpl {
 
             // Find and create the audio component
             log::debug!("Step 4: Creating audio component...");
-            let component = Self::create_component(&factory)?;
-            log::debug!("Component created successfully");
+            let (component, class_index) = Self::create_component(&factory)?;
+            log::debug!("Component created successfully (class index {class_index})");
 
             // Initialize component with a host-application context. Passing null here
             // crashes plugins that query the host (u-he, Waves, ...); see HostApplication.
@@ -264,7 +300,21 @@ impl PluginImpl {
                 .map(|p| p.as_ptr() as *mut FUnknown)
                 .unwrap_or(ptr::null_mut());
             let init_result = component.initialize(context);
-            log::debug!("Component initialized with result: {:#x}", init_result);
+            if init_result != kResultOk {
+                // A component that failed to initialize must NOT be terminated (terminate pairs
+                // with a *successful* initialize), and must certainly not be driven on through
+                // activateBus/setActive/process — so bail before anything else touches it. The
+                // ComPtr releases it here and the module unloads as this frame unwinds.
+                return Err(Error::PluginLoadFailed(format!(
+                    "IComponent::initialize failed: {init_result:#x}"
+                )));
+            }
+            log::debug!("Component initialized with result: {init_result:#x}");
+
+            // The component is live from here: it may have spawned threads and registered
+            // callbacks, so every failure below has to run the full ordered teardown before the
+            // module unloads. The guard does that until the finished `PluginImpl` takes over.
+            let mut initialized = InitializedComponent::new(component.clone());
 
             // CRITICAL: Activate event buses for MIDI processing
             log::debug!("Step 6: Activating event buses...");
@@ -291,6 +341,7 @@ impl PluginImpl {
             // plugin; this distinction matters for state restore (see `single_component`).
             let single_component = component.cast::<IEditController>().is_some();
             let controller = Self::get_or_create_controller(&component, &factory, context)?;
+            initialized.attach_controller(controller.clone(), single_component);
             log::debug!(
                 "Controller obtained: {} (single_component: {single_component})",
                 controller.is_some()
@@ -323,21 +374,6 @@ impl PluginImpl {
                 log::debug!("Skipping component→controller state transfer at load");
             }
 
-            // Activate component (important for parameter access)
-            log::debug!("Step 12: Activating component...");
-            let activate_result = component.setActive(1);
-            log::debug!("Component activation result: {:#x}", activate_result);
-            let is_active = if activate_result == kResultOk {
-                log::debug!("Component activated successfully during initialization");
-                true
-            } else {
-                log::warn!(
-                    "Component activation failed during initialization: {:#x}",
-                    activate_result
-                );
-                false
-            };
-
             // Editor resize plumbing (an IPlugFrame the view can call into),
             // plus the Linux IRunLoop registry VSTGUI-based editors need.
             let editor_resize = Arc::new(Mutex::new(None));
@@ -354,8 +390,10 @@ impl PluginImpl {
             let output_events = create_event_list();
             log::debug!("Event lists created");
 
-            // Extract plugin info from the factory and component
-            let info = Self::extract_plugin_info(path, &factory, &component, &controller)?;
+            // Extract plugin info from the factory and component. Keyed on the class that was
+            // actually instantiated, so a multi-class factory reports the uid the host can
+            // reload (or respawn under isolation) to get this same component back.
+            let info = Self::extract_plugin_info(path, &factory, &component, class_index)?;
 
             let has_gui = controller.is_some() && {
                 if let Some(ref ctrl) = controller {
@@ -378,24 +416,23 @@ impl PluginImpl {
             let mut updated_info = info;
             updated_info.has_gui = has_gui;
 
-            log::info!("=== PLUGIN LOADING COMPLETE ===");
             log::info!(
                 "Plugin info: {} by {}",
                 updated_info.name,
                 updated_info.vendor
             );
-            log::info!("Has GUI: {}, Active: {}", updated_info.has_gui, is_active);
 
-            Ok(Self {
+            let mut plugin = Self {
                 component,
                 processor,
                 controller,
                 single_component,
                 info: updated_info,
-                is_active,
+                is_active: false,
                 is_processing: false,
                 sample_rate: 44100.0,
                 block_size: 512,
+                applied_setup: None,
                 tempo: 120.0,
                 time_sig_numerator: 4,
                 time_sig_denominator: 4,
@@ -405,12 +442,14 @@ impl PluginImpl {
                 active_notes: Vec::with_capacity(MAX_TRACKED_NOTES),
                 process_data: None,
                 component_handler: Some(component_handler),
-                pending_param_changes: Vec::new(),
+                pending_param_changes: Vec::with_capacity(MAX_PENDING_PARAM_CHANGES),
+                dropped_param_changes: 0,
                 gui_param_changes_for_host: Arc::new(Mutex::new(Vec::with_capacity(
                     MAX_EDITOR_FEEDBACK,
                 ))),
                 input_events,
                 output_events,
+                chunk_events: Vec::with_capacity(MAX_QUEUED_EVENTS),
                 output_midi: Arc::new(ArrayQueue::new(MAX_OUTPUT_MIDI)),
                 plugin_view: None,
                 plug_frame,
@@ -419,16 +458,63 @@ impl PluginImpl {
                 run_loop,
                 _host_app: host_app,
                 _module: module,
-            })
+            };
+            // From here on `plugin` owns the teardown: dropping it runs the same ordered
+            // sequence the guard would.
+            initialized.disarm();
+
+            // VST3 lifecycle: `setupProcessing` and bus activation require an INACTIVE
+            // component, and a plugin sizes its DSP buffers when it goes active, from the
+            // ProcessSetup it was last given. So set up first, activate second — activating an
+            // un-set-up component hands it whatever defaults it was born with.
+            //
+            // Both are best-effort here, and neither failure fails the load: this runs at the
+            // internal default configuration (the host applies its real sample rate and block
+            // size immediately after load), the plugin remains fully inspectable either way, and
+            // `start_processing` re-runs both with the real settings and reports a genuine
+            // failure there.
+            if let Err(e) = plugin.setup_processing() {
+                log::warn!("setupProcessing failed at load ({e}); deferring to start_processing");
+            } else if let Err(e) = plugin.activate() {
+                log::warn!(
+                    "Component activation failed at load ({e}); deferring to start_processing"
+                );
+            }
+
+            log::info!("=== PLUGIN LOADING COMPLETE ===");
+            log::info!(
+                "Has GUI: {}, Active: {}",
+                plugin.info.has_gui,
+                plugin.is_active
+            );
+            Ok(plugin)
         }
     }
 
-    /// Extract plugin info from factory and component
+    /// Put the component into the active state (`IComponent::setActive(true)`).
+    ///
+    /// Only valid once the component has been given a `ProcessSetup` — see the ordering note in
+    /// [`Self::load`].
+    fn activate(&mut self) -> Result<()> {
+        let result = unsafe { self.component.setActive(1) };
+        if result != kResultOk {
+            return Err(Error::Other(format!(
+                "Failed to activate component: {result:#x}"
+            )));
+        }
+        self.is_active = true;
+        Ok(())
+    }
+
+    /// Describe the plugin class at `class_index` — the class [`Self::create_component`]
+    /// actually instantiated, not merely the first audio class the factory lists. A factory can
+    /// export several audio classes (a synth plus its effect sibling, or per-format variants),
+    /// and the reported `uid` is what a host stores to reload this exact plugin.
     fn extract_plugin_info(
         path: &std::path::Path,
         factory: &ComPtr<IPluginFactory>,
         component: &ComPtr<IComponent>,
-        _controller: &Option<ComPtr<IEditController>>,
+        class_index: i32,
     ) -> Result<PluginInfo> {
         unsafe {
             // Get factory info
@@ -436,100 +522,62 @@ impl PluginImpl {
             factory.getFactoryInfo(&mut factory_info);
             let vendor = crate::internal::utils::c_str_to_string(&factory_info.vendor);
 
-            // Find audio component class info
-            let num_classes = factory.countClasses();
-            for i in 0..num_classes {
-                let mut class_info: PClassInfo = std::mem::zeroed();
-                if factory.getClassInfo(i, &mut class_info) == kResultOk {
-                    let category = crate::internal::utils::c_str_to_string(&class_info.category);
-
-                    if category.contains("Audio Module Class") {
-                        let name = crate::internal::utils::c_str_to_string(&class_info.name);
-                        let cid = class_info.cid;
-                        let uid = format!(
-                            "{:08X}{:08X}{:08X}{:08X}",
-                            u32::from_be_bytes([
-                                cid[0] as u8,
-                                cid[1] as u8,
-                                cid[2] as u8,
-                                cid[3] as u8
-                            ]),
-                            u32::from_be_bytes([
-                                cid[4] as u8,
-                                cid[5] as u8,
-                                cid[6] as u8,
-                                cid[7] as u8
-                            ]),
-                            u32::from_be_bytes([
-                                cid[8] as u8,
-                                cid[9] as u8,
-                                cid[10] as u8,
-                                cid[11] as u8
-                            ]),
-                            u32::from_be_bytes([
-                                cid[12] as u8,
-                                cid[13] as u8,
-                                cid[14] as u8,
-                                cid[15] as u8
-                            ])
-                        );
-
-                        // Count audio buses
-                        let audio_inputs =
-                            component.getBusCount(kAudio as i32, kInput as i32) as u32;
-                        let audio_outputs =
-                            component.getBusCount(kAudio as i32, kOutput as i32) as u32;
-
-                        // Real version + sub-categories via IPluginFactory2 when the factory
-                        // provides it; left empty (honest) rather than faked when it doesn't.
-                        let (version, category) = factory
-                            .cast::<IPluginFactory2>()
-                            .and_then(|f2| {
-                                let mut info2: PClassInfo2 = std::mem::zeroed();
-                                if f2.getClassInfo2(i, &mut info2) == kResultOk {
-                                    Some((
-                                        crate::internal::utils::c_str_to_string(&info2.version),
-                                        crate::internal::utils::c_str_to_string(
-                                            &info2.subCategories,
-                                        ),
-                                    ))
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or_default();
-
-                        // MIDI capability from the presence of event buses, not a guess.
-                        let has_midi_input =
-                            component.getBusCount(kEvent as i32, kInput as i32) > 0;
-                        let has_midi_output =
-                            component.getBusCount(kEvent as i32, kOutput as i32) > 0;
-
-                        return Ok(PluginInfo {
-                            path: path.to_path_buf(),
-                            name,
-                            vendor,
-                            version,
-                            category,
-                            uid,
-                            audio_inputs,
-                            audio_outputs,
-                            has_gui: false, // Will be updated by caller
-                            has_midi_input,
-                            has_midi_output,
-                        });
-                    }
-                }
+            let mut class_info: PClassInfo = std::mem::zeroed();
+            if factory.getClassInfo(class_index, &mut class_info) != kResultOk {
+                return Err(Error::PluginLoadFailed(format!(
+                    "Could not read class info for the instantiated class (index {class_index})"
+                )));
             }
 
-            Err(Error::PluginLoadFailed(
-                "No audio component found".to_string(),
-            ))
+            let name = crate::internal::utils::c_str_to_string(&class_info.name);
+            let uid = format_class_uid(&class_info.cid);
+
+            // Count audio buses
+            let audio_inputs = component.getBusCount(kAudio as i32, kInput as i32) as u32;
+            let audio_outputs = component.getBusCount(kAudio as i32, kOutput as i32) as u32;
+
+            // Real version + sub-categories via IPluginFactory2 when the factory
+            // provides it; left empty (honest) rather than faked when it doesn't.
+            let (version, category) = factory
+                .cast::<IPluginFactory2>()
+                .and_then(|f2| {
+                    let mut info2: PClassInfo2 = std::mem::zeroed();
+                    if f2.getClassInfo2(class_index, &mut info2) == kResultOk {
+                        Some((
+                            crate::internal::utils::c_str_to_string(&info2.version),
+                            crate::internal::utils::c_str_to_string(&info2.subCategories),
+                        ))
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default();
+
+            // MIDI capability from the presence of event buses, not a guess.
+            let has_midi_input = component.getBusCount(kEvent as i32, kInput as i32) > 0;
+            let has_midi_output = component.getBusCount(kEvent as i32, kOutput as i32) > 0;
+
+            Ok(PluginInfo {
+                path: path.to_path_buf(),
+                name,
+                vendor,
+                version,
+                category,
+                uid,
+                audio_inputs,
+                audio_outputs,
+                has_gui: false, // Will be updated by caller
+                has_midi_input,
+                has_midi_output,
+            })
         }
     }
 
-    /// Find and create the audio component from the factory
-    unsafe fn create_component(factory: &ComPtr<IPluginFactory>) -> Result<ComPtr<IComponent>> {
+    /// Find and create the audio component from the factory, returning it together with the
+    /// factory class index it came from (so the reported [`PluginInfo`] describes that class).
+    unsafe fn create_component(
+        factory: &ComPtr<IPluginFactory>,
+    ) -> Result<(ComPtr<IComponent>, i32)> {
         let num_classes = factory.countClasses();
 
         for i in 0..num_classes {
@@ -547,9 +595,10 @@ impl PluginImpl {
                     );
 
                     if result == kResultOk && !component_ptr.is_null() {
-                        return ComPtr::from_raw(component_ptr).ok_or_else(|| {
+                        let component = ComPtr::from_raw(component_ptr).ok_or_else(|| {
                             Error::PluginLoadFailed("Failed to create component".to_string())
-                        });
+                        })?;
+                        return Ok((component, i));
                     }
                 }
             }
@@ -568,7 +617,17 @@ impl PluginImpl {
         }
     }
 
-    /// Set up processing with current configuration
+    /// The configuration currently baked into the plugin via `setupProcessing`.
+    fn current_setup(&self) -> AppliedSetup {
+        AppliedSetup {
+            sample_rate: self.sample_rate,
+            block_size: self.block_size,
+            process_mode: self.vst_process_mode(),
+        }
+    }
+
+    /// Set up processing with the current configuration. VST3 requires the component to be
+    /// **inactive**; every caller either runs before the first activation or deactivates first.
     fn setup_processing(&mut self) -> Result<()> {
         unsafe {
             // Set up processing
@@ -589,6 +648,7 @@ impl PluginImpl {
 
             // Create process data
             self.create_process_data()?;
+            self.applied_setup = Some(self.current_setup());
 
             Ok(())
         }
@@ -790,13 +850,16 @@ impl PluginImpl {
     /// buffers. `frames` is always <= the configured `block_size`, which is what the plugin
     /// was set up to accept; `process` splits a larger caller block into successive chunks.
     ///
-    /// Queued input events and parameter changes are consumed and cleared here, so when a
-    /// block is split they apply to the first chunk only rather than repeating in each one.
+    /// The plugin-facing event list has already been staged with this chunk's events (see
+    /// [`stage_chunk_events`]); queued parameter changes are selected the same way here, by the
+    /// chunk their offset falls in. `is_last` marks the chunk that absorbs anything scheduled
+    /// past the end of the caller's block.
     fn process_chunk(
         &mut self,
         buffers: &mut AudioBuffers,
         frame_offset: usize,
         frames: usize,
+        is_last: bool,
     ) -> Result<()> {
         let result = if let Some(ref mut data) = self.process_data {
             unsafe {
@@ -819,16 +882,15 @@ impl PluginImpl {
                 let frames = frames.min(self.block_size);
                 data.process_data.numSamples = frames as i32;
 
-                // Clamp queued MIDI event offsets into the actual (possibly smaller) block, so a
-                // note scheduled near block_size can't land past the end of a short block.
-                self.input_events
-                    .clamp_offsets(frames.saturating_sub(1) as i32);
-
-                // Feed queued parameter changes into the processor's input queue, clamping
-                // each sample offset into this block.
+                // Feed the queued parameter changes that belong to this chunk into the
+                // processor's input queue, rebased to the chunk — the same routing the events
+                // got in `stage_chunk_events`, so automation and MIDI stay aligned across a
+                // split block.
                 for pc in &self.pending_param_changes {
-                    let off = pc.sample_offset.clamp(0, frames.saturating_sub(1) as i32);
-                    data.input_param_changes.enqueue(pc.id, off, pc.value);
+                    if let Some(off) = chunk_offset(pc.sample_offset, frame_offset, frames, is_last)
+                    {
+                        data.input_param_changes.enqueue(pc.id, off, pc.value);
+                    }
                 }
 
                 // Route parameter edits the plugin's *own editor* reported via performEdit into
@@ -904,7 +966,8 @@ impl PluginImpl {
                 // at the new sample position.
                 advance_process_context(&mut data.process_context, frames as i64);
 
-                // Clear input events AFTER processing so plugin can see them
+                // Clear the staged input events AFTER processing, so the plugin got to see them
+                // and the next chunk starts from an empty list.
                 self.input_events.clear();
                 // Clear the input parameter queue too, so this block's values don't
                 // re-stick on the next block.
@@ -948,10 +1011,34 @@ impl PluginImpl {
             Err(Error::Other("Process data not initialized".to_string()))
         };
 
-        // Clear in place (retains capacity); the changes were copied into the processor's
-        // input queue above. Runs on both the Ok and error paths so the queue can't accumulate.
-        self.pending_param_changes.clear();
         result
+    }
+
+    /// Distribute the block's queued input events over its chunks and process each one.
+    ///
+    /// `total` is the caller's block length, already known non-zero by the caller; the empty
+    /// block is handled separately (some plugins use a zero-sample call to flush pending
+    /// parameter changes).
+    fn process_chunks(&mut self, buffers: &mut AudioBuffers, total: usize) -> Result<()> {
+        // `.max(1)`: a zero block size would make every chunk empty and never advance `offset`,
+        // spinning forever on the audio thread. `Vst3HostBuilder::build` rejects 0, but
+        // `block_size` is plain state and this loop must terminate regardless.
+        let step = self.block_size.max(1);
+        let mut offset = 0;
+        while offset < total {
+            let frames = (total - offset).min(step);
+            let is_last = offset + frames >= total;
+            stage_chunk_events(
+                &self.chunk_events,
+                &self.input_events,
+                offset,
+                frames,
+                is_last,
+            );
+            self.process_chunk(buffers, offset, frames, is_last)?;
+            offset += frames;
+        }
+        Ok(())
     }
 }
 
@@ -978,6 +1065,20 @@ impl PluginInternal for PluginImpl {
                     "setParamNormalized({id}) returned {result:#x}; applying anyway \
                      (many plugins report kResultFalse on success)"
                 );
+            }
+            if self.pending_param_changes.len() >= MAX_PENDING_PARAM_CHANGES {
+                // Only reachable when nothing is draining the queue (the plugin isn't
+                // processing), so the dropped change would have arrived as part of a stale flood
+                // anyway. The controller half above still ran, so the plugin's own display
+                // stays correct.
+                self.dropped_param_changes += 1;
+                log::warn!(
+                    "dropping parameter change for {id}, queue full at \
+                     {MAX_PENDING_PARAM_CHANGES} (is the plugin processing?); \
+                     {} dropped so far",
+                    self.dropped_param_changes
+                );
+                return Ok(());
             }
             self.pending_param_changes.push(ParameterChange {
                 id,
@@ -1097,25 +1198,27 @@ impl PluginInternal for PluginImpl {
         // audible gate at the device's block rate) and advance the plugin's transport at a
         // fraction of real time. So split an oversized block into successive chunks instead.
         //
-        // Queued events and parameter changes are consumed by the first chunk (`process_chunk`
-        // clears them), so they land at their requested offset within it rather than being
-        // re-delivered to every chunk.
-        if total == 0 {
+        // Each queued event and parameter change is routed to the chunk its sample offset falls
+        // in, rebased to that chunk: an event at offset 1500 of a 2048-frame block fires in the
+        // fourth 512-frame chunk at offset 476, not ~20 ms early at the top of the first one.
+        // Offsets past the end of the caller's block are clamped into the final chunk.
+        self.input_events.take_into(&mut self.chunk_events);
+
+        let result = if total == 0 {
             // Preserve the historical behaviour of still calling the plugin for an empty block —
             // some plugins use a zero-sample call to flush pending parameter changes.
-            return self.process_chunk(buffers, 0, 0);
-        }
-        // `.max(1)`: a zero block size would make every chunk empty and never advance `offset`,
-        // spinning forever on the audio thread. `Vst3HostBuilder::build` rejects 0, but
-        // `block_size` is plain state and this loop must terminate regardless.
-        let step = self.block_size.max(1);
-        let mut offset = 0;
-        while offset < total {
-            let frames = (total - offset).min(step);
-            self.process_chunk(buffers, offset, frames)?;
-            offset += frames;
-        }
-        Ok(())
+            stage_chunk_events(&self.chunk_events, &self.input_events, 0, 0, true);
+            self.process_chunk(buffers, 0, 0, true)
+        } else {
+            self.process_chunks(buffers, total)
+        };
+
+        // Both queues are consumed by this block, on the error path too: leaving them filled
+        // would re-deliver every event and parameter change next block — re-triggering held
+        // notes and growing without bound for as long as the plugin keeps failing.
+        self.chunk_events.clear();
+        self.pending_param_changes.clear();
+        result
     }
 
     fn reconfigure(&mut self, sample_rate: f64, block_size: usize) -> Result<()> {
@@ -1425,19 +1528,23 @@ impl PluginInternal for PluginImpl {
 
     fn start_processing(&mut self) -> Result<()> {
         unsafe {
-            // Component should already be activated during initialization
-            // But activate it if somehow it's not active
-            if !self.is_active {
-                log::warn!("Component not active, attempting to activate");
-                let result = self.component.setActive(1);
-                if result != kResultOk {
-                    return Err(Error::Other(format!("Failed to activate: {:#x}", result)));
+            // The configuration may have moved since the last setup (`set_audio_config` after
+            // load, or a device change), and a plugin sizes its DSP buffers when it goes active,
+            // from the ProcessSetup it was last given. So apply a changed configuration the way
+            // `reconfigure` does — deactivate, set up, reactivate — rather than calling
+            // setupProcessing on a running component, which VST3 forbids. An unchanged
+            // configuration needs no setup at all: the plugin still has it.
+            if self.applied_setup != Some(self.current_setup()) {
+                if self.is_active {
+                    self.component.setActive(0);
+                    self.is_active = false;
                 }
-                self.is_active = true;
+                self.setup_processing()?;
             }
 
-            // Setup processing
-            self.setup_processing()?;
+            if !self.is_active {
+                self.activate()?;
+            }
 
             // Start processing. `setProcessing` is an optional notification — a plugin
             // may return kNotImplemented (e.g. u-he), which is not an error: it simply
@@ -1685,6 +1792,13 @@ impl PluginInternal for PluginImpl {
         self.component_handler
             .as_ref()
             .map(|h| h.take_parameter_edits())
+            .unwrap_or_default()
+    }
+
+    fn take_restart_flags(&mut self) -> crate::plugin::RestartFlags {
+        self.component_handler
+            .as_ref()
+            .map(|h| h.take_restart_flags())
             .unwrap_or_default()
     }
 
@@ -2324,6 +2438,145 @@ impl PluginImpl {
     }
 }
 
+/// Map a sample offset within the caller's block onto one chunk of it.
+///
+/// Returns the offset rebased to the chunk (`0..frames`), or `None` when the offset belongs to
+/// a different chunk. Anything scheduled past the end of the caller's block lands at the end of
+/// the final chunk rather than being dropped — a note scheduled near `block_size` still sounds
+/// when the device hands over a shorter block.
+fn chunk_offset(
+    sample_offset: i32,
+    chunk_start: usize,
+    frames: usize,
+    is_last: bool,
+) -> Option<i32> {
+    let start = chunk_start as i64;
+    let end = start + frames as i64;
+    // A negative offset is undefined in VST3; treat it as the start of the block.
+    let offset = i64::from(sample_offset.max(0));
+    if offset < start {
+        None
+    } else if offset < end {
+        Some((offset - start) as i32)
+    } else if is_last {
+        Some(frames.saturating_sub(1) as i32)
+    } else {
+        None
+    }
+}
+
+/// Stage the events belonging to one chunk into the plugin-facing event list, rebasing each
+/// offset to the chunk start (see [`chunk_offset`]). Replaces whatever the list held, so each
+/// chunk of a split block sees exactly its own events, in order and with their spacing intact.
+fn stage_chunk_events(
+    queued: &[Event],
+    list: &HostEventList,
+    chunk_start: usize,
+    frames: usize,
+    is_last: bool,
+) {
+    list.reset_with(queued.iter().filter_map(|event| {
+        chunk_offset(event.sampleOffset, chunk_start, frames, is_last).map(|offset| {
+            let mut event = *event;
+            event.sampleOffset = offset;
+            event
+        })
+    }));
+}
+
+/// Format a VST3 class id (a raw 16-byte `TUID`) as the 32-hex-digit string this library uses
+/// as a plugin's stable `uid`.
+fn format_class_uid(cid: &[std::os::raw::c_char; 16]) -> String {
+    cid.iter().map(|&b| format!("{:02X}", b as u8)).collect()
+}
+
+/// Ordered teardown for a component that has been initialized but whose `PluginImpl` doesn't
+/// exist yet.
+///
+/// Between `IComponent::initialize` returning success and the finished `PluginImpl`, `load` can
+/// still fail — and by then the plugin may have spawned threads and registered callbacks.
+/// Releasing its interfaces and unloading the module without `terminate()` leaves that code
+/// running inside memory the unload is about to unmap. This guard runs the same sequence
+/// `Drop for PluginImpl` does, unless [`Self::disarm`] hands the job to the built plugin.
+///
+/// It holds its own references (COM refcounts), so `load` keeps using the originals as it
+/// builds; the extra references are released when the guard drops either way.
+struct InitializedComponent {
+    component: ComPtr<IComponent>,
+    controller: Option<ComPtr<IEditController>>,
+    single_component: bool,
+    armed: bool,
+}
+
+impl InitializedComponent {
+    fn new(component: ComPtr<IComponent>) -> Self {
+        Self {
+            component,
+            controller: None,
+            single_component: false,
+            armed: true,
+        }
+    }
+
+    /// Record the controller so a later failure disconnects and terminates it too.
+    fn attach_controller(
+        &mut self,
+        controller: Option<ComPtr<IEditController>>,
+        single_component: bool,
+    ) {
+        self.controller = controller;
+        self.single_component = single_component;
+    }
+
+    /// Cancel the teardown: the finished `PluginImpl` owns the lifecycle from here.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for InitializedComponent {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        log::debug!("Plugin load failed after initialize; terminating the component");
+        unsafe {
+            terminate_component(
+                &self.component,
+                self.controller.as_ref(),
+                self.single_component,
+            );
+        }
+    }
+}
+
+/// Disconnect and terminate a live component/controller pair, in VST3 order.
+///
+/// The mirror of the load sequence: break the component↔controller connection, terminate the
+/// controller, then terminate the component. Many plugins (dual-component ones especially) rely
+/// on `terminate()` to break that link before release and crash without it. A single-component
+/// plugin is one object exposed as both halves, so it has no connection pair and is terminated
+/// once, as the component.
+unsafe fn terminate_component(
+    component: &ComPtr<IComponent>,
+    controller: Option<&ComPtr<IEditController>>,
+    single_component: bool,
+) {
+    if let Some(controller) = controller {
+        if !single_component {
+            if let (Some(comp_cp), Some(ctrl_cp)) = (
+                component.cast::<IConnectionPoint>(),
+                controller.cast::<IConnectionPoint>(),
+            ) {
+                comp_cp.disconnect(ctrl_cp.as_ptr());
+                ctrl_cp.disconnect(comp_cp.as_ptr());
+            }
+            controller.terminate();
+        }
+    }
+    component.terminate();
+}
+
 impl Drop for PluginImpl {
     fn drop(&mut self) {
         // VST3 teardown order: detach the editor, stop processing, deactivate the component,
@@ -2348,21 +2601,11 @@ impl Drop for PluginImpl {
                 self.is_active = false;
             }
 
-            if let Some(ref controller) = self.controller {
-                // A single-component plugin is one object exposed as both, so it has no
-                // connection pair to disconnect and must be terminated once (as the component).
-                if !self.single_component {
-                    if let (Some(comp_cp), Some(ctrl_cp)) = (
-                        self.component.cast::<IConnectionPoint>(),
-                        controller.cast::<IConnectionPoint>(),
-                    ) {
-                        comp_cp.disconnect(ctrl_cp.as_ptr());
-                        ctrl_cp.disconnect(comp_cp.as_ptr());
-                    }
-                    controller.terminate();
-                }
-            }
-            self.component.terminate();
+            terminate_component(
+                &self.component,
+                self.controller.as_ref(),
+                self.single_component,
+            );
         }
     }
 }
@@ -2463,6 +2706,106 @@ mod transport_tests {
         assert_eq!(ctx.continousTimeSamples, advanced);
         // ~0.992 s elapsed at 120 BPM → ~1.98 quarter notes; just assert it moved forward.
         assert!(ctx.projectTimeMusic > 1.9 && ctx.projectTimeMusic < 2.1);
+    }
+}
+
+#[cfg(test)]
+mod chunked_block_tests {
+    use super::*;
+    use crate::internal::com_implementations::create_event_list;
+
+    fn note_on_at(offset: i32, pitch: i16) -> Event {
+        let mut e: Event = unsafe { std::mem::zeroed() };
+        e.r#type = kNoteOnEvent as u16;
+        e.sampleOffset = offset;
+        e.__field0.noteOn.pitch = pitch;
+        e
+    }
+
+    /// Read back what the plugin would see: `(sampleOffset, pitch)` per staged event.
+    fn staged(list: &HostEventList) -> Vec<(i32, i16)> {
+        let mut out = Vec::new();
+        list.for_each_then_clear(|e| {
+            out.push((e.sampleOffset, unsafe { e.__field0.noteOn.pitch }))
+        });
+        out
+    }
+
+    /// A device block larger than the configured block size is split into chunks, and each
+    /// queued event has to land in the chunk that actually contains its offset — rebased to
+    /// that chunk. Routing everything to chunk 0 (clamped to its end) fires late events ~20 ms
+    /// early and collapses the spacing between them.
+    #[test]
+    fn events_are_routed_to_the_chunk_that_contains_them() {
+        // A 2048-frame device block processed in 512-frame chunks.
+        let queued = [
+            note_on_at(0, 60),    // chunk 0, offset 0
+            note_on_at(100, 61),  // chunk 0, offset 100
+            note_on_at(512, 62),  // chunk 1, offset 0 (first sample of the chunk)
+            note_on_at(1500, 63), // chunk 2, offset 476
+        ];
+        let list = create_event_list();
+
+        stage_chunk_events(&queued, &list, 0, 512, false);
+        assert_eq!(staged(&list), vec![(0, 60), (100, 61)]);
+
+        stage_chunk_events(&queued, &list, 512, 512, false);
+        assert_eq!(staged(&list), vec![(0, 62)]);
+
+        stage_chunk_events(&queued, &list, 1024, 512, false);
+        assert_eq!(staged(&list), vec![(476, 63)]);
+
+        // The final chunk holds nothing: every event was delivered exactly once, earlier.
+        stage_chunk_events(&queued, &list, 1536, 512, true);
+        assert_eq!(staged(&list), Vec::new());
+    }
+
+    /// Offsets past the end of the caller's block still have to sound; they collapse into the
+    /// last chunk rather than being dropped (the pre-split behaviour, preserved).
+    #[test]
+    fn offsets_past_the_block_land_in_the_final_chunk() {
+        let queued = [note_on_at(9_000, 64), note_on_at(-5, 65)];
+        let list = create_event_list();
+
+        // A non-final chunk ignores the overshoot; the negative offset is treated as 0.
+        stage_chunk_events(&queued, &list, 0, 512, false);
+        assert_eq!(staged(&list), vec![(0, 65)]);
+
+        // The final chunk absorbs it at its last sample.
+        stage_chunk_events(&queued, &list, 512, 512, true);
+        assert_eq!(staged(&list), vec![(511, 64)]);
+    }
+
+    /// A block that fits in one chunk keeps the old semantics: exact offsets inside the block,
+    /// anything past the end clamped to its last sample.
+    #[test]
+    fn single_chunk_block_clamps_to_its_own_length() {
+        let queued = [note_on_at(0, 60), note_on_at(200, 61), note_on_at(999, 62)];
+        let list = create_event_list();
+
+        stage_chunk_events(&queued, &list, 0, 256, true);
+        assert_eq!(staged(&list), vec![(0, 60), (200, 61), (255, 62)]);
+    }
+
+    #[test]
+    fn chunk_offset_maps_each_offset_once() {
+        // Every offset in a 3-chunk block belongs to exactly one chunk.
+        let chunks = [
+            (0usize, 512usize, false),
+            (512, 512, false),
+            (1024, 512, true),
+        ];
+        for offset in [0, 1, 511, 512, 1023, 1024, 1535] {
+            let hits: Vec<_> = chunks
+                .iter()
+                .filter_map(|&(start, frames, last)| {
+                    chunk_offset(offset, start, frames, last).map(|o| (start, o))
+                })
+                .collect();
+            assert_eq!(hits.len(), 1, "offset {offset} routed to {hits:?}");
+            let (start, rebased) = hits[0];
+            assert_eq!(start as i32 + rebased, offset);
+        }
     }
 }
 

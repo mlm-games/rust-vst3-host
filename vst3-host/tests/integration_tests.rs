@@ -1214,7 +1214,46 @@ fn test_sample_accurate_automation_evolves_output() {
         .find(|p| p.name.to_lowercase().contains("cutoff"))
         .map(|p| p.id)
         .expect("Dexed has a cutoff param");
-    plugin.send_midi_note(60, 110, MidiChannel::Ch1).unwrap();
+    // Play one second of a freshly triggered note, optionally scheduling the automation
+    // sample-accurately each block, and return the summed RMS of the final quarter.
+    fn late_quarter_energy(
+        plugin: &mut Plugin,
+        cutoff: u32,
+        auto: Option<&ParameterAutomation>,
+        sr: f64,
+        block: usize,
+    ) -> f64 {
+        plugin.send_midi_note(60, 110, MidiChannel::Ch1).unwrap();
+        let blocks = sr as usize / block; // ~1 second
+        let mut late = 0.0f64;
+        let mut t = 0.0;
+        for b in 0..blocks {
+            if let Some(auto) = auto {
+                for (offset, value) in auto.points_for_block(t, block, sr, 8) {
+                    plugin.set_parameter_at(cutoff, value, offset).unwrap();
+                }
+            }
+            let mut buf = AudioBuffers::new(0, 2, block, sr);
+            plugin.process_audio(&mut buf).unwrap();
+            let sumsq: f64 = buf
+                .outputs
+                .iter()
+                .flat_map(|c| c.iter())
+                .map(|&s| (s as f64) * (s as f64))
+                .sum();
+            if b >= 3 * blocks / 4 {
+                late += (sumsq / (block as f64 * 2.0)).sqrt();
+            }
+            t += block as f64 / sr;
+        }
+        // Release the note and flush its tail so the next pass starts from silence.
+        plugin.send_midi_note_off(60, MidiChannel::Ch1).unwrap();
+        for _ in 0..blocks {
+            let mut buf = AudioBuffers::new(0, 2, block, sr);
+            plugin.process_audio(&mut buf).unwrap();
+        }
+        late
+    }
 
     // Cutoff ramps closed -> open over one second.
     let auto = ParameterAutomation::new()
@@ -1222,35 +1261,17 @@ fn test_sample_accurate_automation_evolves_output() {
         .add_point(1.0, 0.95)
         .with_curve(AutomationCurve::Linear);
 
-    let blocks = sr as usize / block; // ~1 second
-    let (mut early, mut late) = (0.0f64, 0.0f64);
-    let mut t = 0.0;
-    for b in 0..blocks {
-        // Schedule this block's sub-block automation points (sample-accurate).
-        for (offset, value) in auto.points_for_block(t, block, sr, 8) {
-            plugin.set_parameter_at(cutoff, value, offset).unwrap();
-        }
-        let mut buf = AudioBuffers::new(0, 2, block, sr);
-        plugin.process_audio(&mut buf).unwrap();
-        let sumsq: f64 = buf
-            .outputs
-            .iter()
-            .flat_map(|c| c.iter())
-            .map(|&s| (s as f64) * (s as f64))
-            .sum();
-        let rms = (sumsq / (block as f64 * 2.0)).sqrt();
-        if b < blocks / 4 {
-            early += rms;
-        } else if b >= 3 * blocks / 4 {
-            late += rms;
-        }
-        t += block as f64 / sr;
-    }
+    // A/B the same second of the same note: cutoff held closed vs ramped open. Comparing
+    // two runs isolates the automation's effect from the note's own amplitude envelope.
+    plugin.set_parameter(cutoff, 0.05).unwrap();
+    let held = late_quarter_energy(&mut plugin, cutoff, None, sr, block);
+    plugin.set_parameter(cutoff, 0.05).unwrap();
+    let ramped = late_quarter_energy(&mut plugin, cutoff, Some(&auto), sr, block);
     plugin.stop_processing().ok();
 
-    println!("automation timeline: early-quarter energy {early:.4}, late-quarter {late:.4}");
+    println!("automation timeline: held-closed late energy {held:.4}, ramped late {ramped:.4}");
     assert!(
-        late > early,
-        "opening the cutoff over the timeline should raise output energy: early={early:.4} late={late:.4}"
+        ramped > held * 1.5,
+        "a sample-accurate cutoff ramp should raise late-quarter energy over a closed hold: held={held:.4} ramped={ramped:.4}"
     );
 }
