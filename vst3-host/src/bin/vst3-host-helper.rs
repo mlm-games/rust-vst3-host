@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 
 use vst3_host::{
     audio::AudioBuffers,
-    process_isolation::{HostCommand, HostResponse},
+    process_isolation::{HostCommand, HostResponse, ProtocolChannel},
     Plugin, Vst3Host,
 };
 
@@ -32,23 +32,30 @@ use vst3_host::{
 type SharedPlugin = Arc<Mutex<Option<Plugin>>>;
 
 fn main() {
+    // Before anything else — certainly before a plugin binary is loaded and can run its own
+    // code — take the protocol channel away from stdout. A hosted plugin shares this
+    // process's descriptors and third-party plugins do print; on the shared stdout a single
+    // `printf` line would be read by the host as a response and desynchronise every later
+    // command from its reply.
+    let protocol = ProtocolChannel::claim();
+
     eprintln!("VST3 Host Helper Process Started");
 
     let plugin: SharedPlugin = Arc::new(Mutex::new(None));
 
     #[cfg(target_os = "macos")]
     {
-        macos::run(plugin);
+        macos::run(plugin, protocol);
     }
 
     #[cfg(not(target_os = "macos"))]
     {
         // No UI run loop needed: process commands on this (main) thread directly.
+        let mut protocol = protocol;
         let stdin = io::stdin();
-        let mut stdout = io::stdout();
         let mut sample_rate = 44100.0;
         for line in stdin.lock().lines() {
-            let Some(command) = parse_line(line, &mut stdout) else {
+            let Some(command) = parse_line(line, &mut protocol) else {
                 continue;
             };
             if matches!(command, HostCommand::Shutdown) {
@@ -56,13 +63,13 @@ fn main() {
                 break;
             }
             let response = handle(command, &plugin, &mut sample_rate, None);
-            respond(&mut stdout, &response);
+            respond(&mut protocol, &response);
         }
     }
 }
 
 /// Parse one stdin line into a command, reporting (and skipping) blank/invalid lines.
-fn parse_line(line: io::Result<String>, stdout: &mut io::Stdout) -> Option<HostCommand> {
+fn parse_line(line: io::Result<String>, protocol: &mut ProtocolChannel) -> Option<HostCommand> {
     let line = match line {
         Ok(l) => l,
         Err(e) => {
@@ -77,7 +84,7 @@ fn parse_line(line: io::Result<String>, stdout: &mut io::Stdout) -> Option<HostC
         Ok(cmd) => Some(cmd),
         Err(e) => {
             respond(
-                stdout,
+                protocol,
                 &HostResponse::Error {
                     message: format!("Invalid command: {}", e),
                 },
@@ -87,10 +94,10 @@ fn parse_line(line: io::Result<String>, stdout: &mut io::Stdout) -> Option<HostC
     }
 }
 
-fn respond(stdout: &mut io::Stdout, response: &HostResponse) {
+fn respond(protocol: &mut ProtocolChannel, response: &HostResponse) {
     if let Ok(json) = serde_json::to_string(response) {
-        let _ = writeln!(stdout, "{}", json);
-        let _ = stdout.flush();
+        let _ = writeln!(protocol, "{}", json);
+        let _ = protocol.flush();
     }
 }
 
@@ -482,8 +489,9 @@ mod macos {
     use std::sync::mpsc;
 
     /// Entry point on macOS: spawn the stdin/command worker, then run the UI event pump on
-    /// this (main) thread.
-    pub fn run(plugin: SharedPlugin) {
+    /// this (main) thread. The already-claimed protocol channel moves to the worker, which is
+    /// the only thread that writes responses.
+    pub fn run(plugin: SharedPlugin, mut protocol: ProtocolChannel) {
         let (gui_tx, gui_rx) = mpsc::channel::<GuiRequest>();
         let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
 
@@ -492,11 +500,10 @@ mod macos {
             let plugin = plugin.clone();
             std::thread::spawn(move || {
                 let stdin = io::stdin();
-                let mut stdout = io::stdout();
                 let mut sample_rate = 44100.0;
                 let gui = GuiChannel(gui_tx);
                 for line in stdin.lock().lines() {
-                    let Some(command) = parse_line(line, &mut stdout) else {
+                    let Some(command) = parse_line(line, &mut protocol) else {
                         continue;
                     };
                     if matches!(command, HostCommand::Shutdown) {
@@ -505,7 +512,7 @@ mod macos {
                         break;
                     }
                     let response = handle(command, &plugin, &mut sample_rate, Some(&gui));
-                    respond(&mut stdout, &response);
+                    respond(&mut protocol, &response);
                 }
                 // stdin closed → ask the main loop to exit too.
                 let _ = shutdown_tx.send(());
@@ -621,9 +628,13 @@ mod macos {
             content.addSubview(&container);
         }
 
-        let handle = vst3_host::WindowHandle::from_nsview(
-            Retained::as_ptr(&container) as *mut std::ffi::c_void
-        );
+        // SAFETY: `container` is a live NSView held by the window this function returns, which
+        // the helper keeps alive until it closes the editor.
+        let handle = unsafe {
+            vst3_host::WindowHandle::from_nsview(
+                Retained::as_ptr(&container) as *mut std::ffi::c_void
+            )
+        };
         p.open_editor(handle).map_err(|e| e.to_string())?;
 
         window.setContentSize(frame.size);

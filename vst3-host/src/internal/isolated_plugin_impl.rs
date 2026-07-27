@@ -35,6 +35,10 @@ pub struct IsolatedPluginImpl {
     time_sig_numerator: i32,
     /// Time signature denominator advertised in the helper's host `ProcessContext`.
     time_sig_denominator: i32,
+    /// Whether the transport is playing in the helper's host `ProcessContext`. A freshly
+    /// loaded plugin starts out playing (the in-process default), so only a stopped transport
+    /// needs replaying after a crash.
+    is_playing: bool,
     /// Whether the plugin is currently processing
     is_processing: bool,
     /// Whether the plugin has an open editor
@@ -90,6 +94,7 @@ impl IsolatedPluginImpl {
             tempo,
             time_sig_numerator,
             time_sig_denominator,
+            is_playing: true,
             is_processing: false,
             has_open_editor: false,
             editor_size: None,
@@ -125,16 +130,30 @@ impl IsolatedPluginImpl {
     ///
     /// On its own (auto-recover off) this is just [`Self::send_command_once`]; the caller can
     /// still recover manually via [`PluginInternal::recover`].
+    ///
+    /// Recovery holds the process mutex across the whole respawn + reload, which takes as
+    /// long as loading the plugin binary does (tens to hundreds of milliseconds, sometimes
+    /// more). An audio callback calling `process()` concurrently blocks on that mutex for the
+    /// duration and will glitch — recovery is a control-plane operation, and there is no way
+    /// to swap the helper underneath a caller that is mid-command.
     fn send_command(&self, command: HostCommand) -> Result<HostResponse> {
         if !self.auto_recover {
             return self.send_command_once(command);
         }
+        // A timed-out load or state command already cost a full (long) deadline and a SIGKILL;
+        // replaying it against each fresh helper would just repeat that, so only crashes are
+        // worth retrying for those.
+        let slow = crate::process_isolation::is_slow_command(&command);
         let mut attempt: u32 = 0;
         loop {
             match self.send_command_once(command.clone()) {
                 Ok(resp) => return Ok(resp),
                 Err(e) => {
-                    let recoverable = matches!(e, Error::PluginCrashed | Error::PluginTimeout);
+                    let recoverable = match e {
+                        Error::PluginCrashed => true,
+                        Error::PluginTimeout => !slow,
+                        _ => false,
+                    };
                     if !recoverable || attempt >= self.auto_recover_max_retries {
                         return Err(e);
                     }
@@ -198,7 +217,11 @@ impl PluginInternal for IsolatedPluginImpl {
     }
 
     fn set_tempo(&mut self, bpm: f64) -> Result<()> {
-        self.expect_success(HostCommand::SetTempo { bpm }, "SetTempo")
+        self.expect_success(HostCommand::SetTempo { bpm }, "SetTempo")?;
+        // Track the accepted transport state so a post-crash reload replays it instead of the
+        // load-time settings. Only on success, so a rejected change can't desync the copy.
+        self.tempo = bpm;
+        Ok(())
     }
 
     fn set_time_signature(&mut self, numerator: i32, denominator: i32) -> Result<()> {
@@ -208,11 +231,16 @@ impl PluginInternal for IsolatedPluginImpl {
                 denominator,
             },
             "SetTimeSignature",
-        )
+        )?;
+        self.time_sig_numerator = numerator;
+        self.time_sig_denominator = denominator;
+        Ok(())
     }
 
     fn set_playing(&mut self, playing: bool) -> Result<()> {
-        self.expect_success(HostCommand::SetPlaying { playing }, "SetPlaying")
+        self.expect_success(HostCommand::SetPlaying { playing }, "SetPlaying")?;
+        self.is_playing = playing;
+        Ok(())
     }
 
     fn get_parameter(&self, id: u32) -> Result<f64> {
@@ -619,6 +647,10 @@ impl IsolatedPluginImpl {
     /// Respawn the helper and reload the plugin. Takes `&self` (it locks `self.process`
     /// internally and only reads immutable fields), so the auto-recover retry path in
     /// `send_command` — which has only `&self` — can call it too.
+    ///
+    /// The process mutex is held for the whole spawn + reload + state replay, so any other
+    /// caller — including an audio callback in `process()` — blocks until the new helper is
+    /// ready. See [`Self::send_command`].
     fn recover_locked(&self) -> Result<()> {
         let mut process = self
             .process
@@ -653,6 +685,12 @@ impl IsolatedPluginImpl {
             });
         }
 
+        // Tempo and time signature travel with `LoadPlugin` above; the transport's playing
+        // state does not, and a fresh plugin comes up playing.
+        if !self.is_playing {
+            let _ = fresh.send_command(HostCommand::SetPlaying { playing: false });
+        }
+
         // Restore processing state (parameter values are NOT replayed; see Plugin::recover).
         if self.is_processing {
             let _ = fresh.send_command(HostCommand::StartProcessing);
@@ -667,3 +705,130 @@ impl IsolatedPluginImpl {
 
 // Ensure IsolatedPluginImpl is Send
 unsafe impl Send for IsolatedPluginImpl {}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A stand-in helper: logs every request it receives and answers each one, so a test can
+    /// assert on exactly what the host sent across the boundary.
+    struct FakeHelper {
+        dir: std::path::PathBuf,
+        script: PathBuf,
+        log: PathBuf,
+    }
+
+    impl FakeHelper {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "vst3_iso_{name}_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            let script = dir.join("fake-helper");
+            let log = dir.join("requests.log");
+            let mut f = std::fs::File::create(&script).expect("script");
+            write!(
+                f,
+                concat!(
+                    "#!/bin/sh\n",
+                    "while IFS= read -r line; do\n",
+                    "  printf '%s\\n' \"$line\" >> '{log}'\n",
+                    "  case \"$line\" in\n",
+                    "    *LoadPlugin*) printf '%s\\n' '{{\"PluginInfo\":{{\"vendor\":\"v\",\"name\":\"n\",\"version\":\"1\",\"category\":\"\",\"uid\":\"u\",\"has_gui\":false,\"audio_inputs\":0,\"audio_outputs\":1,\"output_channels\":2,\"has_midi_input\":true,\"has_midi_output\":false}}}}' ;;\n",
+                    "    *) printf '%s\\n' '{{\"Success\":{{\"message\":\"ok\"}}}}' ;;\n",
+                    "  esac\n",
+                    "done\n"
+                ),
+                log = log.display()
+            )
+            .expect("write script");
+            drop(f);
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+            Self { dir, script, log }
+        }
+
+        fn requests(&self) -> Vec<String> {
+            std::fs::read_to_string(&self.log)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+    }
+
+    impl Drop for FakeHelper {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn isolated(fake: &FakeHelper) -> IsolatedPluginImpl {
+        let process = PluginHostProcess::new(Some(fake.script.clone()), Duration::from_secs(5))
+            .expect("spawn fake helper");
+        let info = PluginInfo {
+            path: PathBuf::from("/tmp/fake.vst3"),
+            name: "n".to_string(),
+            vendor: "v".to_string(),
+            version: "1".to_string(),
+            category: String::new(),
+            uid: "u".to_string(),
+            audio_inputs: 0,
+            audio_outputs: 1,
+            has_midi_input: true,
+            has_midi_output: false,
+            has_gui: false,
+        };
+        IsolatedPluginImpl::new(
+            process,
+            info,
+            44100.0,
+            512,
+            120.0,
+            4,
+            4,
+            2,
+            Some(fake.script.clone()),
+            Duration::from_secs(5),
+            false,
+            0,
+        )
+    }
+
+    #[test]
+    fn recovery_replays_the_current_transport_state_not_the_load_time_one() {
+        let fake = FakeHelper::new("transport");
+        let mut plugin = isolated(&fake);
+
+        plugin.set_tempo(140.0).expect("set_tempo");
+        plugin.set_time_signature(7, 8).expect("set_time_signature");
+        plugin.set_playing(false).expect("set_playing");
+        plugin.recover().expect("recover");
+
+        let requests = fake.requests();
+        let load_index = requests
+            .iter()
+            .rposition(|r| r.contains("LoadPlugin"))
+            .expect("the reload sends LoadPlugin");
+        let load = &requests[load_index];
+        assert!(
+            load.contains("\"tempo\":140.0"),
+            "reload must carry the tempo set at runtime, got {load}"
+        );
+        assert!(
+            load.contains("\"time_sig_numerator\":7")
+                && load.contains("\"time_sig_denominator\":8"),
+            "reload must carry the time signature set at runtime, got {load}"
+        );
+        assert!(
+            requests[load_index..]
+                .iter()
+                .any(|r| r.contains("SetPlaying")),
+            "a stopped transport must be replayed after the reload, got {requests:?}"
+        );
+    }
+}

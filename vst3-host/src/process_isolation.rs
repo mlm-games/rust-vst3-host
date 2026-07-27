@@ -3,15 +3,251 @@
 //! This module provides functionality to run VST3 plugins in separate processes
 //! for improved stability and crash protection.
 
-use serde::{Deserialize, Serialize};
-use std::io::{BufRead, BufReader, Write};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Default time to wait for a helper response before treating the plugin as hung.
 pub(crate) const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Default deadline for the slow class of commands ([`is_slow_command`]).
+///
+/// Loading a plugin binary or serializing a large state blob legitimately takes far longer
+/// than a process block, so those commands get their own (longer) deadline: the short
+/// per-block deadline exists to catch a plugin hung inside `process()`, and applying it to a
+/// cold-cache module load would SIGKILL a helper that is merely slow.
+pub(crate) const DEFAULT_SLOW_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Maximum bytes accepted for a single line on the protocol stream. Longer lines are
+/// discarded rather than buffered, so a helper (or a plugin sharing its stdout) that never
+/// terminates a line cannot grow the host's memory without bound.
+const MAX_RESPONSE_LINE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Maximum unread lines buffered from the helper. Beyond this the reader drops new lines
+/// (counting them) instead of queueing them forever.
+const MAX_QUEUED_RESPONSES: usize = 64;
+
+/// Upper bound on an audio channel count taken from the wire.
+const MAX_WIRE_CHANNELS: usize = 256;
+
+/// Upper bound on frames-per-channel taken from the wire.
+const MAX_WIRE_FRAMES: usize = 1 << 20;
+
+/// Upper bound on a bus count taken from the wire.
+const MAX_WIRE_BUSES: i32 = 256;
+
+/// Whether a command belongs to the slow class — module load and state I/O — which gets
+/// [`DEFAULT_SLOW_COMMAND_TIMEOUT`] instead of the per-block response deadline.
+pub(crate) fn is_slow_command(command: &HostCommand) -> bool {
+    matches!(
+        command,
+        HostCommand::LoadPlugin { .. } | HostCommand::SaveState | HostCommand::LoadState { .. }
+    )
+}
+
+/// Lossless wire encoding for audio sample buffers.
+///
+/// JSON cannot represent a non-finite number: `serde_json` writes NaN and ±∞ as `null`, and
+/// `null` will not deserialize back into an `f32`. A single non-finite sample from a plugin
+/// would therefore break every block on the boundary. Samples cross as base64 of their
+/// little-endian IEEE-754 bit patterns instead, which is exact for every `f32` — and about
+/// three times smaller than the decimal number array it replaces.
+mod audio_codec {
+    use super::{Deserialize, Deserializer, Serializer, MAX_WIRE_CHANNELS, MAX_WIRE_FRAMES};
+
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    /// Encode one channel's samples as base64 of their little-endian bit patterns.
+    pub(super) fn encode_channel(samples: &[f32]) -> String {
+        let mut bytes = Vec::with_capacity(samples.len() * 4);
+        for s in samples {
+            bytes.extend_from_slice(&s.to_bits().to_le_bytes());
+        }
+        let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+        for chunk in bytes.chunks(3) {
+            let b1 = chunk.get(1).copied().unwrap_or(0);
+            let b2 = chunk.get(2).copied().unwrap_or(0);
+            let n = (u32::from(chunk[0]) << 16) | (u32::from(b1) << 8) | u32::from(b2);
+            out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+            out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+            out.push(if chunk.len() > 1 {
+                ALPHABET[(n >> 6) as usize & 63] as char
+            } else {
+                '='
+            });
+            out.push(if chunk.len() > 2 {
+                ALPHABET[n as usize & 63] as char
+            } else {
+                '='
+            });
+        }
+        out
+    }
+
+    fn sextet(c: u8) -> Option<u32> {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        Some(u32::from(v))
+    }
+
+    /// Decode one channel, rejecting anything that isn't well-formed base64 of whole samples.
+    pub(super) fn decode_channel(encoded: &str) -> Option<Vec<f32>> {
+        let bytes = encoded.as_bytes();
+        if bytes.len() % 4 != 0 {
+            return None;
+        }
+        let mut raw = Vec::with_capacity(bytes.len() / 4 * 3);
+        for chunk in bytes.chunks(4) {
+            let pad = chunk.iter().rev().take_while(|&&c| c == b'=').count();
+            if pad > 2 {
+                return None;
+            }
+            let mut n = 0u32;
+            for (i, &c) in chunk.iter().enumerate() {
+                if c == b'=' {
+                    if i < 4 - pad {
+                        return None; // padding is only legal at the end of the group
+                    }
+                    continue;
+                }
+                n |= sextet(c)? << (18 - 6 * i);
+            }
+            raw.push((n >> 16) as u8);
+            if pad < 2 {
+                raw.push((n >> 8) as u8);
+            }
+            if pad < 1 {
+                raw.push(n as u8);
+            }
+        }
+        if raw.len() % 4 != 0 {
+            return None;
+        }
+        Some(
+            raw.chunks_exact(4)
+                .map(|b| f32::from_bits(u32::from_le_bytes([b[0], b[1], b[2], b[3]])))
+                .collect(),
+        )
+    }
+
+    pub(super) fn serialize<S: Serializer>(
+        channels: &[Vec<f32>],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(channels.iter().map(|c| encode_channel(c)))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<Vec<f32>>, D::Error> {
+        let encoded = Vec::<String>::deserialize(deserializer)?;
+        if encoded.len() > MAX_WIRE_CHANNELS {
+            log::warn!(
+                "isolation: clamping {} wire channels to {MAX_WIRE_CHANNELS}",
+                encoded.len()
+            );
+        }
+        encoded
+            .iter()
+            .take(MAX_WIRE_CHANNELS)
+            .map(|c| {
+                let mut samples = decode_channel(c).ok_or_else(|| {
+                    serde::de::Error::custom("malformed base64 audio channel payload")
+                })?;
+                if samples.len() > MAX_WIRE_FRAMES {
+                    log::warn!(
+                        "isolation: clamping {} wire frames to {MAX_WIRE_FRAMES}",
+                        samples.len()
+                    );
+                    samples.truncate(MAX_WIRE_FRAMES);
+                }
+                Ok(samples)
+            })
+            .collect()
+    }
+}
+
+/// Wire encoding for `f64`s that may legitimately be non-finite.
+///
+/// Same problem as the audio payload: `serde_json` turns NaN/±∞ into `null`, which then fails
+/// to deserialize. Finite values stay plain JSON numbers; non-finite ones cross as their
+/// standard textual spelling, which `f64::from_str` parses back exactly.
+mod lossless_f64 {
+    use super::{Deserializer, Serializer};
+    use std::fmt;
+
+    pub(super) fn serialize<S: Serializer>(value: &f64, serializer: S) -> Result<S::Ok, S::Error> {
+        if value.is_finite() {
+            serializer.serialize_f64(*value)
+        } else if value.is_nan() {
+            serializer.serialize_str("NaN")
+        } else if *value > 0.0 {
+            serializer.serialize_str("inf")
+        } else {
+            serializer.serialize_str("-inf")
+        }
+    }
+
+    struct AnyF64;
+
+    impl serde::de::Visitor<'_> for AnyF64 {
+        type Value = f64;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a number or a non-finite float spelled as a string")
+        }
+
+        fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<f64, E> {
+            Ok(v)
+        }
+
+        fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<f64, E> {
+            Ok(v as f64)
+        }
+
+        fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<f64, E> {
+            Ok(v as f64)
+        }
+
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<f64, E> {
+            v.parse::<f64>()
+                .map_err(|_| E::custom(format!("not a float: {v}")))
+        }
+
+        // `null` is what an older peer would have written for a non-finite value; treat it as
+        // NaN rather than failing the whole exchange.
+        fn visit_unit<E: serde::de::Error>(self) -> Result<f64, E> {
+            Ok(f64::NAN)
+        }
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<f64, D::Error> {
+        deserializer.deserialize_any(AnyF64)
+    }
+}
+
+/// Clamp a wire-provided channel count into `0..=MAX_WIRE_CHANNELS`.
+fn clamped_channel_count<'de, D: Deserializer<'de>>(deserializer: D) -> Result<i32, D::Error> {
+    let raw = i32::deserialize(deserializer)?;
+    Ok(raw.clamp(0, MAX_WIRE_CHANNELS as i32))
+}
+
+/// Clamp a wire-provided bus count into `0..=MAX_WIRE_BUSES`.
+fn clamped_bus_count<'de, D: Deserializer<'de>>(deserializer: D) -> Result<i32, D::Error> {
+    let raw = i32::deserialize(deserializer)?;
+    Ok(raw.clamp(0, MAX_WIRE_BUSES))
+}
 
 /// Commands that can be sent to the isolated plugin process.
 ///
@@ -25,10 +261,12 @@ pub enum HostCommand {
         /// Path to the `.vst3` bundle.
         path: String,
         /// Sample rate to configure the plugin for.
+        #[serde(with = "lossless_f64")]
         sample_rate: f64,
         /// Block size to configure the plugin for.
         block_size: u32,
         /// Transport tempo (BPM) to advertise in the plugin's host `ProcessContext`.
+        #[serde(with = "lossless_f64")]
         tempo: f64,
         /// Time signature numerator to advertise in the host `ProcessContext`.
         time_sig_numerator: i32,
@@ -48,6 +286,7 @@ pub enum HostCommand {
     /// Re-run the plugin's `setupProcessing` at a new sample rate / block size.
     Reconfigure {
         /// New sample rate in Hz.
+        #[serde(with = "lossless_f64")]
         sample_rate: f64,
         /// New block size in frames.
         block_size: u32,
@@ -62,6 +301,7 @@ pub enum HostCommand {
         /// Parameter id.
         id: u32,
         /// Normalized value.
+        #[serde(with = "lossless_f64")]
         value: f64,
     },
     /// Schedule a parameter change at a sample offset within the next process block.
@@ -69,6 +309,7 @@ pub enum HostCommand {
         /// Parameter id.
         id: u32,
         /// Normalized value.
+        #[serde(with = "lossless_f64")]
         value: f64,
         /// Sample offset within the next processed block.
         offset: i32,
@@ -77,6 +318,7 @@ pub enum HostCommand {
     /// effect on the next processed block.
     SetTempo {
         /// Transport tempo in beats per minute (validated `> 0` on the host side).
+        #[serde(with = "lossless_f64")]
         bpm: f64,
     },
     /// Set the transport time signature advertised in the plugin's host `ProcessContext`,
@@ -105,6 +347,7 @@ pub enum HostCommand {
         /// Parameter id.
         id: u32,
         /// Normalized value to format.
+        #[serde(with = "lossless_f64")]
         normalized: f64,
     },
     /// Send a MIDI event to the plugin.
@@ -121,7 +364,8 @@ pub enum HostCommand {
     },
     /// Process one block of audio. `inputs` is per-channel; `frames` is the block length.
     Process {
-        /// Per-channel input samples (`[channel][frame]`).
+        /// Per-channel input samples (`[channel][frame]`), carried as base64 bit patterns.
+        #[serde(with = "audio_codec")]
         inputs: Vec<Vec<f32>>,
         /// Number of frames in this block.
         frames: u32,
@@ -160,6 +404,7 @@ pub enum HostCommand {
         /// Which note-expression dimension to set.
         kind: crate::midi::NoteExpressionType,
         /// Normalized expression value (0..1).
+        #[serde(with = "lossless_f64")]
         value: f64,
         /// Sample offset within the next processed block.
         sample_offset: i32,
@@ -242,7 +487,8 @@ pub enum HostResponse {
     /// Per-channel audio output data (`[channel][frame]`), plus any MIDI the plugin
     /// emitted during the block (arpeggiators, MPE, etc.).
     AudioOutput {
-        /// Output samples per channel.
+        /// Output samples per channel, carried as base64 bit patterns.
+        #[serde(with = "audio_codec")]
         outputs: Vec<Vec<f32>>,
         /// MIDI events the plugin emitted this block, in order.
         output_midi: Vec<crate::midi::MidiEvent>,
@@ -250,6 +496,7 @@ pub enum HostResponse {
     /// A single parameter value (normalized).
     ParameterValue {
         /// Normalized value.
+        #[serde(with = "lossless_f64")]
         value: f64,
     },
     /// A formatted parameter display string.
@@ -289,11 +536,15 @@ pub enum HostResponse {
         uid: String,
         /// Whether the plugin has an editor.
         has_gui: bool,
-        /// Audio input bus count.
+        /// Audio input bus count (clamped to a sane maximum on receipt).
+        #[serde(deserialize_with = "clamped_bus_count")]
         audio_inputs: i32,
-        /// Audio output bus count.
+        /// Audio output bus count (clamped to a sane maximum on receipt).
+        #[serde(deserialize_with = "clamped_bus_count")]
         audio_outputs: i32,
-        /// Total output audio channels across all output buses.
+        /// Total output audio channels across all output buses (clamped on receipt: the host
+        /// sizes buffers from this number, so it is not trusted verbatim).
+        #[serde(deserialize_with = "clamped_channel_count")]
         output_channels: i32,
         /// Whether the plugin has a MIDI/event input bus.
         has_midi_input: bool,
@@ -343,6 +594,86 @@ pub enum HostResponse {
     },
 }
 
+/// The helper process's write half of the request/response protocol.
+///
+/// A loaded VST3 plugin shares the helper's file descriptors, and third-party plugins do
+/// print to stdout. Since the protocol is a line stream over the helper's stdout, one stray
+/// `printf` would be read by the host as a response and desynchronise every later exchange.
+///
+/// [`ProtocolChannel::claim`] therefore takes stdout away from the plugin: on Unix it
+/// duplicates the inherited stdout onto a private, close-on-exec descriptor and repoints file
+/// descriptor 1 at stderr, so plugin output is merged into the helper's stderr instead. Call
+/// it once, before any plugin code can run.
+///
+/// On non-Unix platforms the protocol still runs over the process stdout; a plugin writing
+/// there corrupts the stream (the host drops lines it cannot parse, which limits the damage
+/// to noise, but a well-formed line would still be taken for a response).
+pub struct ProtocolChannel {
+    inner: ProtocolChannelInner,
+}
+
+#[cfg(unix)]
+type ProtocolChannelInner = std::fs::File;
+#[cfg(not(unix))]
+type ProtocolChannelInner = std::io::Stdout;
+
+impl ProtocolChannel {
+    /// Claim the protocol channel for this process. See the type documentation.
+    #[cfg(unix)]
+    pub fn claim() -> Self {
+        use std::os::fd::FromRawFd;
+
+        // SAFETY: `F_DUPFD_CLOEXEC`/`dup` return a fresh descriptor owned by this process, and
+        // `dup2` rebinds STDOUT_FILENO, which this process also owns. Both are the documented
+        // POSIX contracts; no descriptor Rust already owns as a `File` is aliased or closed.
+        let fd = unsafe {
+            let private = match libc::fcntl(libc::STDOUT_FILENO, libc::F_DUPFD_CLOEXEC, 3) {
+                fd if fd >= 0 => Some(fd),
+                _ => match libc::dup(libc::STDOUT_FILENO) {
+                    fd if fd >= 0 => Some(fd),
+                    _ => None,
+                },
+            };
+            match private {
+                Some(fd) => {
+                    // Plugin (and helper) writes to stdout now land on stderr.
+                    libc::dup2(libc::STDERR_FILENO, libc::STDOUT_FILENO);
+                    fd
+                }
+                None => {
+                    // Nothing to fall back to: keep speaking on fd 1 as-is, so the protocol
+                    // still works even though plugin writes can pollute it.
+                    eprintln!("helper: could not privatise the protocol channel; plugin writes to stdout may corrupt it");
+                    libc::STDOUT_FILENO
+                }
+            }
+        };
+        // SAFETY: `fd` is a descriptor this process owns — a fresh duplicate, or stdout
+        // itself when duplication failed — and this channel becomes its sole owner.
+        Self {
+            inner: unsafe { std::fs::File::from_raw_fd(fd) },
+        }
+    }
+
+    /// Claim the protocol channel for this process. See the type documentation.
+    #[cfg(not(unix))]
+    pub fn claim() -> Self {
+        Self {
+            inner: std::io::stdout(),
+        }
+    }
+}
+
+impl Write for ProtocolChannel {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// Manages a plugin running in an isolated process.
 ///
 /// Responses are read on a background thread and delivered over a channel, so
@@ -354,12 +685,73 @@ pub struct PluginHostProcess {
     stdin: Option<ChildStdin>,
     /// Lines received from the helper's stdout (one JSON response each).
     responses: Receiver<String>,
-    /// Background reader thread handle (joined on shutdown).
+    /// Background reader thread handle (joined, with a bound, on shutdown).
     reader: Option<JoinHandle<()>>,
+    /// Set by the reader thread when it is about to exit, so shutdown can join it only when
+    /// the join is known to be instant.
+    reader_finished: Arc<AtomicBool>,
+    /// Lines queued but not yet taken by [`Self::send_command`]; bounds the reader's buffer.
+    queued: Arc<AtomicUsize>,
+    /// Lines the reader refused because the queue was full or the line was oversized.
+    discarded_by_reader: Arc<AtomicU64>,
+    /// Lines received that did not parse as a response (helper noise), for diagnostics.
+    unparsed_lines: u64,
     /// How long to wait for a single response before declaring a timeout.
     timeout: Duration,
+    /// Deadline for the slow command class ([`is_slow_command`]).
+    slow_timeout: Duration,
     /// Set once the child has been killed/exited so we stop trying to talk to it.
     dead: bool,
+}
+
+/// One read from the helper's stdout.
+enum ReadLine {
+    /// A complete line (newline included), within the size cap.
+    Line(Vec<u8>),
+    /// A line longer than the cap; its bytes were discarded rather than buffered.
+    Oversized,
+    /// The stream ended (helper exited) or errored.
+    Eof,
+}
+
+/// Read one newline-terminated line, discarding (rather than buffering) anything longer than
+/// `max` bytes so a helper that never terminates a line cannot exhaust host memory.
+fn read_bounded_line(reader: &mut impl BufRead, max: usize) -> ReadLine {
+    let mut line = Vec::new();
+    let mut oversized = false;
+    loop {
+        let budget = (max + 1 - line.len()) as u64;
+        let mut chunk = Vec::new();
+        let read = match reader.by_ref().take(budget).read_until(b'\n', &mut chunk) {
+            Ok(n) => n,
+            Err(_) => return ReadLine::Eof,
+        };
+        let complete = chunk.last() == Some(&b'\n');
+        if !oversized {
+            line.extend_from_slice(&chunk);
+            if line.len() > max {
+                oversized = true;
+                line = Vec::new();
+            }
+        }
+        if read == 0 {
+            // EOF: a trailing partial line is still worth delivering, an oversized one is not.
+            return if oversized {
+                ReadLine::Oversized
+            } else if line.is_empty() {
+                ReadLine::Eof
+            } else {
+                ReadLine::Line(line)
+            };
+        }
+        if complete {
+            return if oversized {
+                ReadLine::Oversized
+            } else {
+                ReadLine::Line(line)
+            };
+        }
+    }
 }
 
 impl PluginHostProcess {
@@ -469,21 +861,42 @@ impl PluginHostProcess {
         // Read responses on a background thread so the caller can apply a deadline.
         // The thread ends (dropping the sender) when stdout hits EOF — i.e. when the
         // helper process exits or crashes — which the receiver sees as Disconnected.
+        //
+        // Nothing the helper sends is trusted for size: lines are read with a byte cap and
+        // the queue of not-yet-consumed lines is bounded, so neither an unterminated line nor
+        // a helper that spews between commands can grow the host's memory without bound.
         let (tx, rx) = mpsc::channel::<String>();
-        let reader = std::thread::spawn(move || {
-            let mut reader = BufReader::new(stdout);
-            let mut line = String::new();
-            loop {
-                line.clear();
-                match reader.read_line(&mut line) {
-                    Ok(0) => break, // EOF: helper exited
-                    Ok(_) => {
-                        if tx.send(std::mem::take(&mut line)).is_err() {
-                            break; // receiver dropped
+        let queued = Arc::new(AtomicUsize::new(0));
+        let discarded = Arc::new(AtomicU64::new(0));
+        let finished = Arc::new(AtomicBool::new(false));
+        let reader = std::thread::spawn({
+            let queued = Arc::clone(&queued);
+            let discarded = Arc::clone(&discarded);
+            let finished = Arc::clone(&finished);
+            move || {
+                let mut reader = BufReader::new(stdout);
+                loop {
+                    match read_bounded_line(&mut reader, MAX_RESPONSE_LINE_BYTES) {
+                        ReadLine::Eof => break,
+                        ReadLine::Oversized => {
+                            discarded.fetch_add(1, Ordering::Relaxed);
+                        }
+                        ReadLine::Line(bytes) => {
+                            if queued.load(Ordering::Relaxed) >= MAX_QUEUED_RESPONSES {
+                                discarded.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
+                            queued.fetch_add(1, Ordering::Relaxed);
+                            // Lossy: a plugin can put arbitrary bytes on the stream, and
+                            // mangled noise must not end the reader thread.
+                            let line = String::from_utf8_lossy(&bytes).into_owned();
+                            if tx.send(line).is_err() {
+                                break; // receiver dropped
+                            }
                         }
                     }
-                    Err(_) => break,
                 }
+                finished.store(true, Ordering::Release);
             }
         });
 
@@ -492,7 +905,12 @@ impl PluginHostProcess {
             stdin: Some(stdin),
             responses: rx,
             reader: Some(reader),
+            reader_finished: finished,
+            queued,
+            discarded_by_reader: discarded,
+            unparsed_lines: 0,
             timeout,
+            slow_timeout: DEFAULT_SLOW_COMMAND_TIMEOUT.max(timeout),
             dead: false,
         })
     }
@@ -502,10 +920,59 @@ impl PluginHostProcess {
         self.timeout = timeout;
     }
 
+    /// Set the deadline used for the slow command class — loading a plugin and saving or
+    /// restoring its state. Never shorter than the per-command timeout.
+    pub fn set_slow_command_timeout(&mut self, timeout: Duration) {
+        self.slow_timeout = timeout;
+    }
+
+    /// The deadline to apply to `command`.
+    fn timeout_for(&self, command: &HostCommand) -> Duration {
+        if is_slow_command(command) {
+            self.slow_timeout.max(self.timeout)
+        } else {
+            self.timeout
+        }
+    }
+
+    /// Drop lines that arrived before this command was sent: they are stale replies or
+    /// unsolicited output, never the answer to what we are about to ask.
+    fn drop_stale_lines(&mut self) {
+        let mut stale = 0u64;
+        while self.responses.try_recv().is_ok() {
+            self.queued.fetch_sub(1, Ordering::Relaxed);
+            stale += 1;
+        }
+        if stale > 0 {
+            self.unparsed_lines += stale;
+            log::warn!("isolation: dropped {stale} unsolicited line(s) from the helper");
+        }
+    }
+
+    /// The child's exit status if it has already exited, `None` while it is still running.
+    fn exit_status(&mut self) -> Option<std::process::ExitStatus> {
+        self.process
+            .as_mut()
+            .and_then(|p| p.try_wait().ok().flatten())
+    }
+
+    /// How many lines from the helper were discarded (oversized, over-queued, unparseable or
+    /// unsolicited). A non-zero count means the helper is putting non-protocol data on the
+    /// stream — typically a plugin writing to stdout on a platform where the protocol channel
+    /// cannot be made private.
+    pub fn discarded_line_count(&self) -> u64 {
+        self.unparsed_lines + self.discarded_by_reader.load(Ordering::Relaxed)
+    }
+
     /// Send a command to the helper process and wait (with a deadline) for a response.
     ///
     /// Returns an error without blocking indefinitely if the plugin hangs (the child
     /// is killed) or the helper has crashed/exited.
+    ///
+    /// A line that does not parse as a response is either a helper that died mid-write —
+    /// reported as a crash — or noise on the stream, which is dropped so the exchange stays
+    /// in sync instead of answering every later command with the previous one's reply. The
+    /// deadline covers the whole exchange, not each individual line.
     pub fn send_command(&mut self, command: HostCommand) -> Result<HostResponse, String> {
         if self.dead {
             return Err("Helper process is no longer running".to_string());
@@ -513,6 +980,9 @@ impl PluginHostProcess {
 
         let command_json = serde_json::to_string(&command)
             .map_err(|e| format!("Failed to serialize command: {}", e))?;
+
+        // Anything already queued predates this command.
+        self.drop_stale_lines();
 
         {
             let stdin = self.stdin.as_mut().ok_or("No stdin available")?;
@@ -526,27 +996,49 @@ impl PluginHostProcess {
             })?;
         }
 
-        match self.responses.recv_timeout(self.timeout) {
-            Ok(line) => {
-                serde_json::from_str(&line).map_err(|e| format!("Failed to parse response: {}", e))
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                // The plugin is hung. Kill the child so it can't wedge us further.
-                self.dead = true;
-                if let Some(ref mut process) = self.process {
-                    let _ = process.kill();
+        let timeout = self.timeout_for(&command);
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match self.responses.recv_timeout(remaining) {
+                Ok(line) => {
+                    self.queued.fetch_sub(1, Ordering::Relaxed);
+                    match serde_json::from_str::<HostResponse>(&line) {
+                        Ok(response) => return Ok(response),
+                        Err(parse_error) => {
+                            // A helper that died mid-write leaves a truncated line behind:
+                            // that is a crash, not noise, and must be reported as one.
+                            if let Some(status) = self.exit_status() {
+                                self.dead = true;
+                                return Err(format!(
+                                    "Helper process crashed: exited with {status} while writing a response ({parse_error})"
+                                ));
+                            }
+                            self.unparsed_lines += 1;
+                            log::warn!(
+                                "isolation: dropping unparseable line from the helper ({parse_error})"
+                            );
+                        }
+                    }
                 }
-                Err(format!(
-                    "Timed out after {:?} waiting for helper response (plugin may have hung)",
-                    self.timeout
-                ))
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                // Reader thread ended => stdout closed => helper exited/crashed.
-                self.dead = true;
-                match self.check_process_status() {
-                    Err(status) => Err(format!("Helper process crashed: {}", status)),
-                    Ok(()) => Err("Helper process exited unexpectedly".to_string()),
+                Err(RecvTimeoutError::Timeout) => {
+                    // The plugin is hung. Kill the child so it can't wedge us further.
+                    self.dead = true;
+                    if let Some(ref mut process) = self.process {
+                        let _ = process.kill();
+                    }
+                    return Err(format!(
+                        "Timed out after {:?} waiting for helper response (plugin may have hung)",
+                        timeout
+                    ));
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    // Reader thread ended => stdout closed => helper exited/crashed.
+                    self.dead = true;
+                    return match self.check_process_status() {
+                        Err(status) => Err(format!("Helper process crashed: {}", status)),
+                        Ok(()) => Err("Helper process exited unexpectedly".to_string()),
+                    };
                 }
             }
         }
@@ -624,7 +1116,23 @@ impl PluginHostProcess {
             }
         }
         if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
+            // Join only once the thread has signalled that it is finishing. It blocks in a
+            // read on the helper's stdout, and that pipe stays open as long as *any* process
+            // holds it — a plugin-spawned grandchild that inherited it, for instance. Since
+            // this runs from Drop, waiting on that is not an option: after a short grace
+            // period the thread is detached instead. It ends by itself at EOF, and a leaked
+            // thread beats a host that can never drop a plugin.
+            let deadline = std::time::Instant::now() + Duration::from_millis(250);
+            while !self.reader_finished.load(Ordering::Acquire) {
+                if std::time::Instant::now() >= deadline {
+                    log::debug!("isolation: helper stdout still open, detaching reader thread");
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if self.reader_finished.load(Ordering::Acquire) {
+                let _ = reader.join();
+            }
         }
         self.dead = true;
     }
@@ -1132,6 +1640,206 @@ mod wire_tests {
             err.contains("vst3-host-helper-xyz"),
             "error should name the offending path, got: {err}"
         );
+    }
+
+    #[test]
+    fn non_finite_samples_survive_the_audio_wire_format() {
+        // JSON has no spelling for NaN/±∞ — serde_json writes `null`, which will not
+        // deserialize back into an f32 — so one such sample used to fail every Process
+        // exchange. The bit-pattern encoding carries them (and -0.0) exactly.
+        let channel = vec![
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            -0.0,
+            0.5,
+            f32::MIN_POSITIVE,
+        ];
+        let resp = HostResponse::AudioOutput {
+            outputs: vec![channel.clone(), vec![]],
+            output_midi: Vec::new(),
+        };
+        let json = serde_json::to_string(&resp).expect("serialize");
+        assert!(
+            !json.contains("null"),
+            "non-finite samples must not become null"
+        );
+        match serde_json::from_str::<HostResponse>(&json).expect("deserialize") {
+            HostResponse::AudioOutput { outputs, .. } => {
+                assert_eq!(outputs.len(), 2);
+                assert!(outputs[1].is_empty());
+                let bits: Vec<u32> = outputs[0].iter().map(|s| s.to_bits()).collect();
+                let want: Vec<u32> = channel.iter().map(|s| s.to_bits()).collect();
+                assert_eq!(bits, want, "samples must round-trip bit-exactly");
+            }
+            other => panic!("round-trip changed the variant: {other:?}"),
+        }
+
+        // The same for the host -> helper direction.
+        let cmd = HostCommand::Process {
+            inputs: vec![vec![f32::NAN, 1.0]],
+            frames: 2,
+        };
+        let json = serde_json::to_string(&cmd).expect("serialize Process");
+        match serde_json::from_str::<HostCommand>(&json).expect("deserialize Process") {
+            HostCommand::Process { inputs, frames } => {
+                assert_eq!(frames, 2);
+                assert!(inputs[0][0].is_nan());
+                assert_eq!(inputs[0][1], 1.0);
+            }
+            other => panic!("Process round-trip changed the variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_finite_parameter_values_survive_the_wire() {
+        // A plugin can hand back a non-finite normalized value; it must not poison the
+        // exchange. Finite values stay plain JSON numbers.
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let json = serde_json::to_string(&HostResponse::ParameterValue { value })
+                .expect("serialize ParameterValue");
+            match serde_json::from_str::<HostResponse>(&json).expect("deserialize") {
+                HostResponse::ParameterValue { value: back } => {
+                    if value.is_nan() {
+                        assert!(back.is_nan(), "NaN must survive the wire");
+                    } else {
+                        assert_eq!(back, value);
+                    }
+                }
+                other => panic!("round-trip changed the variant: {other:?}"),
+            }
+        }
+
+        let json = serde_json::to_string(&HostResponse::ParameterValue { value: 0.25 })
+            .expect("serialize");
+        assert!(
+            json.contains("0.25") && !json.contains("\"0.25\""),
+            "finite values stay JSON numbers, got {json}"
+        );
+        let cmd = HostCommand::SetParameter {
+            id: 3,
+            value: f64::NAN,
+        };
+        let json = serde_json::to_string(&cmd).expect("serialize SetParameter");
+        match serde_json::from_str::<HostCommand>(&json).expect("deserialize") {
+            HostCommand::SetParameter { id, value } => {
+                assert_eq!(id, 3);
+                assert!(value.is_nan());
+            }
+            other => panic!("SetParameter round-trip changed the variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn audio_codec_round_trips_and_shrinks_the_payload() {
+        // Every length (including the two partial base64 groups) must round-trip.
+        for len in 0..9usize {
+            let samples: Vec<f32> = (0..len).map(|i| i as f32 * -0.3125).collect();
+            let encoded = audio_codec::encode_channel(&samples);
+            let decoded = audio_codec::decode_channel(&encoded).expect("decode");
+            assert_eq!(decoded, samples, "round-trip failed at len {len}");
+        }
+        assert!(audio_codec::decode_channel("!!!!").is_none());
+        assert!(audio_codec::decode_channel("AAA").is_none(), "bad length");
+        assert!(
+            audio_codec::decode_channel("AAAA").is_none(),
+            "3 bytes is not a whole f32"
+        );
+
+        // The bit-pattern form is also a good deal smaller than a JSON number array.
+        let block: Vec<Vec<f32>> = (0..2)
+            .map(|c| {
+                (0..512)
+                    .map(|i| ((i * 7 + c) as f32 / 512.0).sin())
+                    .collect()
+            })
+            .collect();
+        let plain = serde_json::to_string(&block).expect("plain json").len();
+        let encoded = serde_json::to_string(&HostResponse::AudioOutput {
+            outputs: block,
+            output_midi: Vec::new(),
+        })
+        .expect("encoded json")
+        .len();
+        assert!(
+            encoded < plain,
+            "base64 payload ({encoded}) should be smaller than the number array ({plain})"
+        );
+    }
+
+    #[test]
+    fn wire_provided_counts_are_clamped_on_receipt() {
+        // The host sizes buffers from these numbers, so a bogus helper reply must not be
+        // taken at face value.
+        let json = r#"{"PluginInfo":{"vendor":"v","name":"n","version":"1","category":"",
+            "uid":"u","has_gui":false,"audio_inputs":-4,"audio_outputs":999999,
+            "output_channels":2000000,"has_midi_input":true,"has_midi_output":false}}"#;
+        match serde_json::from_str::<HostResponse>(json).expect("deserialize PluginInfo") {
+            HostResponse::PluginInfo {
+                audio_inputs,
+                audio_outputs,
+                output_channels,
+                ..
+            } => {
+                assert_eq!(audio_inputs, 0);
+                assert_eq!(audio_outputs, MAX_WIRE_BUSES);
+                assert_eq!(output_channels, MAX_WIRE_CHANNELS as i32);
+            }
+            other => panic!("PluginInfo round-trip changed the variant: {other:?}"),
+        }
+
+        // Channel counts on the audio payload are clamped the same way.
+        let channels: Vec<String> = (0..MAX_WIRE_CHANNELS + 5)
+            .map(|_| audio_codec::encode_channel(&[0.0]))
+            .collect();
+        let json = serde_json::to_string(&serde_json::json!({
+            "AudioOutput": { "outputs": channels, "output_midi": [] }
+        }))
+        .expect("serialize");
+        match serde_json::from_str::<HostResponse>(&json).expect("deserialize") {
+            HostResponse::AudioOutput { outputs, .. } => {
+                assert_eq!(outputs.len(), MAX_WIRE_CHANNELS)
+            }
+            other => panic!("AudioOutput round-trip changed the variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oversized_lines_are_discarded_rather_than_buffered() {
+        // A helper that never terminates a line must not be able to grow host memory.
+        let mut input: Vec<u8> = Vec::new();
+        input.extend_from_slice(b"short\n");
+        input.extend_from_slice(&[b'x'; 64]);
+        input.push(b'\n');
+        input.extend_from_slice(b"ok\n");
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(input));
+
+        assert!(matches!(read_bounded_line(&mut reader, 8), ReadLine::Line(l) if l == b"short\n"));
+        assert!(matches!(
+            read_bounded_line(&mut reader, 8),
+            ReadLine::Oversized
+        ));
+        assert!(matches!(read_bounded_line(&mut reader, 8), ReadLine::Line(l) if l == b"ok\n"));
+        assert!(matches!(read_bounded_line(&mut reader, 8), ReadLine::Eof));
+    }
+
+    #[test]
+    fn slow_commands_are_classified_apart_from_the_per_block_ones() {
+        assert!(is_slow_command(&HostCommand::SaveState));
+        assert!(is_slow_command(&HostCommand::LoadState { data: vec![] }));
+        assert!(is_slow_command(&HostCommand::LoadPlugin {
+            path: "x".into(),
+            sample_rate: 44100.0,
+            block_size: 512,
+            tempo: 120.0,
+            time_sig_numerator: 4,
+            time_sig_denominator: 4,
+        }));
+        assert!(!is_slow_command(&HostCommand::Process {
+            inputs: vec![],
+            frames: 64
+        }));
+        assert!(!is_slow_command(&HostCommand::GetAllParameters));
     }
 
     /// A helper that never responds (a hung plugin) must not hang the host: `send_command`

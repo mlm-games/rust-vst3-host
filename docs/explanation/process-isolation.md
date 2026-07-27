@@ -62,6 +62,12 @@ let host = Vst3Host::builder()
   `VST3_HOST_HELPER_PATH` environment variable does the same. A configured path that doesn't
   exist fails fast with a clear error rather than silently falling back to the search.
 
+The helper and the library must come from the same build: the IPC wire format (audio
+buffers cross as base64-encoded IEEE-754 bit patterns, non-finite floats as tagged
+strings) is an internal contract with no version negotiation. A stale helper binary on
+`VST3_HOST_HELPER_PATH` or beside the executable fails to parse commands rather than
+misbehaving silently — rebuild it alongside the library (`just helper`).
+
 ## Why it's opt-in, not the default
 
 The headline vision was "isolation by default," but defaulting it on has a real cost:
