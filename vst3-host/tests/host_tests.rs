@@ -182,3 +182,33 @@ fn test_host_with_custom_backend() {
     let host = Vst3Host::new();
     assert!(host.is_ok());
 }
+
+/// The builder and `Plugin::reconfigure` used to disagree: `reconfigure` rejected a zero/negative
+/// sample rate and a zero block size, but the builder accepted them. A `block_size(0)` host then
+/// produced permanent silence (and, once oversized blocks were split into chunks, a loop that
+/// never advanced), and `sample_rate(0.0)` reached `setupProcessing`, where a plugin computing
+/// `1.0 / sampleRate` generates NaN coefficients.
+#[test]
+fn builder_rejects_configurations_reconfigure_would_reject() {
+    use vst3_host::Vst3Host;
+
+    for rate in [0.0, -48_000.0, f64::NAN, f64::INFINITY] {
+        assert!(
+            Vst3Host::builder().sample_rate(rate).build().is_err(),
+            "sample_rate({rate}) should be rejected"
+        );
+    }
+    for block in [0usize, i32::MAX as usize + 1, usize::MAX] {
+        assert!(
+            Vst3Host::builder().block_size(block).build().is_err(),
+            "block_size({block}) should be rejected"
+        );
+    }
+
+    // Sane values still build.
+    assert!(Vst3Host::builder()
+        .sample_rate(48_000.0)
+        .block_size(512)
+        .build()
+        .is_ok());
+}

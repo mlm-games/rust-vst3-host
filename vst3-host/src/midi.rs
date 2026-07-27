@@ -485,9 +485,13 @@ pub fn name_to_note(name: &str) -> Option<u8> {
         _ => return None,
     };
 
-    // Calculate MIDI note number
-    // Using the convention where C3 = MIDI 60
-    let midi_note = (octave + 2) * 12 + semitone;
+    // Calculate MIDI note number, using the convention where C3 = MIDI 60.
+    // Checked: the octave comes from parsing arbitrary text, and `(octave + 2) * 12` overflows for
+    // extremes like "C2147483647" — a panic in debug, a wrapped (wrong) note in release.
+    let midi_note = octave
+        .checked_add(2)
+        .and_then(|o| o.checked_mul(12))
+        .and_then(|base| base.checked_add(semitone))?;
 
     if (0..=127).contains(&midi_note) {
         Some(midi_note as u8)
@@ -669,6 +673,12 @@ mod tests {
             "C99",    // octave out of MIDI range
             "C-99",   //
             "#3",     // accidental with no letter
+            // Octave arithmetic has to be checked: `(octave + 2) * 12` overflows on these, which
+            // panics in a debug build and silently returns a wrong note in a release one.
+            "C2147483647",
+            "C-2147483648",
+            "Bb2147483647",
+            "C#2147483647",
         ] {
             assert_eq!(name_to_note(junk), None, "expected None for {junk:?}");
         }

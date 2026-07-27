@@ -175,7 +175,10 @@ impl Timeline {
     /// (evaluated in the beat domain) tagged with the lane's parameter id.
     pub fn advance_block(&mut self, frames: usize) -> BlockEvents {
         let start = self.sample_clock;
-        let end = start + frames as u64;
+        // Saturating: `seek_frame` is public and takes any `u64`, so a seek near the top of the
+        // range followed by a normal block would otherwise overflow (panic in debug, wrap in
+        // release — wrapping would make the window run backwards and re-fire events).
+        let end = start.saturating_add(frames as u64);
         let mut out = BlockEvents::default();
 
         for clip in &self.clips {
@@ -230,6 +233,17 @@ impl Timeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `seek_frame` is public and takes any `u64`, so the block window must not overflow: a panic
+    /// in debug, and in release a wrapped `end` that runs the window backwards and re-fires events.
+    #[test]
+    fn advance_block_near_the_end_of_the_clock_does_not_overflow() {
+        let mut t = Timeline::new(48_000.0, 120.0);
+        t.seek_frame(u64::MAX);
+        let _ = t.advance_block(1);
+        let _ = t.advance_block(4096);
+    }
+
     use crate::midi::MidiChannel;
 
     fn note_on(n: u8) -> MidiEvent {

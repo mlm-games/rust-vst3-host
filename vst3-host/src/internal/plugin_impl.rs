@@ -868,11 +868,15 @@ impl PluginImpl {
                 // assume the caller's block equals the configured block size).
                 for (ch_idx, channel) in buffers.inputs.iter().enumerate() {
                     if ch_idx < data.input_buffers.len() {
+                        // Clamp the START as well as the length: the block length comes from the
+                        // first channel, but `AudioBuffers`' channel Vecs are public and need not
+                        // all be the same length. A short channel would otherwise produce an
+                        // out-of-range slice (`ch[start..start]` still panics when start > len).
+                        let start = frame_offset.min(channel.len());
                         let n = frames
                             .min(data.input_buffers[ch_idx].len())
-                            .min(channel.len().saturating_sub(frame_offset));
-                        data.input_buffers[ch_idx][..n]
-                            .copy_from_slice(&channel[frame_offset..frame_offset + n]);
+                            .min(channel.len() - start);
+                        data.input_buffers[ch_idx][..n].copy_from_slice(&channel[start..start + n]);
                     }
                 }
 
@@ -928,10 +932,12 @@ impl PluginImpl {
                     // (length-clamped to the actual frames).
                     for (ch_idx, channel) in buffers.outputs.iter_mut().enumerate() {
                         if ch_idx < data.output_buffers.len() {
+                            // Clamp the start too — see the matching note on the input copy.
+                            let start = frame_offset.min(channel.len());
                             let n = frames
                                 .min(data.output_buffers[ch_idx].len())
-                                .min(channel.len().saturating_sub(frame_offset));
-                            channel[frame_offset..frame_offset + n]
+                                .min(channel.len() - start);
+                            channel[start..start + n]
                                 .copy_from_slice(&data.output_buffers[ch_idx][..n]);
                         }
                     }
@@ -1099,9 +1105,13 @@ impl PluginInternal for PluginImpl {
             // some plugins use a zero-sample call to flush pending parameter changes.
             return self.process_chunk(buffers, 0, 0);
         }
+        // `.max(1)`: a zero block size would make every chunk empty and never advance `offset`,
+        // spinning forever on the audio thread. `Vst3HostBuilder::build` rejects 0, but
+        // `block_size` is plain state and this loop must terminate regardless.
+        let step = self.block_size.max(1);
         let mut offset = 0;
         while offset < total {
-            let frames = (total - offset).min(self.block_size);
+            let frames = (total - offset).min(step);
             self.process_chunk(buffers, offset, frames)?;
             offset += frames;
         }

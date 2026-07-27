@@ -8,9 +8,28 @@
 
 #![cfg(feature = "cpal-backend")]
 
+use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
 use vst3_host::prelude::*;
+
+/// Serializes in-process plugin loading across this binary's tests.
+///
+/// Loading and dropping a VST3 module is not safe to do concurrently: the module is shared
+/// process-wide (on macOS `CFBundleCreate` returns the cached instance per path), so one test's
+/// teardown can unload the bundle another test is still using, and real plugins' module-global
+/// init — JUCE's `MessageManager` in Dexed's case — is not thread-safe either. libtest runs these
+/// in parallel by default, which made the whole binary die with SIGSEGV inside the plugin's own
+/// init after all its tests had passed.
+///
+/// `feature_coverage_tests.rs` already carries this guard for the same reason. Note this only
+/// protects tests *within* one binary; the underlying library-level hazard is unfixed, so a host
+/// that loads plugins from several threads can still hit it.
+static PLUGIN_LOCK: Mutex<()> = Mutex::new(());
+
+fn plugin_guard() -> MutexGuard<'static, ()> {
+    PLUGIN_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Load a plugin in an isolated host, retrying a few times: some C++ plugins (Dexed,
 /// HY-MPS3) intermittently abort ("Pure virtual function called!") during static init in a
@@ -54,8 +73,15 @@ fn find_test_plugin() -> Option<PluginInfo> {
         "OB-Xd",            // OB-Xd synthesizer
     ];
 
-    let mut host = Vst3Host::new().ok()?;
-    let plugins = host.discover_plugins().ok()?;
+    let host = Vst3Host::new().ok()?;
+    // Out-of-process: an in-process scan instantiates every installed plugin, and a licensed one
+    // throwing an uncatchable C++ exception during its license check aborts the whole binary.
+    let plugins: Vec<PluginInfo> = host
+        .discover_plugins_safe()
+        .plugins
+        .into_iter()
+        .map(|d| d.info)
+        .collect();
 
     // Try to find one of our preferred test plugins
     for test_name in &test_plugins {
@@ -80,8 +106,15 @@ fn find_test_plugin() -> Option<PluginInfo> {
 #[test]
 #[ignore = "Requires VST3 plugins to be installed"]
 fn test_plugin_discovery() {
-    let mut host = Vst3Host::new().expect("Failed to create host");
-    let plugins = host.discover_plugins().expect("Failed to discover plugins");
+    let _plugin_guard = plugin_guard();
+    let host = Vst3Host::new().expect("Failed to create host");
+    // Out-of-process (see `find_test_plugin`): an in-process scan can abort the test binary.
+    let plugins: Vec<PluginInfo> = host
+        .discover_plugins_safe()
+        .plugins
+        .into_iter()
+        .map(|d| d.info)
+        .collect();
 
     // Should find at least one plugin if any are installed
     if !plugins.is_empty() {
@@ -98,6 +131,7 @@ fn test_plugin_discovery() {
 #[test]
 #[ignore = "Requires VST3 plugins to be installed"]
 fn test_plugin_loading() {
+    let _plugin_guard = plugin_guard();
     let Some(plugin_info) = find_test_plugin() else {
         println!("No VST3 plugins found, skipping test");
         return;
@@ -125,6 +159,7 @@ fn test_plugin_loading() {
 #[test]
 #[ignore = "Requires VST3 plugins to be installed"]
 fn test_plugin_parameters() {
+    let _plugin_guard = plugin_guard();
     let Some(plugin_info) = find_test_plugin() else {
         println!("No VST3 plugins found, skipping test");
         return;
@@ -170,6 +205,7 @@ fn test_plugin_parameters() {
 #[test]
 #[ignore = "Requires VST3 plugins to be installed"]
 fn test_midi_processing() {
+    let _plugin_guard = plugin_guard();
     let Some(plugin_info) = find_test_plugin() else {
         println!("No VST3 plugins found, skipping test");
         return;
@@ -207,6 +243,7 @@ fn test_midi_processing() {
 #[test]
 #[ignore = "Requires VST3 plugins to be installed and audio hardware"]
 fn test_audio_processing() {
+    let _plugin_guard = plugin_guard();
     let Some(plugin_info) = find_test_plugin() else {
         println!("No VST3 plugins found, skipping test");
         return;
@@ -265,6 +302,7 @@ fn test_audio_processing() {
 #[test]
 #[ignore = "Requires the bundled test plugin"]
 fn test_runtime_transport_mutation() {
+    let _plugin_guard = plugin_guard();
     let plugin_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../test_plugins/Dexed.vst3");
     if !std::path::Path::new(plugin_path).exists() {
         println!("Test plugin not found at {plugin_path}, skipping");
@@ -329,6 +367,7 @@ fn test_runtime_transport_mutation() {
 #[test]
 #[ignore = "Requires the bundled test plugin"]
 fn test_plugin_state_save_restore() {
+    let _plugin_guard = plugin_guard();
     let plugin_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../test_plugins/Dexed.vst3");
     if !std::path::Path::new(plugin_path).exists() {
         println!("Test plugin not found at {plugin_path}, skipping");
@@ -388,6 +427,7 @@ fn test_plugin_state_save_restore() {
 #[test]
 #[ignore = "Requires the bundled test plugin"]
 fn test_vstpreset_save_load() {
+    let _plugin_guard = plugin_guard();
     let plugin_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../test_plugins/Dexed.vst3");
     if !std::path::Path::new(plugin_path).exists() {
         println!("Test plugin not found at {plugin_path}, skipping");
@@ -448,6 +488,7 @@ fn test_vstpreset_save_load() {
 #[test]
 #[ignore = "Requires the helper binary and the bundled test plugin"]
 fn test_process_isolation() {
+    let _plugin_guard = plugin_guard();
     let plugin_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../test_plugins/Dexed.vst3");
     if !std::path::Path::new(plugin_path).exists() {
         println!("Test plugin not found at {plugin_path}, skipping");
@@ -538,6 +579,7 @@ fn test_process_isolation() {
 #[test]
 #[ignore = "Requires the helper binary and the bundled test plugin"]
 fn test_isolation_set_parameter_at() {
+    let _plugin_guard = plugin_guard();
     let plugin_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../test_plugins/Dexed.vst3");
     if !std::path::Path::new(plugin_path).exists() {
         println!("Test plugin not found at {plugin_path}, skipping");
@@ -583,6 +625,7 @@ fn test_isolation_set_parameter_at() {
 #[test]
 #[ignore = "Requires the helper binary and the bundled test plugin"]
 fn test_isolation_state_roundtrip() {
+    let _plugin_guard = plugin_guard();
     let plugin_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../test_plugins/Dexed.vst3");
     if !std::path::Path::new(plugin_path).exists() {
         println!("Test plugin not found at {plugin_path}, skipping");
@@ -622,6 +665,7 @@ fn test_isolation_state_roundtrip() {
 #[test]
 #[ignore = "Requires the bundled test plugin"]
 fn test_plugin_metadata_is_detected() {
+    let _plugin_guard = plugin_guard();
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../test_plugins/Dexed.vst3");
     if !std::path::Path::new(path).exists() {
         println!("Test plugin not found, skipping");
@@ -646,6 +690,7 @@ fn test_plugin_metadata_is_detected() {
 #[test]
 #[ignore = "Requires the bundled test plugin"]
 fn test_set_bus_active() {
+    let _plugin_guard = plugin_guard();
     use vst3_host::{BusDirection, MediaType};
 
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../test_plugins/Dexed.vst3");
@@ -692,6 +737,7 @@ fn test_set_bus_active() {
 #[test]
 #[ignore = "Requires the bundled test plugin"]
 fn test_parameter_automation_changes_audio() {
+    let _plugin_guard = plugin_guard();
     let plugin_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../test_plugins/Dexed.vst3");
     if !std::path::Path::new(plugin_path).exists() {
         println!("Test plugin not found, skipping");
@@ -757,6 +803,7 @@ fn test_parameter_automation_changes_audio() {
 #[test]
 #[ignore = "Requires the helper binary; a real emitter only if one is installed"]
 fn test_isolation_output_midi_parity() {
+    let _plugin_guard = plugin_guard();
     // Drive the SAME plugin in-process and isolated with identical input; the isolated
     // output MIDI must equal the in-process output MIDI (the boundary must be transparent).
     let candidates = [
@@ -816,6 +863,7 @@ fn test_isolation_output_midi_parity() {
 #[test]
 #[ignore = "Requires the helper binary and the bundled test plugin"]
 fn test_isolation_crash_recovery() {
+    let _plugin_guard = plugin_guard();
     let plugin_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../test_plugins/Dexed.vst3");
     if !std::path::Path::new(plugin_path).exists() {
         println!("Test plugin not found at {plugin_path}, skipping");
@@ -875,6 +923,7 @@ fn test_isolation_crash_recovery() {
 #[test]
 #[ignore = "Requires the helper binary and the bundled test plugin"]
 fn test_isolation_auto_recover() {
+    let _plugin_guard = plugin_guard();
     let plugin_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../test_plugins/Dexed.vst3");
     if !std::path::Path::new(plugin_path).exists() {
         println!("Test plugin not found at {plugin_path}, skipping");
@@ -929,6 +978,7 @@ fn test_isolation_auto_recover() {
 #[test]
 #[ignore = "Requires the helper binary"]
 fn test_isolation_dead_helper_errors_fast() {
+    let _plugin_guard = plugin_guard();
     use std::time::Duration;
     use vst3_host::process_isolation::{HostCommand, PluginHostProcess};
 
@@ -954,8 +1004,16 @@ fn test_isolation_dead_helper_errors_fast() {
 #[test]
 #[ignore = "Requires free VST3 synths to be installed"]
 fn test_specific_free_plugins() {
+    let _plugin_guard = plugin_guard();
+    // `mut` for the `load_plugin` calls further down; the scan itself only needs `&self`.
     let mut host = Vst3Host::new().expect("Failed to create host");
-    let plugins = host.discover_plugins().expect("Failed to discover plugins");
+    // Out-of-process (see `find_test_plugin`): an in-process scan can abort the test binary.
+    let plugins: Vec<PluginInfo> = host
+        .discover_plugins_safe()
+        .plugins
+        .into_iter()
+        .map(|d| d.info)
+        .collect();
 
     // Check for specific free plugins
     let free_plugins = [
@@ -1009,6 +1067,7 @@ fn test_specific_free_plugins() {
 #[test]
 #[ignore = "requires the helper binary and installed plugins"]
 fn test_probe_and_auto_isolate() {
+    let _plugin_guard = plugin_guard();
     use vst3_host::{ProbeResult, Vst3Host};
 
     let host = Vst3Host::new().expect("host");
@@ -1035,6 +1094,7 @@ fn test_probe_and_auto_isolate() {
 #[test]
 #[ignore = "Requires the bundled test plugin"]
 fn test_realtime_runner_applies_commands_and_renders() {
+    let _plugin_guard = plugin_guard();
     use vst3_host::realtime::RealtimePluginRunner;
 
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../test_plugins/Dexed.vst3");
@@ -1093,6 +1153,7 @@ fn test_realtime_runner_applies_commands_and_renders() {
 #[test]
 #[ignore = "Requires audio hardware and the bundled test plugin"]
 fn test_play_realtime_smoke() {
+    let _plugin_guard = plugin_guard();
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../test_plugins/Dexed.vst3");
     if !std::path::Path::new(path).exists() {
         println!("Test plugin not found, skipping");
@@ -1128,6 +1189,7 @@ fn test_play_realtime_smoke() {
 #[test]
 #[ignore = "Requires the bundled test plugin"]
 fn test_sample_accurate_automation_evolves_output() {
+    let _plugin_guard = plugin_guard();
     use vst3_host::parameters::{AutomationCurve, ParameterAutomation};
 
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../test_plugins/Dexed.vst3");

@@ -1752,3 +1752,51 @@ fn oversized_caller_block_is_rendered_in_full() {
         );
     }
 }
+
+/// `AudioBuffers`' channel Vecs are public, so nothing guarantees they are all the same length.
+/// The block length is taken from the first channel, so a shorter later channel meant the chunked
+/// output copy indexed it at an offset past its end — `ch[start..start]` still panics when
+/// `start > len`. Reachable through the documented API, and inside the isolation helper, which
+/// forwards the client's `inputs` verbatim while sizing `outputs` from `frames`.
+#[test]
+#[ignore = "Requires the bundled TestSynth (just test-plugin)"]
+fn ragged_channel_lengths_do_not_panic() {
+    let _guard = plugin_guard();
+    let Some(path) = test_synth_path() else {
+        return;
+    };
+
+    let block = 256usize;
+    let mut host = Vst3Host::builder()
+        .sample_rate(48000.0)
+        .block_size(block)
+        .build()
+        .expect("build host");
+    let mut plugin = host.load_plugin(path).expect("load TestSynth");
+    plugin.start_processing().expect("start_processing");
+    let id = plugin.note_on(MidiChannel::Ch1, 60, 100).expect("note_on");
+
+    // Channel 0 spans four chunks; channel 1 stops partway through the second.
+    let mut buffers = AudioBuffers::new(0, 2, block * 4, 48000.0);
+    buffers.outputs[1].truncate(300);
+    plugin
+        .process_audio(&mut buffers)
+        .expect("ragged output channels must not panic or error");
+
+    // The long channel is still fully rendered; the short one is filled only as far as it goes.
+    let long_peak = buffers.outputs[0][block * 3..]
+        .iter()
+        .fold(0.0f32, |m, s| m.max(s.abs()));
+    assert!(long_peak > 0.0, "the full-length channel lost its tail");
+    assert_eq!(buffers.outputs[1].len(), 300, "short channel was resized");
+
+    // Ragged *inputs* too (an effect-style call with a short input channel).
+    let mut buffers = AudioBuffers::new(2, 2, block * 4, 48000.0);
+    buffers.inputs[1].truncate(17);
+    plugin
+        .process_audio(&mut buffers)
+        .expect("ragged input channels must not panic or error");
+
+    plugin.note_off(id).ok();
+    plugin.stop_processing().ok();
+}

@@ -59,7 +59,19 @@ impl Vst3Host {
         Ok(())
     }
 
-    /// Discover VST3 plugins in configured scan paths
+    /// Discover VST3 plugins in configured scan paths.
+    ///
+    /// # This can take your process down
+    ///
+    /// Every candidate is instantiated **in this process** to read its metadata, so a plugin that
+    /// aborts, segfaults, or throws a C++ exception through the Rust frames during its own
+    /// initialisation kills the host — there is nothing this function can catch. That is not
+    /// hypothetical: a licensed Waves plugin in a normal `/Library/Audio/Plug-Ins/VST3` aborts
+    /// with "Rust cannot catch foreign exceptions" during its license check.
+    ///
+    /// Prefer [`Self::discover_plugins_safe`], which introspects each plugin in a short-lived
+    /// child process and reports the casualties as skips instead of dying. Use this one only when
+    /// you control which plugins are present.
     pub fn discover_plugins(&mut self) -> Result<Vec<PluginInfo>> {
         let mut all_paths = self.custom_paths.clone();
 
@@ -515,7 +527,26 @@ impl Vst3HostBuilder {
     }
 
     /// Build the configured host.
+    ///
+    /// Rejects a sample rate or block size the plugin setup can't honour, using the same rules as
+    /// [`Plugin::reconfigure`](crate::Plugin::reconfigure) — the two configuration entry points
+    /// previously disagreed, so a `block_size(0)` accepted here produced permanent silence and a
+    /// `sample_rate(0.0)` reached `setupProcessing`, where plugins computing `1.0 / sampleRate`
+    /// generate NaN coefficients.
     pub fn build(self) -> Result<Vst3Host> {
+        if !self.config.sample_rate.is_finite() || self.config.sample_rate <= 0.0 {
+            return Err(Error::InvalidParameter(format!(
+                "sample rate must be finite and positive, got {}",
+                self.config.sample_rate
+            )));
+        }
+        if self.config.block_size == 0 || self.config.block_size > i32::MAX as usize {
+            return Err(Error::InvalidParameter(format!(
+                "block size must be in 1..={}, got {}",
+                i32::MAX,
+                self.config.block_size
+            )));
+        }
         Ok(Vst3Host {
             config: self.config,
             custom_paths: self.custom_paths,

@@ -856,10 +856,13 @@ impl VST3Inspector {
         let Some(audio) = self.audio.as_ref() else {
             return;
         };
-        // `try_lock`: the audio callback holds this same mutex for the duration of each block, and
-        // blocking the UI thread behind it would stutter the whole app. Losing the race just
-        // defers servicing to the next frame, which the editor can't perceive.
-        if let Ok(mut plugin) = audio.plugin().try_lock() {
+        // `AudioHandle::try_lock`, not the raw `Mutex::try_lock`: the audio callback holds this
+        // mutex for each block and blocking the UI thread behind it would stutter the app, so
+        // losing the race and deferring to the next frame is fine — but a *poisoned* mutex is
+        // permanent, and the raw try_lock treats it as failure, which would silently stop
+        // servicing the editor for the rest of the session after any audio-thread panic. The
+        // playback bridge deliberately keeps running through poison, so this must too.
+        if let Some(mut plugin) = audio.try_lock() {
             plugin.service_run_loop();
         }
     }
@@ -2921,18 +2924,18 @@ impl VST3Inspector {
                 .map_err(|e| format!("render: {e}"))
         })();
 
-        // Report the export outcome now. The reload below is asynchronous (introspection runs off
-        // thread and the load itself happens in a later frame), so checking `self.audio` here to
-        // infer whether it worked would always see `None` and always claim failure.
-        match render_result {
-            Ok(()) => self.set_error(format!("Exported audio to {}", path.display())),
-            Err(e) => self.set_error(format!("Failed to export audio: {e}")),
-        }
-
         // Resume the live view by reloading the plugin. The snapshot rides along so
         // `poll_pending_load` can restore it onto the new instance once the load completes —
         // applying it here would be too early, and would silently lose the user's tweaks.
         self.load_plugin_restoring(plugin_path, state);
+
+        // Report the export outcome *after* starting the reload, because the reload clears the
+        // status line. Not before it, either: the reload is asynchronous now, so inferring success
+        // from `self.audio` here would always see `None` and always claim failure.
+        match render_result {
+            Ok(()) => self.set_error(format!("Exported audio to {}", path.display())),
+            Err(e) => self.set_error(format!("Failed to export audio: {e}")),
+        }
     }
 
     /// Capture the live plugin's current state into an A/B slot (for quick comparison).

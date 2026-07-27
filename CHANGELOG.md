@@ -6,6 +6,50 @@ All notable changes to `vst3-host` are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed (second review pass)
+
+Three more reviewers went at the crate — one debugging a real crash, one attacking the changes
+above, one running adversarial inputs through the public API. Everything below was reproduced.
+
+- **Four regressions from the fixes below, before they ever shipped in a release.** The chunked
+  `process()` panicked on the audio thread when the caller's channel Vecs had unequal lengths (the
+  block length comes from the first channel, so a shorter later channel got sliced past its end);
+  it span forever if `block_size` was 0; gating the helper/probe ancestor search on
+  `debug_assertions` broke every isolation test in release builds, because test binaries live in
+  `target/<profile>/deps` where no other resolver looks; and the inspector's WAV-export toast was
+  erased by the reload it triggers, so the export result was never visible at all.
+- **`Vst3HostBuilder::build` validates sample rate and block size**, matching
+  `Plugin::reconfigure`. The two disagreed: `block_size(0)` gave permanent silence and
+  `sample_rate(0.0)` reached `setupProcessing`, where plugins computing `1.0 / sampleRate` produce
+  NaN coefficients.
+- **`RmsWindow` could be latched to silence permanently by one bad sample.** The running sum is an
+  accumulator, so a NaN (or a sample large enough that its square overflows) poisoned it forever —
+  evicting the entry subtracts NaN again — and `rms()`'s `max(0.0)` guard renders NaN as `0.0`. A
+  meter would read digital silence for the rest of its life while full-scale audio flowed through.
+  `RmsWindow::from_duration` also panicked with a capacity overflow on a non-finite duration.
+- **A symlink loop made plugin scanning hang forever.** `scan_directory` recursed on `is_dir()`,
+  which follows symlinks, with no visited set — so a plug-in folder containing a link to an
+  ancestor wedged the scan while the result list grew unboundedly with textually distinct
+  duplicates that `dedup` couldn't collapse. Directories are now tracked by canonical path.
+- **Automation could stop audio rendering entirely.** Only the interpolating branch of
+  `value_at_time` clamped, so a curve whose first or last point was out of range returned it raw to
+  `Plugin::set_parameter_at`, which rejects it — and `Timeline::drive_block` propagates that
+  *before* processing audio, so rendering stopped once the playhead reached the last point, losing
+  that block's MIDI with it. All branches now clamp and map non-finite to a usable value.
+- Overflow panics reachable from public APIs: `Timeline::advance_block` after a large
+  `seek_frame`, `ParameterAutomation::points_for_block` with an absurd block length, and
+  `midi::name_to_note` on an extreme octave (`"C2147483647"`).
+- The inspector serviced the Linux editor run loop with a raw `try_lock`, which treats a poisoned
+  mutex as a failed race — permanent, not transient — so a VSTGUI editor would stop painting for
+  the rest of the session after any audio-thread panic.
+
+### Changed
+
+- `Vst3Host::discover_plugins` now documents that it instantiates every candidate **in-process**,
+  so a plugin that aborts during its own init takes the host down with it — verified with a
+  licensed Waves plugin that aborts with "Rust cannot catch foreign exceptions" during its license
+  check. [`discover_plugins_safe`] exists for this and should be preferred.
+
 ### Fixed
 
 Found by a five-lens review of the whole crate; each was confirmed by reading the code, and two

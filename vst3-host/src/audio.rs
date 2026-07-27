@@ -366,13 +366,28 @@ impl RmsWindow {
     }
 
     /// Create a window sized for `window_secs` of audio at `sample_rate` Hz.
+    ///
+    /// The sample count is clamped: a non-finite or absurd duration/rate would otherwise saturate
+    /// to `usize::MAX` and panic in `VecDeque::with_capacity`.
     pub fn from_duration(window_secs: f32, sample_rate: f64) -> Self {
-        Self::new((window_secs.max(0.0) as f64 * sample_rate).round() as usize)
+        const MAX_WINDOW_SAMPLES: f64 = (1u64 << 26) as f64; // ~23 min at 48 kHz; 256 MiB of f32
+        let samples = window_secs.max(0.0) as f64 * sample_rate;
+        let samples = if samples.is_finite() {
+            samples.round().clamp(1.0, MAX_WINDOW_SAMPLES) as usize
+        } else {
+            1
+        };
+        Self::new(samples)
     }
 
     /// Add one sample, evicting the oldest if the window is full.
     pub fn push_sample(&mut self, sample: f32) {
+        // Treat a non-finite square as silence. The running sum is an accumulator: a single NaN
+        // (or an overflow to infinity from a huge sample) poisons it permanently, because evicting
+        // that entry subtracts NaN again. `rms()`'s `max(0.0)` guard then reports NaN as 0.0, so
+        // the meter would read digital silence for the rest of its life while audio flows.
         let sq = sample * sample;
+        let sq = if sq.is_finite() { sq } else { 0.0 };
         if self.squares.len() == self.capacity {
             if let Some(old) = self.squares.pop_front() {
                 self.sum -= old as f64;
@@ -982,5 +997,48 @@ mod meter_tests {
         // 10 ms at 48 kHz = 480 samples.
         let r = RmsWindow::from_duration(0.01, 48_000.0);
         assert_eq!(r.capacity, 480);
+    }
+
+    /// The running sum is an accumulator, so a single non-finite square would poison it for the
+    /// life of the window — and `rms()`'s `max(0.0)` guard renders NaN as `0.0`, i.e. the meter
+    /// silently reads digital silence forever while full-scale audio flows through it.
+    #[test]
+    fn rms_window_is_not_latched_by_a_non_finite_sample() {
+        for poison in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 1.9e19] {
+            let mut w = RmsWindow::new(1);
+            w.push_sample(poison);
+            w.push_sample(0.5);
+            assert!(
+                (w.rms() - 0.5).abs() < 1e-6,
+                "a {poison} sample latched the meter: rms = {}",
+                w.rms()
+            );
+        }
+
+        // Same through the block API, with the poison still inside the window.
+        let mut w = RmsWindow::new(4);
+        w.push_block(&[f32::NAN, 0.5, 0.5, 0.5]);
+        assert!(w.rms().is_finite() && w.rms() > 0.0, "rms = {}", w.rms());
+    }
+
+    /// A non-finite or absurd duration/rate saturates to `usize::MAX` and panics inside
+    /// `VecDeque::with_capacity`; `from_duration` takes plain `f32`/`f64` from the caller.
+    #[test]
+    fn rms_window_from_duration_survives_absurd_input() {
+        for (secs, rate) in [
+            (1.0f32, f64::INFINITY),
+            (f32::INFINITY, 48_000.0f64),
+            (f32::NAN, 48_000.0),
+            (1.0, 1e30),
+            (1.0, -48_000.0),
+            (-1.0, 48_000.0),
+        ] {
+            let w = RmsWindow::from_duration(secs, rate);
+            assert!(
+                w.capacity >= 1,
+                "capacity {} for ({secs}, {rate})",
+                w.capacity
+            );
+        }
     }
 }

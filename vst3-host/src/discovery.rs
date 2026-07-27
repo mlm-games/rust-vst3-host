@@ -147,9 +147,14 @@ pub fn scan_standard_paths() -> Vec<PathBuf> {
 pub fn scan_directories(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let mut plugins = Vec::new();
 
+    // Directories already visited, by canonical path. A symlink pointing at an ancestor makes the
+    // recursion below unbounded — `is_dir()` follows symlinks — so a user whose plug-in folder
+    // contains one would hang the scan while `plugins` grew forever with textually-distinct
+    // duplicates of the same file (which `dedup` can't collapse, since the paths differ).
+    let mut visited = std::collections::HashSet::new();
     for path in paths {
         if path.exists() {
-            scan_directory(path, &mut plugins)?;
+            scan_directory(path, &mut plugins, &mut visited)?;
         }
     }
 
@@ -160,8 +165,26 @@ pub fn scan_directories(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
     Ok(plugins)
 }
 
-/// Recursively scan a directory for VST3 plugins
-fn scan_directory(dir: &Path, plugins: &mut Vec<PathBuf>) -> Result<()> {
+/// Recursively scan a directory for VST3 plugins.
+///
+/// `visited` holds the canonical path of every directory already descended into, so a symlink
+/// loop terminates instead of recursing forever.
+fn scan_directory(
+    dir: &Path,
+    plugins: &mut Vec<PathBuf>,
+    visited: &mut std::collections::HashSet<PathBuf>,
+) -> Result<()> {
+    // Resolve through symlinks so two routes to the same directory collapse to one entry. A
+    // directory we can't canonicalize (permissions, a broken link) is simply not descended into.
+    match dir.canonicalize() {
+        Ok(real) => {
+            if !visited.insert(real) {
+                return Ok(());
+            }
+        }
+        Err(_) => return Ok(()),
+    }
+
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -175,7 +198,7 @@ fn scan_directory(dir: &Path, plugins: &mut Vec<PathBuf>) -> Result<()> {
 
             // Recursively scan subdirectories (but not .vst3 bundles)
             if path.is_dir() && path.extension() != Some(std::ffi::OsStr::new("vst3")) {
-                scan_directory(&path, plugins)?;
+                scan_directory(&path, plugins, visited)?;
             }
         }
     }
@@ -509,6 +532,25 @@ pub struct SafeDiscoveryReport {
     pub skipped: Vec<SafeDiscoverySkip>,
 }
 
+/// Whether this executable is itself running from a cargo `target/{debug,release}` tree — i.e.
+/// it is a `cargo run` / `cargo test` / example binary rather than a deployed application.
+///
+/// Used to decide whether it is reasonable to go looking for sibling helper binaries in ancestor
+/// directories: inside a build tree that is the whole point, and outside one it would mean
+/// executing something from a path the host doesn't control.
+pub(crate) fn running_from_cargo_target(exe_dir: &Path) -> bool {
+    exe_dir.ancestors().any(|dir| {
+        matches!(
+            dir.file_name().and_then(|n| n.to_str()),
+            Some("debug") | Some("release")
+        ) && dir
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            == Some("target")
+    })
+}
+
 /// Locate the `vst3-host-probe` binary that does the risky introspection out-of-process.
 ///
 /// Mirrors the heuristic the isolation layer uses to find `vst3-host-helper` (same exe
@@ -550,15 +592,14 @@ fn find_probe_binary() -> std::result::Result<PathBuf, String> {
 
     // Walk up looking for a cargo target/{debug,release} that holds the probe.
     //
-    // Debug builds only. This walks *above* the executable into directories an unprivileged
-    // process can write, and whatever it finds gets executed and then trusted for everything the
-    // host believes about a plugin. That is a fine convenience while developing in a cargo tree
-    // and an arbitrary-code-execution foothold in a shipped app, where a plain `target/debug/`
-    // beside any ancestor directory would be picked up. Release builds use the explicit
-    // `VST3_HOST_PROBE_PATH` override or a binary sitting next to the executable, both checked
-    // above.
-    #[cfg(debug_assertions)]
-    {
+    // Only when *we* are running from inside a cargo target directory — i.e. a `cargo run`/`cargo
+    // test` binary, which is the case this fallback exists for (test and example binaries live in
+    // `target/<profile>/deps` and `…/examples`, so neither check above finds the sibling helper).
+    // A shipped application's executable is not under `target/<profile>/`, and for it this walk
+    // would be a liability: it reaches into directories an unprivileged process can write, and
+    // whatever it finds is executed and then trusted for everything the host believes about a
+    // plugin. Deployed builds use `VST3_HOST_PROBE_PATH` or a binary beside the executable.
+    if running_from_cargo_target(exe_dir) {
         let mut current = exe_dir;
         while let Some(parent) = current.parent() {
             for profile in ["debug", "release"] {
@@ -867,5 +908,45 @@ mod report_tests {
         assert_eq!(back.detailed.info.category, "Instrument|Synth");
         assert!(back.detailed.info.has_midi_output);
         assert_eq!(back.detailed.classes.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use super::*;
+
+    /// A symlink pointing back at an ancestor makes the recursive scan unbounded, because
+    /// `Path::is_dir` follows symlinks. It hung and grew `plugins` forever with textually distinct
+    /// duplicates of the same file — which `dedup` cannot collapse, since the paths differ.
+    #[cfg(unix)]
+    #[test]
+    fn scan_terminates_on_a_symlink_cycle_and_does_not_duplicate() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!("vst3-scan-cycle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("mk root");
+        std::fs::create_dir_all(root.join("Real.vst3")).expect("mk bundle");
+        // Three branches, each looping back to the root: without a visited set this explodes.
+        for name in ["a", "b", "c"] {
+            let sub = root.join(name);
+            std::fs::create_dir_all(&sub).expect("mk sub");
+            symlink(&root, sub.join("loop")).expect("symlink");
+        }
+
+        let found = scan_directories(std::slice::from_ref(&root)).expect("scan");
+
+        let bundles: Vec<_> = found
+            .iter()
+            .filter(|p| p.file_name() == Some(std::ffi::OsStr::new("Real.vst3")))
+            .collect();
+        assert_eq!(
+            bundles.len(),
+            1,
+            "the same bundle was reported {} times through symlink routes: {found:?}",
+            bundles.len()
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -257,9 +257,22 @@ impl ParameterAutomation {
             }
         }
 
+        // Every branch clamps to the normalized range and maps non-finite to a usable value.
+        // `add_point` accepts any `f64`, and the consumers don't tolerate out-of-range input:
+        // `Plugin::set_parameter_at` rejects it, and `Timeline::drive_block` propagates that
+        // rejection *before* processing audio — so one bad automation point stopped rendering
+        // entirely, and the block's MIDI (already consumed by `advance_block`) was lost with it.
+        fn sanitize(value: f64) -> f64 {
+            if value.is_finite() {
+                value.clamp(0.0, 1.0)
+            } else {
+                0.0
+            }
+        }
+
         match (prev, next) {
-            (None, _) => Some(self.points[0].value),
-            (Some(i), None) => Some(self.points[i].value),
+            (None, _) => Some(sanitize(self.points[0].value)),
+            (Some(i), None) => Some(sanitize(self.points[i].value)),
             (Some(i), Some(j)) => {
                 let p1 = &self.points[i];
                 let p2 = &self.points[j];
@@ -273,7 +286,7 @@ impl ParameterAutomation {
                     AutomationCurve::Step => p1.value,
                 };
 
-                Some(value.clamp(0.0, 1.0))
+                Some(sanitize(value))
             }
         }
     }
@@ -300,7 +313,9 @@ impl ParameterAutomation {
         let n = points_per_block.clamp(1, frames);
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
-            let offset = (i * frames) / n;
+            // Widened: `i * frames` overflows `usize` for an absurd `frames`, and this is
+            // reachable from `Timeline::advance_block`'s caller-supplied block length.
+            let offset = ((i as u128 * frames as u128) / n as u128) as usize;
             let time = block_start_secs + offset as f64 / sample_rate;
             if let Some(value) = self.value_at_time(time) {
                 out.push((offset as i32, value));
@@ -319,6 +334,55 @@ impl Default for ParameterAutomation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every branch of `value_at_time` must return a usable normalized value. Only the
+    /// interpolating branch clamped, so a curve whose first or last point was out of range handed
+    /// that raw value straight to `Plugin::set_parameter_at`, which rejects it — and
+    /// `Timeline::drive_block` propagates the rejection *before* processing audio, so rendering
+    /// stopped dead once the playhead reached the last point (losing that block's MIDI too).
+    #[test]
+    fn value_at_time_is_always_a_valid_normalized_value() {
+        let a = ParameterAutomation::new()
+            .add_point(0.0, 99.0)
+            .add_point(1.0, -50.0);
+        // Before the first point, exactly on it, between, on the last, and past it.
+        for t in [-1.0, 0.0, 0.5, 1.0, 2.0] {
+            let v = a.value_at_time(t).expect("some value");
+            assert!(
+                (0.0..=1.0).contains(&v),
+                "value_at_time({t}) = {v}, outside 0..=1"
+            );
+        }
+
+        // A NaN point time must not produce NaN values either.
+        let b = ParameterAutomation::new()
+            .add_point(0.0, 0.0)
+            .add_point(f64::NAN, 1.0);
+        for t in [0.0, 0.5, 1.0] {
+            let v = b.value_at_time(t).expect("some value");
+            assert!(v.is_finite(), "value_at_time({t}) = {v}");
+            assert!((0.0..=1.0).contains(&v), "value_at_time({t}) = {v}");
+        }
+
+        // And the block sampler inherits it.
+        for (offset, value) in b.points_for_block(0.0, 2, 1.0, 2) {
+            assert!(
+                value.is_finite() && (0.0..=1.0).contains(&value),
+                "{offset} -> {value}"
+            );
+        }
+    }
+
+    /// `frames` reaches here from `Timeline::advance_block`, so the sub-block offset maths must
+    /// not overflow on an absurd block length.
+    #[test]
+    fn points_for_block_survives_an_absurd_block_length() {
+        let a = ParameterAutomation::new()
+            .add_point(0.0, 0.0)
+            .add_point(1.0, 1.0);
+        let points = a.points_for_block(0.0, usize::MAX, 48_000.0, 4);
+        assert!(points.iter().all(|(_, v)| v.is_finite()));
+    }
 
     #[test]
     fn add_point_with_nan_time_does_not_panic() {
