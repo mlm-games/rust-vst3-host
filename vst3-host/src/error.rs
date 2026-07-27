@@ -49,6 +49,16 @@ pub enum Error {
     #[error(transparent)]
     IoError(#[from] std::io::Error),
 
+    /// The plugin's `process()` returned a failure code. Carries the raw tresult rather than a
+    /// formatted `String` so returning it from the audio callback allocates nothing.
+    #[error("Plugin process() failed: {0:#x}")]
+    ProcessFailed(i32),
+
+    /// The plugin is not currently active/processing. A unit variant for the same reason as
+    /// [`Self::ProcessFailed`] — this is rejected on the audio path once per block while stopped.
+    #[error("Plugin is not processing")]
+    NotProcessing,
+
     /// Other errors
     #[error("{0}")]
     Other(String),

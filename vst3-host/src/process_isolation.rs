@@ -414,7 +414,14 @@ impl PluginHostProcess {
             }
         }
 
-        // Also check common cargo target directories
+        // Also check common cargo target directories.
+        //
+        // Debug builds only: this walks *above* the executable into user-writable directories, and
+        // the binary it finds is spawned and then trusted for every answer the host gets about the
+        // plugin. Convenient in a cargo tree, an arbitrary-code-execution foothold in a shipped
+        // app. Release builds must use the explicit `helper_path`/env override or a helper next to
+        // the executable, both checked above.
+        #[cfg(debug_assertions)]
         if helper_path.is_none() {
             // Try to find the workspace root and look in target/debug or target/release
             let mut current_dir = exe_dir;

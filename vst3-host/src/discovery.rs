@@ -549,18 +549,29 @@ fn find_probe_binary() -> std::result::Result<PathBuf, String> {
     }
 
     // Walk up looking for a cargo target/{debug,release} that holds the probe.
-    let mut current = exe_dir;
-    while let Some(parent) = current.parent() {
-        for profile in ["debug", "release"] {
-            let candidate = parent.join("target").join(profile).join(PROBE_NAME);
-            if candidate.exists() {
-                return Ok(candidate);
+    //
+    // Debug builds only. This walks *above* the executable into directories an unprivileged
+    // process can write, and whatever it finds gets executed and then trusted for everything the
+    // host believes about a plugin. That is a fine convenience while developing in a cargo tree
+    // and an arbitrary-code-execution foothold in a shipped app, where a plain `target/debug/`
+    // beside any ancestor directory would be picked up. Release builds use the explicit
+    // `VST3_HOST_PROBE_PATH` override or a binary sitting next to the executable, both checked
+    // above.
+    #[cfg(debug_assertions)]
+    {
+        let mut current = exe_dir;
+        while let Some(parent) = current.parent() {
+            for profile in ["debug", "release"] {
+                let candidate = parent.join("target").join(profile).join(PROBE_NAME);
+                if candidate.exists() {
+                    return Ok(candidate);
+                }
             }
+            if parent.join("Cargo.toml").exists() {
+                break;
+            }
+            current = parent;
         }
-        if parent.join("Cargo.toml").exists() {
-            break;
-        }
-        current = parent;
     }
 
     Err(format!(

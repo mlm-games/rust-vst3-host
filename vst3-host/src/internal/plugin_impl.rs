@@ -31,6 +31,10 @@ use super::{
 /// forever. The buffer is pre-reserved to this size so steady-state pushes never reallocate.
 const MAX_OUTPUT_MIDI: usize = 4096;
 
+/// Cap on simultaneously tracked `note_on` ids (see `PluginImpl::active_notes`). Far above any
+/// real polyphony, and bounds a caller that starts notes it never releases.
+const MAX_TRACKED_NOTES: usize = 1024;
+
 /// Internal plugin implementation that handles all VST3 COM interactions
 pub struct PluginImpl {
     // Core VST3 interfaces
@@ -62,6 +66,10 @@ pub struct PluginImpl {
     process_mode: crate::plugin::ProcessMode,
     /// Monotonic allocator for per-voice note ids (note_on); 0/-1 reserved for "unset".
     next_note_id: i32,
+    // `(note_id, channel, pitch)` for notes started via `note_on`, so `note_off` can address the
+    // release by pitch as well as by id. Pre-reserved and capped, so tracking never allocates on
+    // the audio thread and a caller that never releases its notes can't grow it without bound.
+    active_notes: Vec<(i32, i16, i16)>,
 
     // Host data structures
     process_data: Option<Box<HostProcessData>>,
@@ -394,6 +402,7 @@ impl PluginImpl {
                 playing: true,
                 process_mode: crate::plugin::ProcessMode::Realtime,
                 next_note_id: 1,
+                active_notes: Vec::with_capacity(MAX_TRACKED_NOTES),
                 process_data: None,
                 component_handler: Some(component_handler),
                 pending_param_changes: Vec::new(),
@@ -776,6 +785,170 @@ impl PluginImpl {
     }
 }
 
+impl PluginImpl {
+    /// Process exactly `frames` samples starting at `frame_offset` within the caller's
+    /// buffers. `frames` is always <= the configured `block_size`, which is what the plugin
+    /// was set up to accept; `process` splits a larger caller block into successive chunks.
+    ///
+    /// Queued input events and parameter changes are consumed and cleared here, so when a
+    /// block is split they apply to the first chunk only rather than repeating in each one.
+    fn process_chunk(
+        &mut self,
+        buffers: &mut AudioBuffers,
+        frame_offset: usize,
+        frames: usize,
+    ) -> Result<()> {
+        let result = if let Some(ref mut data) = self.process_data {
+            unsafe {
+                // Clear output events only - input events should be preserved for processing
+                self.output_events.clear();
+
+                // Clear the output parameter queue too. VST3's ProcessData::outputParameterChanges
+                // describes changes for the *current* processing block only (see
+                // Steinberg::Vst::ProcessData / IParameterChanges docs); the reference
+                // ParameterChanges host helper exposes clearQueue() for exactly this reset.
+                // Without this, addParameterData()/addPoint() would keep appending to queues
+                // from prior blocks, mixing stale points into new ones, growing point storage
+                // unbounded, and risking a reallocation on the audio thread long after warm-up.
+                data.output_param_changes.clear_all();
+
+                // VST3 allows numSamples to vary up to the maximum given to setupProcessing; the
+                // caller's block may be shorter (BufferSize::Default gives variable sizes) or, if
+                // it was longer, `process` has already split it into chunks of at most that
+                // maximum.
+                let frames = frames.min(self.block_size);
+                data.process_data.numSamples = frames as i32;
+
+                // Clamp queued MIDI event offsets into the actual (possibly smaller) block, so a
+                // note scheduled near block_size can't land past the end of a short block.
+                self.input_events
+                    .clamp_offsets(frames.saturating_sub(1) as i32);
+
+                // Feed queued parameter changes into the processor's input queue, clamping
+                // each sample offset into this block.
+                for pc in &self.pending_param_changes {
+                    let off = pc.sample_offset.clamp(0, frames.saturating_sub(1) as i32);
+                    data.input_param_changes.enqueue(pc.id, off, pc.value);
+                }
+
+                // Route parameter edits the plugin's *own editor* reported via performEdit into
+                // the processor too, so turning a knob in the plugin GUI affects the audio — not
+                // just the host's display. (Some plugins relay editor→processor internally over
+                // the component/controller connection; others rely on the host to do this. We do
+                // it unconditionally; a plugin that also self-relays just gets the same value
+                // twice in the same block, which is idempotent.) Drained here at offset 0 and
+                // stashed for the host's display poll (get_parameter_changes).
+                if let Some(ref handler) = self.component_handler {
+                    if let Ok(mut gui_changes) = handler.parameter_changes.lock() {
+                        if !gui_changes.is_empty() {
+                            for &(id, value) in gui_changes.iter() {
+                                data.input_param_changes.enqueue(id, 0, value);
+                            }
+                            if let Ok(mut stash) = self.gui_param_changes_for_host.lock() {
+                                // Bounded: nothing drains the stash unless the host polls
+                                // `get_parameter_changes`, and the realtime runner never does, so
+                                // an unbounded append here would grow forever and reallocate on
+                                // the audio thread. Both buffers are pre-reserved to the cap, so
+                                // the steady-state append allocates nothing.
+                                let room = MAX_EDITOR_FEEDBACK.saturating_sub(stash.len());
+                                if room >= gui_changes.len() {
+                                    stash.append(&mut gui_changes);
+                                } else {
+                                    stash.extend(gui_changes.drain(..room));
+                                    gui_changes.clear();
+                                }
+                            } else {
+                                gui_changes.clear();
+                            }
+                        }
+                    }
+                }
+
+                // Copy this chunk's input audio to the plugin buffers (length-clamped — never
+                // assume the caller's block equals the configured block size).
+                for (ch_idx, channel) in buffers.inputs.iter().enumerate() {
+                    if ch_idx < data.input_buffers.len() {
+                        let n = frames
+                            .min(data.input_buffers[ch_idx].len())
+                            .min(channel.len().saturating_sub(frame_offset));
+                        data.input_buffers[ch_idx][..n]
+                            .copy_from_slice(&channel[frame_offset..frame_offset + n]);
+                    }
+                }
+
+                // Clear output buffers
+                for buffer in &mut data.output_buffers {
+                    buffer.fill(0.0);
+                }
+
+                // Channel pointers and process-data input/output pointers were wired once in
+                // prepare_buffers (buffer addresses are stable), so there's nothing to rebuild
+                // here — keeping the steady-state path allocation-free.
+
+                // Process
+                let process_result = self.processor.process(&mut data.process_data);
+
+                // Everything from here to the output copy is per-block cleanup and MUST run even
+                // when the plugin reported failure. Returning early instead would leave this
+                // block's events and parameter changes queued, so the next block would re-deliver
+                // every one of them — re-triggering held notes and growing the queues without
+                // bound for as long as the plugin keeps failing.
+
+                // Advance the transport so tempo-synced DSP (LFOs, sync'd delays/arps) sees
+                // a moving playhead instead of a frozen time-0. The context describes the
+                // block that was just processed; advancing here means the next block starts
+                // at the new sample position.
+                advance_process_context(&mut data.process_context, frames as i64);
+
+                // Clear input events AFTER processing so plugin can see them
+                self.input_events.clear();
+                // Clear the input parameter queue too, so this block's values don't
+                // re-stick on the next block.
+                data.input_param_changes.clear_all();
+
+                // Capture any MIDI the plugin emitted this block (arpeggiators, MPE, etc.).
+                // Drain the event list in place (no `mem::take`) and push each converted event
+                // into the lock-free output queue with `force_push`, which drops the oldest event
+                // when full. No lock and no allocation on the audio thread even while MIDI flows.
+                if !self.output_events.is_empty() {
+                    let out = &self.output_midi;
+                    self.output_events.for_each_then_clear(|e| {
+                        if let Some(m) = event_to_midi(e) {
+                            out.force_push(m);
+                        }
+                    });
+                }
+
+                if process_result != kResultOk {
+                    // Leave the caller's buffers as they were (the playback bridges pre-fill them
+                    // with silence) rather than copying out whatever the failed call left behind.
+                    Err(Error::ProcessFailed(process_result))
+                } else {
+                    // Copy this chunk's output back into the caller's buffers at the same offset
+                    // (length-clamped to the actual frames).
+                    for (ch_idx, channel) in buffers.outputs.iter_mut().enumerate() {
+                        if ch_idx < data.output_buffers.len() {
+                            let n = frames
+                                .min(data.output_buffers[ch_idx].len())
+                                .min(channel.len().saturating_sub(frame_offset));
+                            channel[frame_offset..frame_offset + n]
+                                .copy_from_slice(&data.output_buffers[ch_idx][..n]);
+                        }
+                    }
+                    Ok(())
+                }
+            }
+        } else {
+            Err(Error::Other("Process data not initialized".to_string()))
+        };
+
+        // Clear in place (retains capacity); the changes were copied into the processor's
+        // input queue above. Runs on both the Ok and error paths so the queue can't accumulate.
+        self.pending_param_changes.clear();
+        result
+    }
+}
+
 impl PluginInternal for PluginImpl {
     fn set_parameter(&mut self, id: u32, value: f64) -> Result<()> {
         self.set_parameter_at(id, value, 0)
@@ -786,8 +959,19 @@ impl PluginInternal for PluginImpl {
             // VST3 requires both halves: tell the controller (for GUI/display/formatting)
             // AND feed the processor's input queue (so the change reaches the audio DSP).
             // The processor side is applied at `sample_offset` in the next process() block.
-            unsafe {
-                controller.setParamNormalized(id, value);
+            let result = unsafe { controller.setParamNormalized(id, value) };
+            // Deliberately NOT treated as an error. The SDK's reference `EditController` returns
+            // kResultTrue on success and kResultFalse for an id it doesn't own, which makes the
+            // code look like a usable success signal — but real plugins don't honour that. Dexed
+            // (JUCE) returns kResultFalse for parameter ids 0/1/2 that it then applies correctly,
+            // so failing the call here would break parameter automation on shipping plugins. Log
+            // it for diagnosis and carry on; `log` skips the formatting entirely when the level is
+            // disabled, so this costs nothing on the audio path.
+            if result != kResultOk && result != kResultTrue {
+                log::debug!(
+                    "setParamNormalized({id}) returned {result:#x}; applying anyway \
+                     (many plugins report kResultFalse on success)"
+                );
             }
             self.pending_param_changes.push(ParameterChange {
                 id,
@@ -879,159 +1063,49 @@ impl PluginInternal for PluginImpl {
 
     fn process(&mut self, buffers: &mut AudioBuffers) -> Result<()> {
         if !self.is_active || !self.is_processing {
-            return Err(Error::Other("Plugin is not processing".to_string()));
+            // Unit variant, not a formatted string: a host that stops processing while its stream
+            // keeps running hits this once per block on the audio thread.
+            return Err(Error::NotProcessing);
         }
 
         // Flush denormals to zero for the duration of the plugin's processing, restoring the
         // prior FPU state when this returns. Covers both the simple (mutex) and realtime paths,
-        // since both funnel audio through here.
+        // since both funnel audio through here. Hoisted out of the per-chunk loop below so a
+        // split block saves and restores the FPU state once, not once per chunk.
         let _denormal = crate::internal::denormal::DenormalGuard::new();
 
-        // Parameter changes queued since the last block are fed into the processor's input
-        // queue below (so the DSP — not just the controller — sees them this block) and then
-        // cleared in place. Draining in place (rather than `mem::take`, which leaves a
-        // zero-capacity Vec) keeps the queue's capacity across blocks, so a steady stream of
-        // parameter automation never reallocates on the audio thread.
-        let result = if let Some(ref mut data) = self.process_data {
-            unsafe {
-                // Clear output events only - input events should be preserved for processing
-                self.output_events.clear();
+        // How many frames the caller actually supplied.
+        let total = buffers
+            .outputs
+            .iter()
+            .chain(buffers.inputs.iter())
+            .map(|c| c.len())
+            .next()
+            .unwrap_or(self.block_size);
 
-                // Clear the output parameter queue too. VST3's ProcessData::outputParameterChanges
-                // describes changes for the *current* processing block only (see
-                // Steinberg::Vst::ProcessData / IParameterChanges docs); the reference
-                // ParameterChanges host helper exposes clearQueue() for exactly this reset.
-                // Without this, addParameterData()/addPoint() would keep appending to queues
-                // from prior blocks, mixing stale points into new ones, growing point storage
-                // unbounded, and risking a reallocation on the audio thread long after warm-up.
-                data.output_param_changes.clear_all();
-
-                // The device may request a smaller block than the configured maximum
-                // (BufferSize::Default gives variable sizes), so process exactly the
-                // number of frames the caller provided, clamped to our preallocated
-                // buffers. VST3 allows numSamples to vary up to the setup maximum.
-                let frames = buffers
-                    .outputs
-                    .iter()
-                    .chain(buffers.inputs.iter())
-                    .map(|c| c.len())
-                    .next()
-                    .unwrap_or(self.block_size)
-                    .min(self.block_size);
-                data.process_data.numSamples = frames as i32;
-
-                // Clamp queued MIDI event offsets into the actual (possibly smaller) block, so a
-                // note scheduled near block_size can't land past the end of a short block.
-                self.input_events
-                    .clamp_offsets(frames.saturating_sub(1) as i32);
-
-                // Feed queued parameter changes into the processor's input queue, clamping
-                // each sample offset into this block.
-                for pc in &self.pending_param_changes {
-                    let off = pc.sample_offset.clamp(0, frames.saturating_sub(1) as i32);
-                    data.input_param_changes.enqueue(pc.id, off, pc.value);
-                }
-
-                // Route parameter edits the plugin's *own editor* reported via performEdit into
-                // the processor too, so turning a knob in the plugin GUI affects the audio — not
-                // just the host's display. (Some plugins relay editor→processor internally over
-                // the component/controller connection; others rely on the host to do this. We do
-                // it unconditionally; a plugin that also self-relays just gets the same value
-                // twice in the same block, which is idempotent.) Drained here at offset 0 and
-                // stashed for the host's display poll (get_parameter_changes).
-                if let Some(ref handler) = self.component_handler {
-                    if let Ok(mut gui_changes) = handler.parameter_changes.lock() {
-                        if !gui_changes.is_empty() {
-                            for &(id, value) in gui_changes.iter() {
-                                data.input_param_changes.enqueue(id, 0, value);
-                            }
-                            if let Ok(mut stash) = self.gui_param_changes_for_host.lock() {
-                                // Bounded: nothing drains the stash unless the host polls
-                                // `get_parameter_changes`, and the realtime runner never does, so
-                                // an unbounded append here would grow forever and reallocate on
-                                // the audio thread. Both buffers are pre-reserved to the cap, so
-                                // the steady-state append allocates nothing.
-                                let room = MAX_EDITOR_FEEDBACK.saturating_sub(stash.len());
-                                if room >= gui_changes.len() {
-                                    stash.append(&mut gui_changes);
-                                } else {
-                                    stash.extend(gui_changes.drain(..room));
-                                    gui_changes.clear();
-                                }
-                            } else {
-                                gui_changes.clear();
-                            }
-                        }
-                    }
-                }
-
-                // Copy input audio to plugin buffers (length-clamped — never assume the
-                // caller's block equals the configured block size).
-                for (ch_idx, channel) in buffers.inputs.iter().enumerate() {
-                    if ch_idx < data.input_buffers.len() {
-                        let n = channel.len().min(data.input_buffers[ch_idx].len());
-                        data.input_buffers[ch_idx][..n].copy_from_slice(&channel[..n]);
-                    }
-                }
-
-                // Clear output buffers
-                for buffer in &mut data.output_buffers {
-                    buffer.fill(0.0);
-                }
-
-                // Channel pointers and process-data input/output pointers were wired once in
-                // prepare_buffers (buffer addresses are stable), so there's nothing to rebuild
-                // here — keeping the steady-state path allocation-free.
-
-                // Process
-                let result = self.processor.process(&mut data.process_data);
-                if result != kResultOk {
-                    return Err(Error::Other(format!("Process failed: {:#x}", result)));
-                }
-
-                // Advance the transport so tempo-synced DSP (LFOs, sync'd delays/arps) sees
-                // a moving playhead instead of a frozen time-0. The context describes the
-                // block that was just processed; advancing here means the next block starts
-                // at the new sample position.
-                advance_process_context(&mut data.process_context, frames as i64);
-
-                // Clear input events AFTER processing so plugin can see them
-                self.input_events.clear();
-                // Clear the input parameter queue too, so this block's values don't
-                // re-stick on the next block.
-                data.input_param_changes.clear_all();
-
-                // Capture any MIDI the plugin emitted this block (arpeggiators, MPE, etc.).
-                // Drain the event list in place (no `mem::take`) and push each converted event
-                // into the lock-free output queue with `force_push`, which drops the oldest event
-                // when full. No lock and no allocation on the audio thread even while MIDI flows.
-                if !self.output_events.is_empty() {
-                    let out = &self.output_midi;
-                    self.output_events.for_each_then_clear(|e| {
-                        if let Some(m) = event_to_midi(e) {
-                            out.force_push(m);
-                        }
-                    });
-                }
-
-                // Copy output to provided buffers (length-clamped to the actual frames).
-                for (ch_idx, channel) in buffers.outputs.iter_mut().enumerate() {
-                    if ch_idx < data.output_buffers.len() {
-                        let n = channel.len().min(data.output_buffers[ch_idx].len());
-                        channel[..n].copy_from_slice(&data.output_buffers[ch_idx][..n]);
-                    }
-                }
-
-                Ok(())
-            }
-        } else {
-            Err(Error::Other("Process data not initialized".to_string()))
-        };
-
-        // Clear in place (retains capacity); the changes were copied into the processor's
-        // input queue above. Runs on both the Ok and error paths so the queue can't accumulate.
-        self.pending_param_changes.clear();
-        result
+        // The plugin was set up with `maxSamplesPerBlock = self.block_size` and may not be handed
+        // more than that in one call — but the device can legitimately deliver more: the cpal
+        // backend clamps the requested size *up* into the device's supported range, and
+        // `BufferSize::Default` lets the device pick whatever it likes. Feeding only the first
+        // `block_size` frames and returning would leave the rest of every buffer as silence (an
+        // audible gate at the device's block rate) and advance the plugin's transport at a
+        // fraction of real time. So split an oversized block into successive chunks instead.
+        //
+        // Queued events and parameter changes are consumed by the first chunk (`process_chunk`
+        // clears them), so they land at their requested offset within it rather than being
+        // re-delivered to every chunk.
+        if total == 0 {
+            // Preserve the historical behaviour of still calling the plugin for an empty block —
+            // some plugins use a zero-sample call to flush pending parameter changes.
+            return self.process_chunk(buffers, 0, 0);
+        }
+        let mut offset = 0;
+        while offset < total {
+            let frames = (total - offset).min(self.block_size);
+            self.process_chunk(buffers, offset, frames)?;
+            offset += frames;
+        }
+        Ok(())
     }
 
     fn reconfigure(&mut self, sample_rate: f64, block_size: usize) -> Result<()> {
@@ -1384,6 +1458,9 @@ impl PluginInternal for PluginImpl {
                 self.is_active = false;
             }
 
+            // Nothing can still be sounding, so no note-on is outstanding.
+            self.active_notes.clear();
+
             Ok(())
         }
     }
@@ -1648,6 +1725,17 @@ impl PluginInternal for PluginImpl {
     ) -> Result<crate::midi::NoteId> {
         let id = self.next_note_id;
         self.next_note_id = self.next_note_id.wrapping_add(1).max(1);
+        // Remember which (channel, pitch) this id stands for. VST3 note-off carries both the
+        // noteId *and* the pitch/channel, and plugins that don't track note ids (most non-MPE
+        // synths) match the release by pitch — so `note_off` has to reproduce them.
+        if self.active_notes.len() >= MAX_TRACKED_NOTES {
+            // Full only if a caller started notes it never released (a MIDI panic sends CCs, not
+            // note-offs, so entries can also be left behind that way). Evict one in O(1) rather
+            // than refusing to track, so new notes keep getting correct releases.
+            self.active_notes.swap_remove(0);
+        }
+        self.active_notes
+            .push((id, channel.as_index() as i16, note as i16));
         unsafe {
             let mut ev: Event = std::mem::zeroed();
             ev.busIndex = 0;
@@ -1664,6 +1752,14 @@ impl PluginInternal for PluginImpl {
     }
 
     fn note_off(&mut self, id: crate::midi::NoteId, sample_offset: i32) -> Result<()> {
+        // Recover the note's channel and pitch from the note-on. Without them the event carries
+        // pitch 0 on channel 1, which any synth matching releases by pitch ignores — leaving the
+        // real note sounding forever.
+        let tracked = self
+            .active_notes
+            .iter()
+            .position(|&(tracked_id, _, _)| tracked_id == id.0)
+            .map(|i| self.active_notes.swap_remove(i));
         unsafe {
             let mut ev: Event = std::mem::zeroed();
             ev.busIndex = 0;
@@ -1671,6 +1767,11 @@ impl PluginInternal for PluginImpl {
             ev.flags = Event_::EventFlags_::kIsLive as u16;
             ev.r#type = kNoteOffEvent as u16;
             ev.__field0.noteOff.noteId = id.0;
+            if let Some((_, channel, pitch)) = tracked {
+                ev.__field0.noteOff.channel = channel;
+                ev.__field0.noteOff.pitch = pitch;
+            }
+            // A release velocity of 0 is the SDK's own default for "unspecified".
             self.input_events.add_event(ev);
         }
         Ok(())
@@ -2215,11 +2316,20 @@ impl PluginImpl {
 
 impl Drop for PluginImpl {
     fn drop(&mut self) {
-        // VST3 teardown order: stop processing, deactivate the component, disconnect the
-        // component/controller connection points, terminate the controller and the component,
-        // then drop the COM references. Many plugins (dual-component ones especially) rely on
-        // `terminate()` to break the controller↔component link before release and crash without
-        // it.
+        // VST3 teardown order: detach the editor, stop processing, deactivate the component,
+        // disconnect the component/controller connection points, terminate the controller and the
+        // component, then drop the COM references. Many plugins (dual-component ones especially)
+        // rely on `terminate()` to break the controller↔component link before release and crash
+        // without it.
+        //
+        // The editor goes first. A view that is still `attached()` when the controller is
+        // terminated — and then merely Released as a field, without `removed()` — leaves the
+        // plugin's platform frame and its idle timer alive, pointing at a host window the caller
+        // is about to destroy. `open_editor` and `close_editor` pair attach/removed correctly, but
+        // a host that drops the plugin with the editor open (or is unwound past its own close)
+        // never reaches `close_editor`, so do it here too. It is a no-op when no view is attached.
+        let _ = PluginInternal::close_editor(self);
+
         let _ = self.stop_processing();
 
         unsafe {

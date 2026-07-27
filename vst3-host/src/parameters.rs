@@ -22,7 +22,9 @@ pub struct Parameter {
     pub default: f64,
     /// Parameter unit (e.g., "Hz", "dB", "%")
     pub unit: String,
-    /// Step count (0 = continuous)
+    /// Step count, straight from VST3 `ParameterInfo::stepCount`, which counts the *gaps* between
+    /// discrete values rather than the values themselves: `0` is continuous, `1` is a two-state
+    /// toggle, and `n` is a list of `n + 1` values. So a three-way selector reports `2`, not `3`.
     pub step_count: i32,
     /// Whether the parameter can be automated
     pub can_automate: bool,
@@ -37,14 +39,25 @@ pub struct Parameter {
 impl Parameter {
     /// Convert normalized value (0.0-1.0) to plain value
     pub fn normalized_to_plain(&self, normalized: f64) -> f64 {
-        if self.step_count > 1 {
-            // Discrete parameter
+        if self.step_count >= 1 {
+            // Stepped parameter: snap to the nearest step. Includes toggles (`step_count == 1`),
+            // which snap to exactly min or max.
             let steps = self.step_count as f64;
             let step = (normalized * steps).round();
             self.min + (step / steps) * (self.max - self.min)
         } else {
             // Continuous parameter
             self.min + normalized * (self.max - self.min)
+        }
+    }
+
+    /// Which discrete value a normalized position selects, for a stepped parameter: `0..=step_count`
+    /// (so `step_count + 1` possible values). `None` for a continuous parameter.
+    pub fn step_index(&self, normalized: f64) -> Option<i32> {
+        if self.step_count >= 1 {
+            Some((normalized.clamp(0.0, 1.0) * self.step_count as f64).round() as i32)
+        } else {
+            None
         }
     }
 
@@ -64,36 +77,43 @@ impl Parameter {
     /// For accurate display (e.g. `"440.00 Hz"`), use
     /// [`crate::Plugin::format_parameter`], which asks the plugin to format it.
     pub fn format_value(&self, normalized: f64) -> String {
-        let plain = self.normalized_to_plain(normalized);
-
-        if self.step_count == 2 {
-            // Boolean parameter
-            if plain > 0.5 {
-                "On".to_string()
-            } else {
-                "Off".to_string()
+        match self.step_index(normalized) {
+            // Toggle: one step, so two states.
+            Some(index) if self.step_count == 1 => {
+                if index >= 1 { "On" } else { "Off" }.to_string()
             }
-        } else if self.step_count > 2 {
-            // Discrete parameter
-            format!("{:.0} {}", plain, self.unit)
-        } else {
-            // Continuous parameter
-            if self.unit.is_empty() {
-                format!("{:.3}", plain)
-            } else {
-                format!("{:.3} {}", plain, self.unit)
+            // Stepped: report which value is selected. The plain value lives in normalized space
+            // (VST3 keeps the engineering range private), so the index is the only meaningful
+            // number to show — use `Plugin::format_parameter` for the plugin's own label.
+            Some(index) => {
+                if self.unit.is_empty() {
+                    format!("{index}")
+                } else {
+                    format!("{} {}", index, self.unit)
+                }
+            }
+            None => {
+                let plain = self.normalized_to_plain(normalized);
+                if self.unit.is_empty() {
+                    format!("{plain:.3}")
+                } else {
+                    format!("{:.3} {}", plain, self.unit)
+                }
             }
         }
     }
 
-    /// Check if this is a discrete/stepped parameter
+    /// Whether this parameter takes discrete steps rather than a continuous range.
+    ///
+    /// True for toggles too — a toggle is just the one-step case. See [`Self::step_count`] for the
+    /// VST3 counting convention.
     pub fn is_discrete(&self) -> bool {
-        self.step_count > 1
+        self.step_count >= 1
     }
 
-    /// Check if this is a boolean/switch parameter
+    /// Whether this parameter is a two-state toggle (VST3 `stepCount == 1`).
     pub fn is_boolean(&self) -> bool {
-        self.step_count == 2
+        self.step_count == 1
     }
 }
 

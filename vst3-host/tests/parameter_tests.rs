@@ -111,7 +111,8 @@ fn test_parameter_formatting() {
         min: 0.0,
         max: 1.0,
         default: 0.0,
-        step_count: 2,
+        // A toggle is VST3 stepCount 1 (one gap, two states), not 2.
+        step_count: 1,
         can_automate: false,
         is_read_only: false,
         is_bypass: true,
@@ -162,7 +163,9 @@ fn test_parameter_types() {
     assert!(discrete.is_discrete());
     assert!(!discrete.is_boolean());
 
-    // Boolean parameter
+    // Boolean parameter. VST3 `stepCount` counts the gaps between values, not the values, so a
+    // two-state toggle is 1 — NOT 2. (2 means three values; see the three-way case below and
+    // `test-plugin`'s Waveform parameter, which sets `stepCount = 2` for Sine/Saw/Super Saw.)
     let boolean = Parameter {
         id: 3,
         name: "Enable".to_string(),
@@ -171,7 +174,7 @@ fn test_parameter_types() {
         min: 0.0,
         max: 1.0,
         default: 0.0,
-        step_count: 2,
+        step_count: 1,
         can_automate: true,
         is_read_only: false,
         is_bypass: false,
@@ -180,6 +183,19 @@ fn test_parameter_types() {
 
     assert!(boolean.is_discrete());
     assert!(boolean.is_boolean());
+
+    // A three-value list is stepped but not boolean — the case that used to be misreported as a
+    // toggle, making its third value unreachable through `format_value`.
+    let three_way = Parameter {
+        step_count: 2,
+        ..boolean.clone()
+    };
+    assert!(three_way.is_discrete());
+    assert!(!three_way.is_boolean());
+    assert_eq!(three_way.step_index(0.0), Some(0));
+    assert_eq!(three_way.step_index(0.5), Some(1));
+    assert_eq!(three_way.step_index(1.0), Some(2));
+    assert_eq!(three_way.format_value(1.0), "2");
 }
 
 #[test]
@@ -273,7 +289,8 @@ fn test_bypass_parameter() {
         min: 0.0,
         max: 1.0,
         default: 0.0,
-        step_count: 2,
+        // A toggle is VST3 stepCount 1 (one gap, two states), not 2.
+        step_count: 1,
         can_automate: false,
         is_read_only: false,
         is_bypass: true,

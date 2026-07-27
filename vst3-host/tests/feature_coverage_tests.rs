@@ -1136,10 +1136,13 @@ fn test_process_before_start_errors() {
     );
 }
 
-/// A block larger than the configured maximum must be clamped, not crash/overflow.
+/// A block larger than the configured maximum must be handled, not crash/overflow. It is split
+/// into chunks of at most the configured block size; see
+/// `oversized_caller_block_is_rendered_in_full` for the assertion that every chunk is actually
+/// rendered (this one only pins down "doesn't error", since silent Dexed can't show coverage).
 #[test]
 #[ignore = "Requires the bundled test plugin"]
-fn test_oversized_block_is_clamped() {
+fn test_oversized_block_is_split_not_rejected() {
     let _guard = plugin_guard();
     let Some((_host, mut plugin)) = load_dexed() else {
         return;
@@ -1149,7 +1152,7 @@ fn test_oversized_block_is_clamped() {
     let mut buffers = AudioBuffers::new(0, 2, 1024, 48000.0);
     plugin
         .process_audio(&mut buffers)
-        .expect("oversized block should be clamped and processed, not error");
+        .expect("oversized block should be split and processed, not error");
 }
 
 /// A `.vstpreset` whose embedded class id doesn't match the loaded plugin is rejected.
@@ -1691,4 +1694,61 @@ fn test_testsynth_multitimbral_channels() {
         ch2_live > 1e-3,
         "channel 2 should sound once Ch2 Level is up (got {ch2_live})"
     );
+}
+
+/// A caller block *larger* than the configured block size must still be rendered end to end.
+///
+/// The plugin may only be handed `maxSamplesPerBlock` samples per `process()` call, so the host
+/// splits an oversized block into successive chunks. Before it did, only the first `block_size`
+/// frames were filled and the rest of every buffer stayed at whatever the caller pre-filled —
+/// silence — which is an audible gate at the device's block rate, plus a transport that advances
+/// at a fraction of real time. Reachable in practice because the cpal backend clamps the requested
+/// buffer size *up* into the device's supported range, and `BufferSize::Default` lets the device
+/// pick its own size.
+#[test]
+#[ignore = "Requires the bundled TestSynth (just test-plugin)"]
+fn oversized_caller_block_is_rendered_in_full() {
+    let _guard = plugin_guard();
+    let Some(path) = test_synth_path() else {
+        return;
+    };
+
+    let block = 256usize;
+    let mut host = Vst3Host::builder()
+        .sample_rate(48000.0)
+        .block_size(block)
+        .build()
+        .expect("build host");
+    let mut plugin = host.load_plugin(path).expect("load TestSynth");
+
+    plugin.start_processing().expect("start_processing");
+    let id = plugin
+        .note_on(MidiChannel::Ch1, 60, 100)
+        .expect("note_on returns a NoteId");
+
+    // Ask for four times the configured block in a single call.
+    let chunks = 4;
+    let frames = block * chunks;
+    let mut buffers = AudioBuffers::new(0, 2, frames, 48000.0);
+    plugin
+        .process_audio(&mut buffers)
+        .expect("process_audio with an oversized block");
+
+    plugin.note_off(id).ok();
+    plugin.stop_processing().ok();
+
+    // Every chunk-sized slice must carry signal, not just the first.
+    let peaks: Vec<f32> = buffers.outputs[0]
+        .chunks(block)
+        .map(|c| c.iter().fold(0.0f32, |m, s| m.max(s.abs())))
+        .collect();
+    println!("per-chunk peaks across an oversized block: {peaks:?}");
+    assert_eq!(peaks.len(), chunks);
+    for (i, peak) in peaks.iter().enumerate() {
+        assert!(
+            *peak > 0.0,
+            "chunk {i} of {chunks} was silent (peaks: {peaks:?}) — the oversized block was \
+             truncated to the configured block size instead of being split"
+        );
+    }
 }

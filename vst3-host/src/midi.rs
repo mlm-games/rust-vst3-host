@@ -447,41 +447,41 @@ pub fn note_to_name(note: u8) -> String {
 pub fn name_to_note(name: &str) -> Option<u8> {
     let name = name.trim().to_uppercase();
 
-    // Extract the note letter and accidental
-    let (note_part, octave_str) = if name.contains('#') {
-        let parts: Vec<&str> = name.split('#').collect();
-        if parts.len() != 2 {
-            return None;
-        }
-        (format!("{}#", parts[0]), parts[1])
-    } else if name.contains('B') && name.len() > 2 && &name[1..2] == "B" {
-        // Handle Bb notation
-        (format!("{}B", &name[0..1]), &name[2..])
-    } else {
-        // Natural note
-        let mut chars = name.chars();
-        let note = chars.next()?.to_string();
-        let octave = chars.as_str();
-        (note, octave)
+    // Parse by chars, never by byte index: `to_uppercase` can produce multi-byte chars (an
+    // accented letter, say), and slicing those at byte 1 would panic rather than returning None.
+    let mut chars = name.chars();
+    let letter = chars.next()?;
+    if !letter.is_ascii_alphabetic() {
+        return None;
+    }
+
+    // An optional accidental follows the letter: '#' (sharp) or 'B' (flat, as in "Db").
+    // A bare "B..." is the note B, not a flat — only treat 'B' as an accidental when it is the
+    // *second* char.
+    let rest = chars.as_str();
+    let (accidental, octave_str) = match rest.chars().next() {
+        Some('#') => (Some('#'), &rest[1..]),
+        Some('B') => (Some('B'), &rest[1..]),
+        _ => (None, rest),
     };
 
     // Parse octave
     let octave: i32 = octave_str.parse().ok()?;
 
     // Convert note to semitone offset within octave
-    let semitone = match note_part.as_str() {
-        "C" => 0,
-        "C#" | "DB" => 1,
-        "D" => 2,
-        "D#" | "EB" => 3,
-        "E" => 4,
-        "F" => 5,
-        "F#" | "GB" => 6,
-        "G" => 7,
-        "G#" | "AB" => 8,
-        "A" => 9,
-        "A#" | "BB" => 10,
-        "B" => 11,
+    let semitone = match (letter, accidental) {
+        ('C', None) => 0,
+        ('C', Some('#')) | ('D', Some('B')) => 1,
+        ('D', None) => 2,
+        ('D', Some('#')) | ('E', Some('B')) => 3,
+        ('E', None) => 4,
+        ('F', None) => 5,
+        ('F', Some('#')) | ('G', Some('B')) => 6,
+        ('G', None) => 7,
+        ('G', Some('#')) | ('A', Some('B')) => 8,
+        ('A', None) => 9,
+        ('A', Some('#')) | ('B', Some('B')) => 10,
+        ('B', None) => 11,
         _ => return None,
     };
 
@@ -647,6 +647,46 @@ mod tests {
         assert_eq!(name_to_note("C#3"), Some(61));
         assert_eq!(name_to_note("Db3"), Some(61));
         assert_eq!(name_to_note("F#3"), Some(66));
+    }
+
+    /// `name_to_note` is a safe `Option`-returning parser fed by UI text fields and config files,
+    /// so every input has to come back as `None` rather than a panic. It used to slice at byte
+    /// index 1 to detect a flat, which panics whenever the uppercased first char is multi-byte.
+    #[test]
+    fn name_to_note_rejects_junk_without_panicking() {
+        for junk in [
+            "éB3",    // multi-byte first char — used to panic on a non-char-boundary slice
+            "ÉB3",    //
+            "日本語", // no ASCII at all
+            "",       // empty
+            "3",      // no note letter
+            "H3",     // not a note name
+            "C",      // no octave
+            "C#",     // accidental, no octave
+            "Cb3",    // Cb is not one of the accidentals we map
+            "C##3",   // double sharp
+            "CB3",    // uppercase input is normalised, but Cb still isn't mapped
+            "C99",    // octave out of MIDI range
+            "C-99",   //
+            "#3",     // accidental with no letter
+        ] {
+            assert_eq!(name_to_note(junk), None, "expected None for {junk:?}");
+        }
+    }
+
+    /// A bare "B" is the note B, not a flat — the flat form only applies when 'B' is the *second*
+    /// character. Both readings go through the same branch, so pin them together.
+    #[test]
+    fn name_to_note_distinguishes_b_natural_from_flats() {
+        assert_eq!(name_to_note("B3"), Some(71));
+        assert_eq!(name_to_note("Bb3"), Some(70));
+        assert_eq!(name_to_note("bb3"), Some(70)); // case-insensitive
+        assert_eq!(name_to_note("Eb3"), Some(63));
+        assert_eq!(name_to_note("Ab3"), Some(68));
+        // Round-trip every note through its own name.
+        for n in 0..=127u8 {
+            assert_eq!(name_to_note(&note_to_name(n)), Some(n), "round-trip {n}");
+        }
     }
 
     #[test]

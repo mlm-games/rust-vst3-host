@@ -6,6 +6,70 @@ All notable changes to `vst3-host` are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+Found by a five-lens review of the whole crate; each was confirmed by reading the code, and two
+were reproduced standalone.
+
+- **Dropping a `Plugin` with its editor open never detached the view.** Teardown deactivated and
+  `terminate()`d the controller, then released the `IPlugView` as a plain field drop — so a view
+  that was still `attached()` was destroyed without `removed()`, leaving the plugin's platform
+  frame and idle timer pointing at a host window the caller was about to free. `open_editor` /
+  `close_editor` paired correctly; the drop path didn't. It now detaches first.
+- **A failed `process()` skipped every per-block cleanup.** The early return bypassed the input
+  event clear, the input parameter queue clear *and* the pending-change clear (the comment claiming
+  otherwise was wrong), so a plugin returning a failure code got every stale event re-delivered on
+  each subsequent block — re-triggering held notes — while the queues grew without bound. Cleanup
+  now always runs, and the error is a non-allocating `Error::ProcessFailed(tresult)` instead of a
+  `format!` on the audio thread (`Error::NotProcessing` likewise).
+- **`Plugin::note_off(NoteId)` sent pitch 0 on channel 1.** The event carried only the note id, so
+  any synth that matches releases by pitch — most non-MPE synths — never released the real note.
+  Note-ons are now tracked (bounded, pre-reserved, no audio-thread allocation) so the release
+  reproduces the original channel and pitch.
+- **A caller block larger than the configured block size left the tail silent.** The plugin may
+  only be handed `maxSamplesPerBlock` at a time and the excess was simply dropped, which is
+  reachable in practice: the cpal backend clamps the requested buffer size *up* into the device's
+  supported range, and `BufferSize::Default` lets the device choose. That produced an audible gate
+  at the device's block rate and a transport advancing at a fraction of real time. Oversized blocks
+  are now split into successive chunks; queued events apply to the first chunk.
+- **`midi::name_to_note` panicked on non-ASCII input.** It sliced at byte index 1 to detect a flat,
+  which is not a char boundary once `to_uppercase` produces a multi-byte char — so `name_to_note("éB3")`
+  panicked instead of returning `None`, from a safe `Option`-returning parser fed by text fields.
+  Now parsed by chars.
+- **Stepped-parameter helpers used the wrong `stepCount` convention.** VST3 counts the gaps between
+  discrete values, so a toggle is `1` and an N-value list is `N-1` — the convention this crate
+  already relies on in `select_program` and that `test-plugin` uses. But `is_boolean()` tested `== 2`
+  and `is_discrete()` tested `> 1`, so a three-way selector was reported as a toggle (its third
+  value unreachable through `format_value`) while a real bypass toggle was reported as continuous.
+  `is_boolean()` is now `== 1`, `is_discrete()` is `>= 1`, `normalized_to_plain` snaps toggles too,
+  and the new `Parameter::step_index` reports which of the `step_count + 1` values is selected.
+- **The helper and probe lookup no longer executes binaries found above the executable in release
+  builds.** Both resolvers walked up ancestor directories and ran any `target/{debug,release}/…`
+  they found — a fine convenience in a cargo tree, an arbitrary-code-execution foothold in a shipped
+  app, since the spawned binary is then trusted for everything the host believes about a plugin.
+  The ancestor walk is now `debug_assertions`-only; release builds use the explicit path/env
+  override or a binary beside the executable.
+
+### Changed
+
+- `Error` gained `ProcessFailed(i32)` and `NotProcessing`. The enum is `#[non_exhaustive]`, so
+  matching code is unaffected, but text that used to arrive as `Error::Other` now has its own
+  variants.
+
+### vst3-inspector
+
+- The plugin is now loaded on the UI thread. Only introspection runs on a worker — the library's own
+  `docs/explanation/threading.md` requires `load_plugin` to run on the thread that will drive the
+  GUI, warning that a plugin which builds its controller's resources elsewhere crashes when its
+  editor is opened. The inspector was doing exactly that, and superseded loads were dropped (full
+  COM teardown) on the worker thread too.
+- WAV export no longer always claims the reload failed. It inferred success by checking `self.audio`
+  immediately after starting a load that is asynchronous, so the check always saw `None`: users
+  always got "reloading the live plugin failed" and never the real export result, and the state
+  snapshot it meant to restore was silently discarded. The snapshot now rides along with the reload
+  and is applied when it completes. Export also closes the editor window first, so the old instance
+  is really gone before a second one loads.
+
 ## [0.8.0] - 2026-07-27
 
 ### Added
