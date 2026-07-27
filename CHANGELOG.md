@@ -6,6 +6,8 @@ All notable changes to `vst3-host` are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-07-27
+
 ### Added
 
 - **Linux `IRunLoop` host service, so VSTGUI-based plugin editors work.** The host frame
@@ -33,6 +35,33 @@ All notable changes to `vst3-host` are documented here. The format is based on
 - The Linux run-loop registry is cleared in `close_editor`, so a plugin that doesn't
   unregister its own event handlers or timers can't leave the host dispatching into a removed
   view on the next `service_run_loop()`.
+- **Host-side buffers a plugin fills are now all bounded.** A sweep for more of the
+  unbounded-growth class [#8] reported found four more buffers with the same shape — written
+  from the plugin side, drained only by an optional host poll. They now share the policy
+  outgoing MIDI already used (`MAX_OUTPUT_MIDI`): pre-reserved to the cap so steady-state
+  pushes never reallocate, and pushes past it dropped.
+  - The `IComponentHandler` gesture log grew for the plugin's lifetime unless the host called
+    `Plugin::take_parameter_edits()`, which is optional — dragging one knob appends per UI
+    frame.
+  - The raw `performEdit` sink grew the same way while the plugin wasn't processing.
+  - The editor-parameter stash was appended **on the audio thread** every block and drained
+    only by `Plugin::get_parameter_changes()`, which `RealtimePluginRunner` never calls — so
+    the runner documented as allocation-free in steady state would grow and reallocate on the
+    audio thread for as long as an editor stayed open.
+  - `HostEventList` had no cap and `process()` (its only drain) returns early while stopped,
+    so queueing MIDI at a stopped plugin grew without bound and then dumped every stale event
+    into the first block once it started.
+- Drains no longer `mem::take` their buffers, which left a zero-capacity `Vec` behind so the
+  next push reallocated — the anti-pattern `HostEventList::for_each_then_clear` already
+  documented avoiding.
+
+### Known limitations
+
+- Nothing drains editor feedback in the realtime path, so a `play_realtime` host sees no
+  editor parameter changes (they are bounded and discarded rather than accumulating). Giving
+  `RtAudioHandle` a parameter-feedback ring like `AudioHandle`'s is still to do.
+- GUI across the process-isolation boundary is still not implemented, and
+  `Plugin::service_run_loop()` is a no-op for isolated plugins.
 
 ## [0.7.0] - 2026-07-14
 
@@ -357,7 +386,8 @@ offline audio I/O, richer process isolation, metering, and a much more capable i
 - Initial release: safe VST3 hosting — discover, load, parameters, MIDI, audio playback, state
   save/restore, and process isolation.
 
-[Unreleased]: https://github.com/HelgeSverre/rust-vst3-host/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/HelgeSverre/rust-vst3-host/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/HelgeSverre/rust-vst3-host/releases/tag/v0.8.0
 [0.7.0]: https://github.com/HelgeSverre/rust-vst3-host/releases/tag/v0.7.0
 [0.6.1]: https://github.com/HelgeSverre/rust-vst3-host/releases/tag/v0.6.1
 [0.6.0]: https://github.com/HelgeSverre/rust-vst3-host/releases/tag/v0.6.0
