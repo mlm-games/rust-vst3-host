@@ -1,6 +1,19 @@
 use vst3_host::host::DiscoveryProgress;
 use vst3_host::plugin::PluginInfo;
 
+/// `VST3_HOST_PROBE_PATH` is process-global, and libtest runs these tests in parallel inside one
+/// binary. Without serializing, one test's `remove_var` lands mid-flight in another's scan, which
+/// then spawns the wrong probe (or none) and reports a bogus outcome — the observed symptom was
+/// the aborting-probe test seeing `TimedOut` instead of `Crashed`. Every test that touches the
+/// variable holds this for its whole body. Same pattern as `SERIAL` in `alloc_tests.rs`.
+static PROBE_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take the probe-env lock, recovering it if a previous test panicked while holding it (a
+/// poisoned lock would otherwise cascade one failure into every sibling test).
+fn probe_env_guard() -> std::sync::MutexGuard<'static, ()> {
+    PROBE_ENV.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 #[test]
 fn test_plugin_info() {
     let info = PluginInfo {
@@ -234,6 +247,7 @@ fn ensure_probe_on_path() -> std::path::PathBuf {
 fn safe_discovery_skips_garbage_and_does_not_panic() {
     // A folder containing a bogus ".vst3" entry must NOT take down the scan: the probe
     // fails to introspect it, and the safe path skips it and returns normally.
+    let _env = probe_env_guard();
     let probe = ensure_probe_on_path();
     if !probe.exists() {
         eprintln!("vst3-host-probe not built at {probe:?}; skipping");
@@ -284,6 +298,7 @@ fn safe_discovery_skips_garbage_and_does_not_panic() {
 fn probe_plugin_info_isolated_returns_err_for_garbage_not_panic() {
     // The single-plugin entry point returns a descriptive Err (never panics / aborts) for
     // a path that cannot be introspected.
+    let _env = probe_env_guard();
     let probe = ensure_probe_on_path();
     if !probe.exists() {
         eprintln!("vst3-host-probe not built at {probe:?}; skipping");
@@ -309,6 +324,7 @@ fn safe_discovery_survives_a_probe_that_aborts() {
     // parent and classified as a crash-skip, not take the scanner down. We stand in a fake
     // probe that aborts itself, so this exercises the parent's child-death handling without
     // needing a real crashing plugin.
+    let _env = probe_env_guard();
     let dir = std::env::temp_dir().join(format!("vst3-abort-probe-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("mk dir");
@@ -334,9 +350,12 @@ fn safe_discovery_survives_a_probe_that_aborts() {
     .expect("write fake bin");
 
     std::env::set_var("VST3_HOST_PROBE_PATH", &fake_probe);
+    // Generous timeout: this asserts how a child death is *classified*, not how fast it happens,
+    // and reaping a SIGABRT child on macOS can take seconds under load (the crash reporter). The
+    // old 5s budget made a slow reap look like a hang, flipping the outcome to `TimedOut`.
     let report = vst3_host::discover_plugins_safe(
         std::slice::from_ref(&scan),
-        std::time::Duration::from_secs(5),
+        std::time::Duration::from_secs(30),
     );
     std::env::remove_var("VST3_HOST_PROBE_PATH");
 
@@ -361,6 +380,7 @@ fn safe_discovery_survives_a_probe_that_aborts() {
 #[test]
 #[ignore = "requires the bundled Dexed test plugin"]
 fn safe_discovery_finds_dexed_out_of_process() {
+    let _env = probe_env_guard();
     let probe = ensure_probe_on_path();
     if !probe.exists() {
         eprintln!("vst3-host-probe not built at {probe:?}; skipping");
