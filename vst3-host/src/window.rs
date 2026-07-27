@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 #[cfg(target_os = "macos")]
 use objc2::{rc::Retained, MainThreadMarker, MainThreadOnly};
 #[cfg(target_os = "macos")]
-use objc2_app_kit::{NSBackingStoreType, NSView, NSWindow, NSWindowStyleMask};
+use objc2_app_kit::{NSApplication, NSBackingStoreType, NSView, NSWindow, NSWindowStyleMask};
 #[cfg(target_os = "macos")]
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
@@ -21,10 +21,46 @@ use winapi::{
     um::libloaderapi::GetModuleHandleW,
     um::winuser::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, LoadCursorW, RegisterClassExW, ShowWindow,
-        UpdateWindow, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, IDC_ARROW, SW_SHOW, WNDCLASSEXW,
-        WS_OVERLAPPEDWINDOW,
+        UpdateWindow, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, IDC_ARROW, SW_SHOW, WM_CLOSE,
+        WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
     },
 };
+
+/// Editor windows whose window procedure has seen `WM_CLOSE`, keyed by `HWND` (as `usize`,
+/// since `HWND` is a raw pointer and not `Send`).
+///
+/// `DefWindowProcW` answers `WM_CLOSE` by destroying the window, which would leave the plugin's
+/// `IPlugView` attached to a freed `HWND`. [`plugin_window_proc`] records the request here
+/// instead, so the host can tear the editor down in the right order.
+#[cfg(target_os = "windows")]
+fn close_requests() -> &'static Mutex<std::collections::HashSet<usize>> {
+    static REQUESTS: std::sync::OnceLock<Mutex<std::collections::HashSet<usize>>> =
+        std::sync::OnceLock::new();
+    REQUESTS.get_or_init(Mutex::default)
+}
+
+/// Window procedure for plugin editor windows: record `WM_CLOSE` and swallow it, defer the rest
+/// to the default handler.
+///
+/// # Safety
+///
+/// Called by the OS with the arguments of a window procedure; all it does with them is forward
+/// them to `DefWindowProcW`.
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn plugin_window_proc(
+    hwnd: HWND,
+    msg: UINT,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if msg == WM_CLOSE {
+        if let Ok(mut requests) = close_requests().lock() {
+            requests.insert(hwnd as usize);
+        }
+        return 0;
+    }
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+}
 
 /// An X11 window (connection + window id) backing a plugin editor on Linux.
 ///
@@ -77,8 +113,9 @@ impl PluginWindow {
             ));
         }
 
-        // Close existing window if any
-        if self.is_open() {
+        // Close existing window if any. Keyed on the handle rather than `is_open()`, which also
+        // reports `false` for a window the user already dismissed — that one still needs closing.
+        if self.native_window.is_some() {
             self.close();
         }
 
@@ -145,10 +182,14 @@ impl PluginWindow {
             }
 
             // Hand the plugin the container NSView to embed its editor in.
-            let window_handle = crate::plugin::WindowHandle::from_nsview(Retained::as_ptr(
-                &container_view,
-            )
-                as *mut std::ffi::c_void);
+            // SAFETY: `container_view` is a live NSView this `PluginWindow` keeps alive (via
+            // the retained window it was added to) for as long as the editor is attached —
+            // `close()` detaches the editor before dropping the window.
+            let window_handle = unsafe {
+                crate::plugin::WindowHandle::from_nsview(
+                    Retained::as_ptr(&container_view) as *mut std::ffi::c_void
+                )
+            };
             self.plugin
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -173,7 +214,7 @@ impl PluginWindow {
                 let mut wc: WNDCLASSEXW = mem::zeroed();
                 wc.cbSize = mem::size_of::<WNDCLASSEXW>() as UINT;
                 wc.style = CS_HREDRAW | CS_VREDRAW;
-                wc.lpfnWndProc = Some(DefWindowProcW);
+                wc.lpfnWndProc = Some(plugin_window_proc);
                 wc.hInstance = GetModuleHandleW(ptr::null());
                 wc.hCursor = LoadCursorW(ptr::null_mut(), IDC_ARROW);
                 wc.lpszClassName = class_name.as_ptr();
@@ -222,7 +263,9 @@ impl PluginWindow {
                     return Err(Error::Other("Failed to create native window".to_string()));
                 }
 
-                // Try to open plugin editor
+                // Try to open plugin editor.
+                // SAFETY: `hwnd` was just created above and null-checked; it is destroyed only
+                // after the editor is detached (in `close()`, or the error arm below).
                 let window_handle =
                     crate::plugin::WindowHandle::from_hwnd(hwnd as *mut std::ffi::c_void);
                 match self
@@ -315,10 +358,15 @@ impl PluginWindow {
 
     /// Close the plugin window
     pub fn close(&mut self) {
-        // Close the plugin editor first
-        if let Ok(mut plugin) = self.plugin.lock() {
-            let _ = plugin.close_editor();
-        }
+        // Detach the plugin editor first — it must never outlive the window it is embedded in.
+        // A poisoned lock (an earlier panic on the audio thread) is recovered rather than
+        // skipped, exactly as every other lock site here does: skipping it would destroy the
+        // native window with the plugin's view still attached to it.
+        let _ = self
+            .plugin
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .close_editor();
 
         // Then close the native window
         #[cfg(target_os = "macos")]
@@ -331,6 +379,9 @@ impl PluginWindow {
         #[cfg(target_os = "windows")]
         {
             if let Some(hwnd) = self.native_window.take() {
+                if let Ok(mut requests) = close_requests().lock() {
+                    requests.remove(&(hwnd as usize));
+                }
                 unsafe {
                     DestroyWindow(hwnd);
                 }
@@ -356,9 +407,58 @@ impl PluginWindow {
         }
     }
 
-    /// Check if the window is currently open
+    /// Check if the window is currently open.
+    ///
+    /// Reports `false` once the user has dismissed the window themselves, even though the
+    /// handle is still around — see [`Self::closed_by_user`].
     pub fn is_open(&self) -> bool {
-        self.native_window.is_some()
+        self.native_window.is_some() && !self.closed_by_user()
+    }
+
+    /// Whether the user closed the window themselves, through its title-bar close button.
+    ///
+    /// Neither the plugin nor the host is told when that happens, so a host that tracks "the
+    /// editor is open" in its own UI should poll this each frame (the check is cheap) and drop
+    /// or [`close`](Self::close) the window when it reports `true`. Otherwise the editor stays
+    /// attached to a window that is gone from the screen.
+    pub fn closed_by_user(&self) -> bool {
+        self.native_window_dismissed()
+    }
+
+    /// Platform probe behind [`Self::closed_by_user`].
+    #[cfg(target_os = "macos")]
+    fn native_window_dismissed(&self) -> bool {
+        let Some(window) = self.native_window.as_ref() else {
+            return false;
+        };
+        // A closed window is ordered out — but so is a miniaturized one, and so is every window
+        // of a hidden application. Neither of those means the user dismissed the editor.
+        if window.isVisible() || window.isMiniaturized() {
+            return false;
+        }
+        match MainThreadMarker::new() {
+            Some(mtm) => !NSApplication::sharedApplication(mtm).isHidden(),
+            // AppKit state can only be read from the main thread; assume the window still stands.
+            None => false,
+        }
+    }
+
+    /// Platform probe behind [`Self::closed_by_user`].
+    #[cfg(target_os = "windows")]
+    fn native_window_dismissed(&self) -> bool {
+        let Some(hwnd) = self.native_window else {
+            return false;
+        };
+        close_requests()
+            .lock()
+            .is_ok_and(|requests| requests.contains(&(hwnd as usize)))
+    }
+
+    /// Platform probe behind [`Self::closed_by_user`]. X11 and Android editor windows carry no
+    /// close affordance of their own, so there is nothing to observe.
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    fn native_window_dismissed(&self) -> bool {
+        false
     }
 }
 

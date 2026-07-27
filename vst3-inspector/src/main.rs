@@ -4,8 +4,12 @@
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use vst3_host::midi::MidiChannel;
@@ -61,6 +65,51 @@ mod tests {
     fn ab_slot_label_maps() {
         assert_eq!(ab_slot_label(AbSlot::A), "A");
         assert_eq!(ab_slot_label(AbSlot::B), "B");
+    }
+
+    #[test]
+    fn a_plugin_is_only_current_once_its_load_succeeded() {
+        let path = "/plugins/Dexed.vst3";
+        // Nothing loaded yet: the row must offer to load it.
+        assert_eq!(
+            plugin_row_state(path, None, None),
+            PluginRowState::Available
+        );
+        // Requested but not finished — and a load that then fails leaves no loaded path, so the
+        // row goes back to offering "Load" rather than claiming to be current forever.
+        assert_eq!(
+            plugin_row_state(path, None, Some(path)),
+            PluginRowState::Loading
+        );
+        assert_eq!(
+            plugin_row_state(path, Some("/plugins/Other.vst3"), None),
+            PluginRowState::Available
+        );
+        assert_eq!(
+            plugin_row_state(path, Some(path), None),
+            PluginRowState::Loaded
+        );
+        // Reloading the current plugin reports the in-flight state, not "Current".
+        assert_eq!(
+            plugin_row_state(path, Some(path), Some(path)),
+            PluginRowState::Loading
+        );
+    }
+
+    #[test]
+    fn page_is_clamped_to_the_last_page_with_rows() {
+        // 25 items at 25 per page is one page: any page index collapses to 0.
+        assert_eq!(clamp_page(0, 25, 25), 0);
+        assert_eq!(clamp_page(1, 25, 25), 0);
+        assert_eq!(clamp_page(9, 25, 25), 0);
+        // 26 items is two pages.
+        assert_eq!(clamp_page(1, 26, 25), 1);
+        assert_eq!(clamp_page(2, 26, 25), 1);
+        // An empty list still has a (single) page 0.
+        assert_eq!(clamp_page(3, 0, 25), 0);
+        // A pathological page size must not divide by zero (it degrades to one item per page).
+        assert_eq!(clamp_page(3, 10, 0), 3);
+        assert_eq!(clamp_page(30, 10, 0), 9);
     }
 
     #[test]
@@ -209,6 +258,9 @@ fn run_selftest(path: &str) -> i32 {
         }
     };
 
+    // Only a plugin that accepts MIDI can answer the held note below with sound.
+    let expects_audio = detail.info.has_midi_input;
+
     // 3. Load + parameters + play + observe audio.
     let mut host = match Vst3Host::builder()
         .sample_rate(48000.0)
@@ -276,11 +328,21 @@ fn run_selftest(path: &str) -> i32 {
         note: 60,
         velocity: 110,
     });
+    // Below this the plugin rendered nothing audible. For a plugin that accepts MIDI, the held
+    // note must produce sound: silence means the audio path is broken (the playback callback
+    // swallows `process_audio` errors), which must not pass as a success. An effect fed no input
+    // has nothing to render, so it is only reported.
+    const SILENCE_THRESHOLD: f32 = 1e-4;
+
     let mut peak = 0.0f32;
+    // Bounded wait (~500 ms), cut short as soon as the note is clearly sounding.
     for _ in 0..20 {
         std::thread::sleep(std::time::Duration::from_millis(25));
         for c in &audio.output_levels().channels {
             peak = peak.max(c.peak);
+        }
+        if peak > SILENCE_THRESHOLD {
+            break;
         }
     }
     audio.send_midi(vst3_host::midi::MidiEvent::NoteOff {
@@ -289,6 +351,16 @@ fn run_selftest(path: &str) -> i32 {
         velocity: 0,
     });
     println!("play: max output peak {peak:.4}");
+    if peak <= SILENCE_THRESHOLD {
+        if expects_audio {
+            eprintln!(
+                "FAIL: no audio from a held C3 (peak {peak:.6} <= {SILENCE_THRESHOLD}) — \
+                 the plugin rendered silence"
+            );
+            return 1;
+        }
+        println!("play: plugin takes no MIDI input, so silence is expected here");
+    }
     println!("SELFTEST OK");
     0
 }
@@ -515,8 +587,34 @@ struct PendingLoad {
     rx: std::sync::mpsc::Receiver<Result<vst3_host::DetailedPluginInfo, String>>,
 }
 
+/// The action waiting on an in-flight file dialog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DialogKind {
+    AddPluginFolder,
+    LoadMidiFile,
+    SavePreset,
+    LoadPreset,
+    ExportWav,
+}
+
+/// A native file dialog running alongside the UI.
+///
+/// A blocking `rfd::FileDialog` takes over the platform's event loop, which stops `update()` —
+/// and with it the plugin editor's run-loop servicing and the MIDI file player's clock. The
+/// async dialog is started when the button is clicked and polled from `update()` instead, so the
+/// app keeps running while it is on screen.
+struct PendingFileDialog {
+    kind: DialogKind,
+    future: Pin<Box<dyn Future<Output = Option<rfd::FileHandle>>>>,
+}
+
 struct VST3Inspector {
+    /// The plugin the app was last asked to load: the startup default, then whatever the user
+    /// picked. Says nothing about whether that load worked — `loaded_plugin_path` does.
     plugin_path: String,
+    /// The plugin that is actually loaded and playing — set only once a load succeeds, so a
+    /// failed load leaves the previous plugin (or nothing) marked as current and stays retryable.
+    loaded_plugin_path: Option<String>,
     plugin_info: Option<PluginInfo>,
     // Prebuilt JSON export of the current plugin (PluginReport), for the "Copy JSON" button.
     // Built at load time so the button never re-introspects a loaded plugin.
@@ -583,6 +681,8 @@ struct VST3Inspector {
     midi_input: MidiInputState,
     // Cached list of available MIDI input port names (refreshed on demand).
     midi_input_ports: Vec<String>,
+    // A file dialog on screen right now, polled each frame instead of blocking the UI thread.
+    pending_dialog: Option<PendingFileDialog>,
 }
 
 /// One of the two A/B compare slots.
@@ -626,6 +726,16 @@ impl eframe::App for VST3Inspector {
         // Finalize any background plugin load that has completed.
         self.poll_pending_load();
 
+        // Resolve a file dialog the user has answered.
+        self.poll_file_dialog();
+
+        // The plugin's editor window has its own close button, which tells neither the plugin nor
+        // us. Poll it so the header button and `gui_attached` follow the window that is actually
+        // on screen, and so the editor is detached properly rather than left on a dead window.
+        if self.plugin_window.as_ref().is_some_and(|w| !w.is_open()) {
+            self.close_plugin_gui();
+        }
+
         // Auto-clear the status/error line a few seconds after it was set.
         if self
             .last_error_time
@@ -649,15 +759,25 @@ impl eframe::App for VST3Inspector {
             }
         }
 
-        // Replay any MIDI file events that have come due, onto the live plugin.
+        // Replay any MIDI file events that have come due, onto the live plugin, logging them in
+        // the monitor like the virtual-keyboard and hardware paths do.
         if self.midi_player.is_playing() {
             let due = self.midi_player.tick(Instant::now());
-            if !due.is_empty() {
-                if let Some(audio) = &self.audio {
-                    for ev in due {
-                        audio.send_midi(ev);
+            let mut dropped = 0usize;
+            if let Some(audio) = &self.audio {
+                for &ev in &due {
+                    self.log_incoming_midi(ev);
+                    // The control ring is bounded; a rejected event never reaches the plugin, and
+                    // a lost note-off rings forever, so it must not pass silently.
+                    if !audio.send_midi(ev) {
+                        dropped += 1;
                     }
                 }
+            }
+            if dropped > 0 {
+                self.set_error(format!(
+                    "MIDI file: {dropped} event(s) dropped — the plugin's control queue is full"
+                ));
             }
         }
 
@@ -826,8 +946,10 @@ impl VST3Inspector {
                 MidiEvent::ProgramChange { channel, program } => {
                     (4, channel.as_index(), program, 0)
                 }
+                // 5, not 2: channel pressure carries no key number, so logging it as
+                // poly-aftertouch would render the pressure as a note.
                 MidiEvent::ChannelAftertouch { channel, pressure } => {
-                    (2, channel.as_index(), pressure, 0)
+                    (5, channel.as_index(), pressure, 0)
                 }
                 MidiEvent::PolyAftertouch {
                     channel,
@@ -905,11 +1027,11 @@ impl VST3Inspector {
         let window_size = Some((size.x.round(), size.y.round()));
         let last_tab = Some(self.current_tab.clone());
         let last_midi_channel = Some(self.selected_midi_channel);
-        // The loaded plugin path, so it can be auto-reloaded next launch.
+        // The loaded plugin path, so it can be auto-reloaded next launch. A plugin that failed to
+        // load is deliberately not remembered — the next launch would just fail the same way.
         let last_loaded_plugin = self
-            .audio
-            .as_ref()
-            .map(|_| self.plugin_path.clone())
+            .loaded_plugin_path
+            .clone()
             .or_else(|| self.preferences.last_loaded_plugin.clone());
 
         let changed = self.preferences.window_size != window_size
@@ -965,21 +1087,12 @@ impl VST3Inspector {
 
                 // Add custom path button
                 if ui.button("Add Folder...").clicked() {
-                    if let Some(folder) = rfd::FileDialog::new()
-                        .set_title("Select VST3 Plugin Folder")
-                        .pick_folder()
-                    {
-                        let folder_path = folder.to_string_lossy().to_string();
-                        if !self.preferences.custom_plugin_paths.contains(&folder_path) {
-                            self.preferences.custom_plugin_paths.push(folder_path);
-                            if let Err(e) = self.preferences.save() {
-                                self.set_error(format!("Failed to save preferences: {e}"));
-                            }
-                            // Refresh plugin list
-                            self.discovered_plugins =
-                                discover_vst3_paths(&self.preferences.custom_plugin_paths);
-                        }
-                    }
+                    self.start_file_dialog(
+                        DialogKind::AddPluginFolder,
+                        rfd::AsyncFileDialog::new()
+                            .set_title("Select VST3 Plugin Folder")
+                            .pick_folder(),
+                    );
                 }
             });
 
@@ -1043,11 +1156,16 @@ impl VST3Inspector {
             .body(|mut body| {
                 for plugin_path in &self.discovered_plugins.clone() {
                     let plugin_name = get_plugin_name_from_path(plugin_path);
-                    let directory = std::path::Path::new(plugin_path)
+                    let directory = Path::new(plugin_path)
                         .parent()
                         .and_then(|p| p.to_str())
                         .unwrap_or("Unknown");
-                    let is_current = self.plugin_path == *plugin_path;
+                    let row_state = plugin_row_state(
+                        plugin_path,
+                        self.loaded_plugin_path.as_deref(),
+                        self.pending_load.as_ref().map(|p| p.path.as_str()),
+                    );
+                    let is_current = row_state == PluginRowState::Loaded;
 
                     // Check if this plugin is from a custom path
                     let is_custom = self
@@ -1083,12 +1201,19 @@ impl VST3Inspector {
                         });
 
                         // Actions
-                        row.col(|ui| {
-                            if is_current {
+                        row.col(|ui| match row_state {
+                            PluginRowState::Loaded => {
                                 ui.label("Current");
-                            } else if ui.button("Load").clicked() {
-                                self.load_plugin(plugin_path.clone());
-                                self.current_tab = Tab::Plugin; // Switch to plugin tab after loading
+                            }
+                            PluginRowState::Loading => {
+                                ui.label("Loading…");
+                            }
+                            PluginRowState::Available => {
+                                if ui.button("Load").clicked() {
+                                    self.load_plugin(plugin_path.clone());
+                                    // Switch to plugin tab after loading
+                                    self.current_tab = Tab::Plugin;
+                                }
                             }
                         });
                     });
@@ -1556,6 +1681,14 @@ impl VST3Inspector {
 
                     // Pagination and table
                     if !filtered_params.is_empty() {
+                        // The filtered set can shrink under the view (a Reset drops a parameter
+                        // out of "Modified Only", a search narrows), so re-clamp before laying
+                        // the page out rather than rendering an empty page past the end.
+                        self.current_page = clamp_page(
+                            self.current_page,
+                            filtered_params.len(),
+                            self.items_per_page,
+                        );
                         let total_pages = filtered_params.len().div_ceil(self.items_per_page);
                         let start_idx = self.current_page * self.items_per_page;
                         let end_idx = (start_idx + self.items_per_page).min(filtered_params.len());
@@ -1789,7 +1922,9 @@ impl VST3Inspector {
                                             if combo_response.inner.unwrap_or(false) {
                                                 new_value =
                                                     selected_step as f32 / param.step_count as f32;
-                                                self.parameter_being_edited = Some(param.id);
+                                                // A combo box commits the whole edit on click —
+                                                // nothing is left in flight to highlight.
+                                                self.parameter_being_edited = None;
                                                 if let Err(e) = self
                                                     .set_parameter_value(param.id, new_value as f64)
                                                 {
@@ -1819,7 +1954,13 @@ impl VST3Inspector {
                                                 }
                                             }
 
-                                            if slider_response.drag_stopped() {
+                                            // The highlight marks an edit in progress, which only
+                                            // a live drag is. Anything else — the pointer
+                                            // released, a keyboard-committed change — leaves
+                                            // nothing in flight.
+                                            if !slider_response.dragged()
+                                                && self.parameter_being_edited == Some(param.id)
+                                            {
                                                 self.parameter_being_edited = None;
                                             }
 
@@ -2376,6 +2517,9 @@ impl VST3Inspector {
                     .connected_port()
                     .unwrap_or("None")
                     .to_string();
+                // The port to connect to, resolved after the combo closes so the connection is
+                // made against a fresh enumeration rather than this cached list.
+                let mut requested: Option<String> = None;
                 egui::ComboBox::from_id_salt("midi_input_port")
                     .selected_text(current)
                     .show_ui(ui, |ui| {
@@ -2385,17 +2529,16 @@ impl VST3Inspector {
                         {
                             self.midi_input.disconnect();
                         }
-                        // Clone the cached list so we don't borrow self across connect().
-                        for (i, name) in self.midi_input_ports.clone().iter().enumerate() {
+                        for name in &self.midi_input_ports {
                             let selected = self.midi_input.connected_port() == Some(name.as_str());
                             if ui.selectable_label(selected, name).clicked() {
-                                match self.midi_input.connect(i) {
-                                    Ok(()) => self.set_error(format!("Listening to MIDI: {name}")),
-                                    Err(e) => self.set_error(format!("MIDI input: {e}")),
-                                }
+                                requested = Some(name.clone());
                             }
                         }
                     });
+                if let Some(name) = requested {
+                    self.connect_midi_input(&name);
+                }
                 if ui.button("Refresh").clicked() {
                     self.midi_input_ports = MidiInputState::list_ports();
                 }
@@ -2410,6 +2553,21 @@ impl VST3Inspector {
                 );
             }
         });
+    }
+
+    /// Bind the hardware MIDI input port called `name` and refresh the cached port list, so the
+    /// dropdown reflects whatever was plugged in or unplugged since it was last enumerated.
+    fn connect_midi_input(&mut self, name: &str) {
+        let result = self.midi_input.connect_by_name(name);
+        self.midi_input_ports = MidiInputState::list_ports();
+        match result {
+            // Report the port the connection actually landed on, not the one clicked.
+            Ok(()) => {
+                let connected = self.midi_input.connected_port().unwrap_or(name).to_string();
+                self.set_error(format!("Listening to MIDI: {connected}"));
+            }
+            Err(e) => self.set_error(format!("MIDI input: {e}")),
+        }
     }
 
     /// Log a forwarded hardware-MIDI event into the monitor as Input.
@@ -2449,26 +2607,89 @@ impl VST3Inspector {
         self.log_midi_event(MidiDirection::Input, ty, ch, d1, d2);
     }
 
+    /// Start a native file dialog for `kind`, unless one is already on screen.
+    fn start_file_dialog(
+        &mut self,
+        kind: DialogKind,
+        future: impl Future<Output = Option<rfd::FileHandle>> + 'static,
+    ) {
+        if self.pending_dialog.is_some() {
+            return;
+        }
+        self.pending_dialog = Some(PendingFileDialog {
+            kind,
+            future: Box::pin(future),
+        });
+    }
+
+    /// Poll the file dialog on screen and, once the user has answered it, run the action that
+    /// opened it. Cheap while the dialog is up: one poll of a future that is waiting on a
+    /// completion callback.
+    fn poll_file_dialog(&mut self) {
+        let Some(pending) = self.pending_dialog.as_mut() else {
+            return;
+        };
+        // No waker needed: the app repaints unconditionally, so the dialog is polled every frame.
+        let chosen = match pending
+            .future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        {
+            Poll::Pending => return,
+            Poll::Ready(handle) => handle.map(|h| h.path().to_path_buf()),
+        };
+
+        let kind = self.pending_dialog.take().expect("checked above").kind;
+        let Some(path) = chosen else {
+            return; // user cancelled
+        };
+        match kind {
+            DialogKind::AddPluginFolder => self.add_plugin_folder(path),
+            DialogKind::LoadMidiFile => self.load_midi_file(&path),
+            DialogKind::SavePreset => self.save_preset_to(&path),
+            DialogKind::LoadPreset => self.load_preset_from(&path),
+            DialogKind::ExportWav => self.export_wav_to(&path),
+        }
+    }
+
+    /// Add a folder to the plugin scan paths and re-run discovery.
+    fn add_plugin_folder(&mut self, folder: PathBuf) {
+        let folder_path = folder.to_string_lossy().to_string();
+        if self.preferences.custom_plugin_paths.contains(&folder_path) {
+            return;
+        }
+        self.preferences.custom_plugin_paths.push(folder_path);
+        if let Err(e) = self.preferences.save() {
+            self.set_error(format!("Failed to save preferences: {e}"));
+        }
+        self.discovered_plugins = discover_vst3_paths(&self.preferences.custom_plugin_paths);
+    }
+
+    /// Load a Standard MIDI File into the player.
+    fn load_midi_file(&mut self, path: &Path) {
+        match self.midi_player.load(path) {
+            Ok(()) => self.set_error(format!(
+                "Loaded {} ({} events)",
+                self.midi_player.loaded_name().unwrap_or("file"),
+                self.midi_player.event_count()
+            )),
+            Err(e) => self.set_error(format!("Failed to load MIDI file: {e}")),
+        }
+    }
+
     /// MIDI file (.mid) playback: load an SMF and replay it onto the live plugin.
     fn show_midi_file_player(&mut self, ui: &mut egui::Ui) {
         ui.group(|ui| {
             ui.label(egui::RichText::new("MIDI File Playback").strong());
             ui.horizontal(|ui| {
                 if ui.button("Load MIDI File…").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .set_title("Load MIDI File")
-                        .add_filter("MIDI", &["mid", "midi"])
-                        .pick_file()
-                    {
-                        match self.midi_player.load(&path) {
-                            Ok(()) => self.set_error(format!(
-                                "Loaded {} ({} events)",
-                                self.midi_player.loaded_name().unwrap_or("file"),
-                                self.midi_player.event_count()
-                            )),
-                            Err(e) => self.set_error(format!("Failed to load MIDI file: {e}")),
-                        }
-                    }
+                    self.start_file_dialog(
+                        DialogKind::LoadMidiFile,
+                        rfd::AsyncFileDialog::new()
+                            .set_title("Load MIDI File")
+                            .add_filter("MIDI", &["mid", "midi"])
+                            .pick_file(),
+                    );
                 }
 
                 let has_file = self.midi_player.loaded_name().is_some();
@@ -2788,23 +3009,26 @@ impl VST3Inspector {
     /// `PluginPreset` (default) and the standard `.vstpreset` interchange format, chosen by
     /// the picked file's extension. Surfaces the result through `last_error`.
     fn save_preset_dialog(&mut self) {
-        let audio = match &self.audio {
-            Some(a) => a,
-            None => {
-                self.set_error("No plugin loaded");
-                return;
-            }
-        };
+        if self.audio.is_none() {
+            self.set_error("No plugin loaded");
+            return;
+        }
+        self.start_file_dialog(
+            DialogKind::SavePreset,
+            rfd::AsyncFileDialog::new()
+                .set_title("Save Plugin Preset")
+                .add_filter("Plugin Preset (JSON)", &["json"])
+                .add_filter("VST3 Preset", &["vstpreset"])
+                .set_file_name("preset.json")
+                .save_file(),
+        );
+    }
 
-        let path = match rfd::FileDialog::new()
-            .set_title("Save Plugin Preset")
-            .add_filter("Plugin Preset (JSON)", &["json"])
-            .add_filter("VST3 Preset", &["vstpreset"])
-            .set_file_name("preset.json")
-            .save_file()
-        {
-            Some(p) => p,
-            None => return, // user cancelled
+    /// Write the loaded plugin's state to `path`, in the format its extension asks for.
+    fn save_preset_to(&mut self, path: &Path) {
+        let Some(audio) = self.audio.as_ref() else {
+            self.set_error("No plugin loaded");
+            return;
         };
 
         let is_vstpreset = path
@@ -2813,9 +3037,9 @@ impl VST3Inspector {
 
         let plugin = audio.lock();
         let result = if is_vstpreset {
-            plugin.save_vstpreset(&path)
+            plugin.save_vstpreset(path)
         } else {
-            plugin.save_preset(&path)
+            plugin.save_preset(path)
         };
         drop(plugin);
 
@@ -2838,14 +3062,20 @@ impl VST3Inspector {
             self.set_error("No plugin loaded");
             return;
         }
+        self.start_file_dialog(
+            DialogKind::LoadPreset,
+            rfd::AsyncFileDialog::new()
+                .set_title("Load Plugin Preset")
+                .add_filter("Presets", &["json", "vstpreset"])
+                .pick_file(),
+        );
+    }
 
-        let path = match rfd::FileDialog::new()
-            .set_title("Load Plugin Preset")
-            .add_filter("Presets", &["json", "vstpreset"])
-            .pick_file()
-        {
-            Some(p) => p,
-            None => return, // user cancelled
+    /// Apply the preset at `path` to the loaded plugin, in the format its extension implies.
+    fn load_preset_from(&mut self, path: &Path) {
+        let Some(audio) = self.audio.as_ref() else {
+            self.set_error("No plugin loaded");
+            return;
         };
 
         let is_vstpreset = path
@@ -2853,12 +3083,11 @@ impl VST3Inspector {
             .is_some_and(|e| e.eq_ignore_ascii_case("vstpreset"));
 
         let result = {
-            let audio = self.audio.as_ref().unwrap();
             let mut plugin = audio.lock();
             if is_vstpreset {
-                plugin.load_vstpreset(&path)
+                plugin.load_vstpreset(path)
             } else {
-                plugin.load_preset(&path)
+                plugin.load_preset(path)
             }
         };
 
@@ -2879,22 +3108,27 @@ impl VST3Inspector {
     /// have two instances at once, so we snapshot state, drop the live instance, render a fresh
     /// one via the library's `render_to_wav`, then reload to resume the live view.
     fn export_wav_dialog(&mut self) {
-        use vst3_host::midi::{MidiChannel, MidiEvent};
-
         if self.audio.is_none() {
             self.set_error("No plugin loaded");
             return;
         }
-        let plugin_path = self.plugin_path.clone();
+        self.start_file_dialog(
+            DialogKind::ExportWav,
+            rfd::AsyncFileDialog::new()
+                .set_title("Export Audio to WAV")
+                .add_filter("WAV audio", &["wav"])
+                .set_file_name("export.wav")
+                .save_file(),
+        );
+    }
 
-        let path = match rfd::FileDialog::new()
-            .set_title("Export Audio to WAV")
-            .add_filter("WAV audio", &["wav"])
-            .set_file_name("export.wav")
-            .save_file()
-        {
-            Some(p) => p,
-            None => return, // user cancelled
+    /// Render the loaded plugin offline to `path`, then reload it to resume the live view.
+    fn export_wav_to(&mut self, path: &Path) {
+        use vst3_host::midi::{MidiChannel, MidiEvent};
+
+        let Some(plugin_path) = self.loaded_plugin_path.clone() else {
+            self.set_error("No plugin loaded");
+            return;
         };
 
         // Snapshot the live state so the export reflects the user's current tweaks.
@@ -2920,7 +3154,7 @@ impl VST3Inspector {
                 note: 60,
                 velocity: 110,
             };
-            vst3_host::simple::render_to_wav(&mut plugin, 4.0, &[note], &path)
+            vst3_host::simple::render_to_wav(&mut plugin, 4.0, &[note], path)
                 .map_err(|e| format!("render: {e}"))
         })();
 
@@ -3094,6 +3328,7 @@ impl VST3Inspector {
 
         // Drop any previously playing plugin first (stops audio, releases the device).
         self.audio = None;
+        self.loaded_plugin_path = None;
         self.plugin_info = None;
         self.selected_parameter = None;
         self.current_page = 0;
@@ -3103,6 +3338,14 @@ impl VST3Inspector {
         self.report_json = None;
         self.last_error = None;
         self.last_error_time = None;
+        // Parameter ids are per-plugin: an enabled LFO would otherwise keep writing the previous
+        // plugin's id into the new one, and the "being edited" highlight would stick to a
+        // parameter that no longer exists.
+        self.automation.detach();
+        self.parameter_being_edited = None;
+        // Keys held on the virtual keyboard belong to the instance that is going away; their
+        // note-offs can never reach it.
+        self.pressed_keys.clear();
         // A/B snapshots belong to the previous plugin; applying them to a different plugin would
         // feed it a foreign state blob. Clear them on every load.
         self.slot_a = None;
@@ -3144,6 +3387,9 @@ impl VST3Inspector {
                 let pending = self.pending_load.take().expect("checked above");
                 match self.load_on_ui_thread(&pending.path, pending.restore_state.as_deref()) {
                     Ok(params) => {
+                        // Only now is this plugin the current one: the list marks it as such and
+                        // stops offering to load it.
+                        self.loaded_plugin_path = Some(pending.path.clone());
                         self.report_json =
                             vst3_host::PluginReport::new(detail.clone(), params.clone())
                                 .to_json()
@@ -3762,6 +4008,7 @@ impl VST3Inspector {
 
         Self {
             plugin_path: path.to_string(),
+            loaded_plugin_path: None,
             plugin_info: None,
             report_json: None,
             plugin_window: None,
@@ -3801,8 +4048,41 @@ impl VST3Inspector {
             midi_player: MidiFilePlayer::default(),
             midi_input: MidiInputState::default(),
             midi_input_ports: MidiInputState::list_ports(),
+            pending_dialog: None,
         }
     }
+}
+
+/// What the plugin list should offer for one row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PluginRowState {
+    /// Loaded and playing right now.
+    Loaded,
+    /// Its load is in flight.
+    Loading,
+    /// Not loaded — offer to load it.
+    Available,
+}
+
+/// Classify a discovered plugin against the loaded one and the one currently being loaded.
+///
+/// A load that is merely requested is neither: reporting an in-flight (or failed) load as the
+/// current plugin hides the row's Load button, leaving no way to retry it.
+fn plugin_row_state(path: &str, loaded: Option<&str>, loading: Option<&str>) -> PluginRowState {
+    if loading == Some(path) {
+        PluginRowState::Loading
+    } else if loaded == Some(path) {
+        PluginRowState::Loaded
+    } else {
+        PluginRowState::Available
+    }
+}
+
+/// Clamp a page index to the last page that still holds rows, so a filter (or a Reset that drops
+/// a parameter out of the "modified" set) shrinking the list can't strand the view past the end.
+fn clamp_page(page: usize, item_count: usize, items_per_page: usize) -> usize {
+    let total_pages = item_count.div_ceil(items_per_page.max(1)).max(1);
+    page.min(total_pages - 1)
 }
 
 fn get_plugin_name_from_path(path: &str) -> String {

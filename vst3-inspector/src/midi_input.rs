@@ -50,10 +50,15 @@ impl MidiInputState {
         self.conn.is_some()
     }
 
-    /// Connect to the input port at `index` (matching [`list_ports`](Self::list_ports) order),
-    /// replacing any existing connection. Active-sensing / timing-clock / SysEx traffic is
-    /// ignored so a controller can't flood the plugin with realtime noise.
-    pub fn connect(&mut self, index: usize) -> Result<(), String> {
+    /// Connect to the input port called `name`, replacing any existing connection.
+    ///
+    /// Resolution is by name against a fresh enumeration, deliberately: a port index taken from a
+    /// list cached earlier points at a different device as soon as anything is plugged in or
+    /// unplugged, and the connection would silently be to the wrong controller.
+    ///
+    /// Active-sensing / timing-clock / SysEx traffic is ignored so a controller can't flood the
+    /// plugin with realtime noise.
+    pub fn connect_by_name(&mut self, name: &str) -> Result<(), String> {
         self.disconnect();
 
         let mut input =
@@ -62,8 +67,9 @@ impl MidiInputState {
 
         let ports = input.ports();
         let port = ports
-            .get(index)
-            .ok_or_else(|| "selected MIDI port no longer exists".to_string())?;
+            .iter()
+            .find(|p| input.port_name(p).is_ok_and(|n| n == name))
+            .ok_or_else(|| format!("MIDI port '{name}' is no longer available"))?;
         let name = input
             .port_name(port)
             .unwrap_or_else(|_| "MIDI input".to_string());

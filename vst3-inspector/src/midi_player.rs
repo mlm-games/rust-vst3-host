@@ -5,7 +5,7 @@
 //! tempo-aware (honors `Set Tempo` meta events across the whole file) but not sample-accurate
 //! — it's driven from the control thread, which is the realistic level for a host UI.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use vst3_host::midi::{MidiChannel, MidiEvent};
 
 /// Seconds elapsed over `delta_ticks` at `tempo_us_per_quarter` microseconds per quarter note,
@@ -114,12 +114,27 @@ pub fn flatten(smf: &midly::Smf) -> Result<Vec<(f64, MidiEvent)>, String> {
     Ok(events)
 }
 
+/// A gap between two [`MidiFilePlayer::tick`] calls longer than this means the control thread
+/// stalled (a modal dialog, a plugin load) rather than merely rendering a slow frame.
+const STALL_THRESHOLD: Duration = Duration::from_millis(250);
+
+/// How far the player is allowed to advance on the tick that discovers a stall. The rest of the
+/// stall is absorbed by sliding the time origin, so playback resumes where it left off instead of
+/// flushing minutes of backlog into a single frame.
+const CATCH_UP_AFTER_STALL: Duration = Duration::from_millis(50);
+
+/// Hard ceiling on the events one `tick` may hand out, so even a pathologically dense file can't
+/// overrun the host's control ring in one frame. Anything past it is simply due on the next tick.
+const MAX_EVENTS_PER_TICK: usize = 512;
+
 /// Plays a loaded SMF by handing out events as their scheduled time arrives.
 #[derive(Default)]
 pub struct MidiFilePlayer {
     events: Vec<(f64, MidiEvent)>,
     next_idx: usize,
     start: Option<Instant>,
+    /// When `tick` last ran, used to notice a stalled control thread.
+    last_tick: Option<Instant>,
     playing: bool,
     loaded_name: Option<String>,
 }
@@ -132,6 +147,7 @@ impl MidiFilePlayer {
         self.events = flatten(&smf)?;
         self.next_idx = 0;
         self.start = None;
+        self.last_tick = None;
         self.playing = false;
         self.loaded_name = path
             .file_name()
@@ -157,6 +173,7 @@ impl MidiFilePlayer {
         }
         self.next_idx = 0;
         self.start = Some(now);
+        self.last_tick = Some(now);
         self.playing = true;
     }
 
@@ -164,6 +181,7 @@ impl MidiFilePlayer {
     pub fn stop(&mut self) {
         self.playing = false;
         self.start = None;
+        self.last_tick = None;
         self.next_idx = 0;
     }
 
@@ -172,15 +190,33 @@ impl MidiFilePlayer {
         self.playing
     }
 
-    /// Return every event due by `now`, advancing the cursor. Sets `playing = false` when the
+    /// Return the events due by `now`, advancing the cursor. Sets `playing = false` when the
     /// file finishes.
+    ///
+    /// The caller drives this from its UI loop, which can stall arbitrarily long (a modal file
+    /// dialog, a plugin load). Rather than handing the whole backlog over at once — a burst that
+    /// overruns the host's control ring and loses note-offs — a stall slides the time origin
+    /// forward, so playback continues from where it was interrupted.
     pub fn tick(&mut self, now: Instant) -> Vec<MidiEvent> {
-        let Some(start) = self.start else {
+        let Some(mut start) = self.start else {
             return Vec::new();
         };
+
+        if let Some(previous) = self.last_tick {
+            let gap = now.saturating_duration_since(previous);
+            if gap > STALL_THRESHOLD {
+                start += gap - CATCH_UP_AFTER_STALL;
+                self.start = Some(start);
+            }
+        }
+        self.last_tick = Some(now);
+
         let elapsed = now.saturating_duration_since(start).as_secs_f64();
         let mut due = Vec::new();
-        while self.next_idx < self.events.len() && self.events[self.next_idx].0 <= elapsed {
+        while self.next_idx < self.events.len()
+            && self.events[self.next_idx].0 <= elapsed
+            && due.len() < MAX_EVENTS_PER_TICK
+        {
             due.push(self.events[self.next_idx].1);
             self.next_idx += 1;
         }
@@ -233,6 +269,83 @@ mod tests {
     fn program_change_is_skipped() {
         let pc = midly::MidiMessage::ProgramChange { program: 5.into() };
         assert!(map_message(0, &pc).is_none());
+    }
+
+    /// A player holding `count` note-ons spaced `spacing` seconds apart, already playing.
+    fn player_with_events(count: usize, spacing: f64) -> (MidiFilePlayer, Instant) {
+        let events = (0..count)
+            .map(|i| {
+                (
+                    i as f64 * spacing,
+                    MidiEvent::NoteOn {
+                        channel: MidiChannel::Ch1,
+                        note: 60,
+                        velocity: 100,
+                    },
+                )
+            })
+            .collect();
+        let mut player = MidiFilePlayer {
+            events,
+            ..Default::default()
+        };
+        let start = Instant::now();
+        player.play(start);
+        (player, start)
+    }
+
+    #[test]
+    fn tick_hands_out_events_as_they_come_due() {
+        let (mut player, start) = player_with_events(4, 0.1);
+        assert_eq!(player.tick(start).len(), 1); // only the event at t=0
+        assert_eq!(player.tick(start + Duration::from_millis(120)).len(), 1);
+        assert!(player.is_playing());
+        assert_eq!(player.tick(start + Duration::from_millis(310)).len(), 2);
+        assert!(!player.is_playing()); // file exhausted
+    }
+
+    #[test]
+    fn a_long_stall_resyncs_the_clock_instead_of_dumping_the_backlog() {
+        // 1 event every 10 ms for a minute: a naive catch-up would hand over ~6000 at once.
+        let (mut player, start) = player_with_events(6000, 0.01);
+        player.tick(start);
+
+        let due = player.tick(start + Duration::from_secs(60));
+        assert!(
+            due.len() <= MAX_EVENTS_PER_TICK,
+            "burst of {} events after a stall",
+            due.len()
+        );
+        // The clock slid forward, so only the events within the catch-up window are due —
+        // far fewer than even the hard cap.
+        assert!(
+            due.len() < 20,
+            "expected a resync, got {} events",
+            due.len()
+        );
+        // Playback continues from where it was interrupted rather than jumping to the end.
+        assert!(player.is_playing());
+        assert!(player.next_idx < 20);
+    }
+
+    #[test]
+    fn a_normal_frame_gap_does_not_resync() {
+        let (mut player, start) = player_with_events(100, 0.01);
+        player.tick(start);
+        // 16 ms — an ordinary 60 fps frame; every event due in that window must be handed out.
+        let due = player.tick(start + Duration::from_millis(160));
+        assert_eq!(due.len(), 16);
+    }
+
+    #[test]
+    fn a_dense_burst_is_capped_and_the_remainder_stays_queued() {
+        // 2000 events all at t=0: more than one tick may hand out.
+        let (mut player, start) = player_with_events(2000, 0.0);
+        let first = player.tick(start);
+        assert_eq!(first.len(), MAX_EVENTS_PER_TICK);
+        assert!(player.is_playing());
+        let second = player.tick(start + Duration::from_millis(16));
+        assert_eq!(second.len(), MAX_EVENTS_PER_TICK);
     }
 
     #[test]

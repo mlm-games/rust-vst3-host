@@ -94,6 +94,17 @@ impl AutomationState {
         }
     }
 
+    /// Stop automating and forget the bound parameter, keeping the shape/period the user picked.
+    ///
+    /// A parameter id only means something to the plugin it came from, so the binding cannot
+    /// survive a plugin switch — left in place it would keep writing that id into whatever
+    /// plugin is loaded next.
+    pub fn detach(&mut self) {
+        self.enabled = false;
+        self.param_id = None;
+        self.last_value = 0.0;
+    }
+
     /// The value the curve should hold at `now`, or `None` if disabled / no parameter chosen.
     pub fn value_now(&self, now: Instant) -> Option<f64> {
         if !self.enabled || self.param_id.is_none() {
@@ -141,6 +152,26 @@ mod tests {
         }
         // Sine reaches its peak around the midpoint.
         assert!(c.value_at_time(1.0).unwrap() > 0.95);
+    }
+
+    #[test]
+    fn detach_clears_the_parameter_binding_but_keeps_the_curve_choice() {
+        let mut s = AutomationState::new();
+        s.enabled = true;
+        s.param_id = Some(42);
+        s.shape = Shape::Triangle;
+        s.period_secs = 7.5;
+        s.last_value = 0.75;
+
+        s.detach();
+
+        assert!(!s.enabled);
+        assert_eq!(s.param_id, None);
+        assert_eq!(s.last_value, 0.0);
+        assert_eq!(s.value_now(Instant::now()), None);
+        // The shape/period are UI preferences, not plugin state.
+        assert_eq!(s.shape, Shape::Triangle);
+        assert_eq!(s.period_secs, 7.5);
     }
 
     #[test]
