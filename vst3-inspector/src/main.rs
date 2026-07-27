@@ -637,6 +637,7 @@ impl eframe::App for VST3Inspector {
         self.update_vu_meters();
         self.poll_plugin_output_midi();
         self.poll_plugin_parameter_changes();
+        self.service_plugin_run_loop();
 
         // Drive the parameter-automation demo at UI cadence while it's enabled.
         if let Some(value) = self.automation.value_now(Instant::now()) {
@@ -841,6 +842,26 @@ impl VST3Inspector {
     /// Reflect parameter changes the plugin made through its own editor (turning a knob in
     /// the plugin GUI calls back via the component handler) into the inspector's parameter
     /// list, so the displayed values stay in sync with the plugin's editor.
+    /// Drive the plugin editor's run-loop services while its window is open. On Linux, VSTGUI
+    /// editors register their X11 file descriptors and timers with the host frame and only paint
+    /// or respond when the host services them — `update()` runs at the monitor refresh rate (see
+    /// the unconditional `request_repaint()` below), which is the cadence the library asks for.
+    /// A no-op on other platforms, so the call stays platform-agnostic here.
+    fn service_plugin_run_loop(&mut self) {
+        if self.plugin_window.is_none() {
+            return;
+        }
+        let Some(audio) = self.audio.as_ref() else {
+            return;
+        };
+        // `try_lock`: the audio callback holds this same mutex for the duration of each block, and
+        // blocking the UI thread behind it would stutter the whole app. Losing the race just
+        // defers servicing to the next frame, which the editor can't perceive.
+        if let Ok(mut plugin) = audio.plugin().try_lock() {
+            plugin.service_run_loop();
+        }
+    }
+
     fn poll_plugin_parameter_changes(&mut self) {
         // Lock-free: the audio callback drains the plugin's editor parameter changes into a
         // ring (see poll_plugin_output_midi); we pop them here without locking.
