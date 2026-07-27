@@ -12,7 +12,8 @@ use vst3::{Class, ComWrapper, Interface, Steinberg::Vst::*, Steinberg::*};
 // Many plugins (u-he, Waves, ...) query the context passed to `IComponent::initialize`
 // for `IHostApplication` and dereference it. Passing a null context makes them crash.
 // Providing a real host-application object that at least answers `getName` lets them
-// initialize. (We don't yet vend host-created objects like IMessage/IAttributeList.)
+// initialize. `createInstance` below also vends the host-created objects they ask for
+// (IMessage/IAttributeList), used to pass data between a plugin's component and controller.
 pub struct HostApplication;
 
 impl Class for HostApplication {
@@ -632,6 +633,14 @@ pub fn create_host_plug_frame(
     ComWrapper::new(HostPlugFrame::new(requested))
 }
 
+/// Cap on buffered editor feedback — the parameter changes and gesture events a plugin's editor
+/// reports through `IComponentHandler`. Both are drained only by an optional host poll
+/// (`Plugin::get_parameter_changes` / `Plugin::take_parameter_edits`), so a host that never polls
+/// would otherwise grow them for the plugin's whole lifetime: dragging a knob emits one
+/// `performEdit` per UI frame. Mirrors `MAX_OUTPUT_MIDI` on the outgoing side — pre-reserved so
+/// steady-state pushes never reallocate, and pushes past the cap are dropped.
+pub const MAX_EDITOR_FEEDBACK: usize = 4096;
+
 // Component Handler implementation
 pub struct ComponentHandler {
     // Track parameter changes from the plugin
@@ -646,7 +655,7 @@ impl ComponentHandler {
     pub fn new(parameter_changes: Arc<Mutex<Vec<(u32, f64)>>>) -> Self {
         ComponentHandler {
             parameter_changes,
-            edits: Arc::new(Mutex::new(Vec::new())),
+            edits: Arc::new(Mutex::new(Vec::with_capacity(MAX_EDITOR_FEEDBACK))),
         }
     }
 
@@ -655,16 +664,18 @@ impl ComponentHandler {
         // A COM FFI callback could be mid-push when a previous one panicked; recover the lock
         // rather than propagating a poison panic across the boundary.
         let mut edits = self.edits.lock().unwrap_or_else(|p| p.into_inner());
-        std::mem::take(&mut *edits)
+        // Drain in place rather than `mem::take`: taking the `Vec` would leave a zero-capacity
+        // buffer behind, so the next editor gesture would reallocate on the COM callback path.
+        edits.drain(..).collect()
     }
 
     // Append a gesture event, recovering a poisoned lock (these run on the COM FFI callback
     // path, where a panic would unwind across the C++ boundary — UB).
     fn push_edit(&self, edit: crate::plugin::ParameterEdit) {
-        self.edits
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push(edit);
+        let mut edits = self.edits.lock().unwrap_or_else(|p| p.into_inner());
+        if edits.len() < MAX_EDITOR_FEEDBACK {
+            edits.push(edit);
+        }
     }
 }
 
@@ -691,7 +702,9 @@ impl IComponentHandlerTrait for ComponentHandler {
         );
         // Store the parameter change for the DSP-feeding drain...
         if let Ok(mut changes) = self.parameter_changes.lock() {
-            changes.push((id, value_normalized));
+            if changes.len() < MAX_EDITOR_FEEDBACK {
+                changes.push((id, value_normalized));
+            }
         }
         // ...and as an ordered gesture event for the richer `take_parameter_edits` drain.
         self.push_edit(crate::plugin::ParameterEdit {
@@ -741,6 +754,13 @@ impl IComponentHandler2Trait for ComponentHandler {
 }
 
 // Event List implementation
+/// Cap on queued events. The input list's only drain is `process()`, which returns early while
+/// the plugin isn't processing, so a host that sends MIDI to a stopped plugin would otherwise
+/// grow this forever (and then dump every stale event into the first block once it starts). Far
+/// above any single block's working set; same pre-reserve/drop-when-full policy as
+/// `MAX_OUTPUT_MIDI`.
+pub const MAX_QUEUED_EVENTS: usize = 4096;
+
 pub struct HostEventList {
     pub events: Mutex<Vec<Event>>,
 }
@@ -748,7 +768,7 @@ pub struct HostEventList {
 impl HostEventList {
     pub fn new() -> Self {
         Self {
-            events: Mutex::new(Vec::new()),
+            events: Mutex::new(Vec::with_capacity(MAX_QUEUED_EVENTS)),
         }
     }
 
@@ -799,6 +819,13 @@ impl HostEventList {
     pub fn add_event(&self, event: Event) {
         match self.events.lock() {
             Ok(mut events) => {
+                if events.len() >= MAX_QUEUED_EVENTS {
+                    log::warn!(
+                        "HostEventList: dropping event, queue full at {MAX_QUEUED_EVENTS} \
+                         (is the plugin processing?)"
+                    );
+                    return;
+                }
                 events.push(event);
                 log::trace!(
                     "HostEventList: Added event via add_event, total count: {}",
@@ -876,6 +903,14 @@ impl IEventListTrait for HostEventList {
 
         match self.events.lock() {
             Ok(mut events) => {
+                // Bound what a plugin can emit into the output list in a single block, so a
+                // misbehaving plugin can't drive unbounded growth from inside `process()`.
+                if events.len() >= MAX_QUEUED_EVENTS {
+                    log::warn!(
+                        "HostEventList: dropping plugin event, queue full at {MAX_QUEUED_EVENTS}"
+                    );
+                    return kResultFalse;
+                }
                 events.push(*event);
                 log::trace!("HostEventList: Added event, total count: {}", events.len());
                 kResultOk
@@ -1247,6 +1282,70 @@ mod component_handler_tests {
             *handler.parameter_changes.lock().unwrap(),
             vec![(5, 0.25), (5, 0.5)]
         );
+    }
+
+    /// Both editor-feedback buffers are drained only by an optional host poll, so a host that
+    /// never polls must not be able to grow them without bound — dragging a knob emits one
+    /// `performEdit` (and one gesture event) per UI frame, for as long as the editor is open.
+    #[test]
+    fn editor_feedback_is_capped_when_the_host_never_polls() {
+        let handler = ComponentHandler::new(Arc::new(Mutex::new(Vec::new())));
+
+        // Simulate a very long drag: far more edits than the cap, never polled.
+        unsafe {
+            for i in 0..(MAX_EDITOR_FEEDBACK * 2) {
+                handler.performEdit(7, (i % 100) as f64 / 100.0);
+            }
+        }
+
+        assert_eq!(
+            handler.parameter_changes.lock().unwrap().len(),
+            MAX_EDITOR_FEEDBACK,
+            "the value-change sink must stop at the cap, not grow with the drag"
+        );
+        let edits = handler.take_parameter_edits();
+        assert_eq!(
+            edits.len(),
+            MAX_EDITOR_FEEDBACK,
+            "the gesture log must stop at the cap too"
+        );
+
+        // Draining keeps the buffer's capacity, so the next gesture doesn't reallocate on the
+        // COM callback path.
+        assert!(handler.take_parameter_edits().is_empty());
+        assert!(handler.edits.lock().unwrap().capacity() >= MAX_EDITOR_FEEDBACK);
+    }
+}
+
+#[cfg(test)]
+mod host_event_list_tests {
+    use super::*;
+
+    /// `process()` is the input list's only drain and it returns early while the plugin isn't
+    /// processing, so queueing MIDI at a stopped plugin must not grow the list forever.
+    #[test]
+    fn queued_events_are_capped_so_a_stopped_plugin_cannot_grow_them() {
+        let list = HostEventList::new();
+        let event: Event = unsafe { std::mem::zeroed() };
+
+        for _ in 0..(MAX_QUEUED_EVENTS + 500) {
+            list.add_event(event);
+        }
+        assert_eq!(unsafe { list.getEventCount() }, MAX_QUEUED_EVENTS as i32);
+
+        // The plugin-facing COM path is capped too, and reports the refusal.
+        let mut event = event;
+        assert_eq!(
+            unsafe { list.addEvent(&mut event as *mut Event) },
+            kResultFalse
+        );
+
+        // Clearing (as each block does) makes room again without dropping capacity.
+        list.clear();
+        assert_eq!(unsafe { list.getEventCount() }, 0);
+        assert!(list.events.lock().unwrap().capacity() >= MAX_QUEUED_EVENTS);
+        list.add_event(event);
+        assert_eq!(unsafe { list.getEventCount() }, 1);
     }
 }
 

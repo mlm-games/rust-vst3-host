@@ -22,7 +22,7 @@ use super::{
     com_implementations::{
         create_event_list, create_host_application, create_host_plug_frame, create_memory_stream,
         create_memory_stream_from, ComponentHandler, HostApplication, HostEventList, HostPlugFrame,
-        ParameterChanges,
+        ParameterChanges, MAX_EDITOR_FEEDBACK,
     },
     module_loader::{load_module, VstModule},
 };
@@ -194,9 +194,12 @@ impl PluginImpl {
     /// the DSP and the host display stay in sync. (Before processing has started, falls back to
     /// the raw performEdit sink so edits aren't lost.)
     pub fn get_parameter_changes(&self) -> Vec<(u32, f64)> {
+        // Both drains take the elements in place rather than `mem::take`-ing the `Vec`: taking it
+        // would leave a zero-capacity buffer behind, so the next block's `append` would
+        // reallocate — on the audio thread, for the stash.
         if let Ok(mut stash) = self.gui_param_changes_for_host.lock() {
             if !stash.is_empty() {
-                return std::mem::take(&mut *stash);
+                return stash.drain(..).collect();
             }
         }
         // Not processing yet (process() hasn't run to move edits into the stash): drain the raw
@@ -204,7 +207,7 @@ impl PluginImpl {
         if !self.is_processing {
             if let Some(ref handler) = self.component_handler {
                 if let Ok(mut changes) = handler.parameter_changes.lock() {
-                    return std::mem::take(&mut *changes);
+                    return changes.drain(..).collect();
                 }
             }
         }
@@ -269,7 +272,7 @@ impl PluginImpl {
 
             // Create component handler for parameter change notifications
             log::debug!("Step 8: Creating component handler...");
-            let parameter_changes = Arc::new(Mutex::new(Vec::new()));
+            let parameter_changes = Arc::new(Mutex::new(Vec::with_capacity(MAX_EDITOR_FEEDBACK)));
             let component_handler =
                 ComWrapper::new(ComponentHandler::new(parameter_changes.clone()));
             log::debug!("Component handler created");
@@ -394,7 +397,9 @@ impl PluginImpl {
                 process_data: None,
                 component_handler: Some(component_handler),
                 pending_param_changes: Vec::new(),
-                gui_param_changes_for_host: Arc::new(Mutex::new(Vec::new())),
+                gui_param_changes_for_host: Arc::new(Mutex::new(Vec::with_capacity(
+                    MAX_EDITOR_FEEDBACK,
+                ))),
                 input_events,
                 output_events,
                 output_midi: Arc::new(ArrayQueue::new(MAX_OUTPUT_MIDI)),
@@ -941,7 +946,18 @@ impl PluginInternal for PluginImpl {
                                 data.input_param_changes.enqueue(id, 0, value);
                             }
                             if let Ok(mut stash) = self.gui_param_changes_for_host.lock() {
-                                stash.append(&mut gui_changes);
+                                // Bounded: nothing drains the stash unless the host polls
+                                // `get_parameter_changes`, and the realtime runner never does, so
+                                // an unbounded append here would grow forever and reallocate on
+                                // the audio thread. Both buffers are pre-reserved to the cap, so
+                                // the steady-state append allocates nothing.
+                                let room = MAX_EDITOR_FEEDBACK.saturating_sub(stash.len());
+                                if room >= gui_changes.len() {
+                                    stash.append(&mut gui_changes);
+                                } else {
+                                    stash.extend(gui_changes.drain(..room));
+                                    gui_changes.clear();
+                                }
                             } else {
                                 gui_changes.clear();
                             }
