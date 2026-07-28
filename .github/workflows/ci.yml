@@ -25,6 +25,21 @@ jobs:
       # Keep the isolation path + a no-plugin example building.
       - run: cargo build -p vst3-host --bin vst3-host-helper --features process-isolation
       - run: cargo run -p vst3-host --example plugin_scanner
+      - name: Build the TestSynth fixture bundle
+        run: |
+          cargo build -p vst3-host-testplug --release
+          bash scripts/bundle-test-plugin.sh
+      # The editor path is the one thing the normal suite cannot reach: it needs a real window on
+      # the process main thread. The smoke example owns `main`, and against TestSynth it asserts
+      # the whole handshake (attach, content scale, resizeView -> onSize) rather than just "it
+      # didn't crash". Only TestSynth, because it is built from source here — Dexed is not in the
+      # repository (`*.vst3` is gitignored), so its half of `editor_open_tests` skips itself.
+      - name: Editor smoke (TestSynth)
+        run: cargo run -p vst3-host --example editor_smoke -- test_plugins/TestSynth.vst3
+      - name: Editor + resize regression tests
+        run: |
+          cargo test -p vst3-host --all-features --test editor_open_tests -- --ignored --nocapture
+          cargo test -p vst3-host --all-features --test feature_coverage_tests -- --ignored --nocapture --test-threads=1 test_testsynth
 
   # The published crate must build and pass its tests on Linux (incl. the X11/XCB path).
   linux:
@@ -35,13 +50,26 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - name: Install build deps (libclang, libxcb, ALSA)
+      - name: Install build deps (libclang, libxcb, ALSA, Xvfb)
         run: |
           sudo apt-get update
-          sudo apt-get install -y libclang-dev clang libxcb1-dev libxcb-util-dev libasound2-dev pkg-config
+          sudo apt-get install -y libclang-dev clang libxcb1-dev libxcb-util-dev libasound2-dev pkg-config xvfb
       - run: cargo build -p vst3-host --all-features
       - run: cargo test -p vst3-host --all-features
       - run: cargo clippy -p vst3-host --all-features --all-targets -- -D warnings
+      - name: Build the TestSynth fixture bundle
+        run: |
+          cargo build -p vst3-host-testplug --release
+          bash scripts/bundle-test-plugin.sh
+      # The X11/XCB editor path only ever got compiled here. `xvfb-run` gives it a display so it
+      # is actually exercised: window creation, X11EmbedWindowID attach, and the host's
+      # ConfigureWindow answer to the plugin's resize request.
+      - name: Editor smoke (TestSynth, under Xvfb)
+        run: xvfb-run -a cargo run -p vst3-host --example editor_smoke -- test_plugins/TestSynth.vst3
+      - name: Editor + resize regression tests (under Xvfb)
+        run: |
+          xvfb-run -a cargo test -p vst3-host --all-features --test editor_open_tests -- --ignored --nocapture
+          xvfb-run -a cargo test -p vst3-host --all-features --test feature_coverage_tests -- --ignored --nocapture --test-threads=1 test_testsynth
 
   asan-lsan:
     name: "ci: AddressSanitizer + LeakSanitizer"
@@ -90,6 +118,20 @@ jobs:
         run: choco install llvm -y
       - run: cargo build -p vst3-host --all-features
       - run: cargo test -p vst3-host --all-features
+      - name: Build the TestSynth fixture bundle
+        shell: bash
+        run: |
+          cargo build -p vst3-host-testplug --release
+          bash scripts/bundle-test-plugin.sh
+      # windows-latest runs the job in an interactive desktop session, so the HWND editor path
+      # (CreateWindowExW, GetDpiForWindow, the plugin's resizeView answered with SetWindowPos)
+      # runs for real rather than only compiling.
+      - name: Editor smoke (TestSynth)
+        run: cargo run -p vst3-host --example editor_smoke -- test_plugins/TestSynth.vst3
+      - name: Editor + resize regression tests
+        run: |
+          cargo test -p vst3-host --all-features --test editor_open_tests -- --ignored --nocapture
+          cargo test -p vst3-host --all-features --test feature_coverage_tests -- --ignored --nocapture --test-threads=1 test_testsynth
 
   # MSRV: verify the declared rust-version (1.85) builds the default-feature crate.
   # (egui-widgets is intentionally excluded — egui/eframe 0.34 require Rust 1.92.)
