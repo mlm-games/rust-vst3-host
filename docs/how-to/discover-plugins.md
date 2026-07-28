@@ -154,6 +154,35 @@ println!("{} by {}", detailed.info.name, detailed.factory.vendor);
 println!("{} classes, {} audio output buses", detailed.classes.len(), detailed.buses.audio_outputs.len());
 ```
 
+## Read a module's declared metadata without loading it
+
+A VST3 module may ship a `moduleinfo.json` describing its factory, classes, snapshots, and
+which retired class ids each class supersedes. Reading it means no plugin code runs at all:
+
+```rust
+# fn main() -> vst3_host::Result<()> {
+# let path = std::path::Path::new("/path/plugin.vst3");
+if let Some(module) = vst3_host::discovery::read_module_info(path)? {
+    for class in &module.classes {
+        println!("{} ({})", class.name, class.class_id);
+    }
+}
+# Ok(())
+# }
+```
+
+Everything in it is bounded and validated before it is handed back, so a malformed or
+hostile file is rejected rather than parsed. When the file is absent,
+`discovery::get_plugin_compatibility` falls back to loading the factory and asking its
+`IPluginCompatibility` class instead.
+
+**Class ids move between plugin versions.** If a saved session's class id no longer exists,
+`ModuleInfo::resolve_class_id` maps it to the class that replaced it, and
+`Vst3Host::load_plugin_class` loads that specific class from a factory that exports several.
+
+For a plugin's standard UI thumbnails, `discovery::discover_plugin_snapshots` lists the
+snapshot PNGs by reading directory metadata — it never opens or decodes an image.
+
 ## Where it looks
 
 | Platform | Default scan directories |

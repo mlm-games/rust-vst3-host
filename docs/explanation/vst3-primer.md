@@ -38,11 +38,13 @@ gives the full per-bus layout.
 
 ## MIDI is mostly events, but not entirely
 
-Note on/off and polyphonic pressure are first-class VST3 events. Control change, pitch
-bend, and channel pressure are delivered through a legacy-controller mechanism (the library
-does this for you). Program changes are *not* MIDI events in VST3 — they go through program
-lists (`IUnitInfo`), which is why `MidiEvent::ProgramChange` isn't supported. See
-[Send MIDI](../how-to/send-midi.md).
+Note on/off and polyphonic pressure are first-class VST3 events. Control change, pitch bend
+and channel pressure are not: the plugin declares through `IMidiMapping` which of *its own
+parameters* each controller drives, and the host sends a parameter change instead. The
+library does that translation for you — and drops the controller if the plugin declares no
+mapping for it, because there is nothing valid to send. Program changes are not MIDI events
+either; they go through program lists (`IUnitInfo`), so `MidiEvent::ProgramChange` is routed
+to the root unit's program-change parameter. See [Send MIDI](../how-to/send-midi.md).
 
 ## Further reading
 

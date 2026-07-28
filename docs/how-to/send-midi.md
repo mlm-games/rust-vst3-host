@@ -32,6 +32,47 @@ plugin.send_midi_event(MidiEvent::PolyAftertouch { channel: MidiChannel::Ch1, no
 The `cc` module has named constants (`MODULATION`, `VOLUME`, `SUSTAIN`, `PAN`, …). Pitch
 bend is a 14-bit value (`0–16383`, center `8192`).
 
+### These become parameter changes, not MIDI events
+
+VST3 has no MIDI controller event. A plugin instead declares, through `IMidiMapping`, which
+of *its own parameters* each controller drives. So control change, pitch bend and channel
+aftertouch are translated: the library looks the controller up in the plugin's mapping table
+and queues a sample-accurate change to the mapped parameter (mirrored to the controller, so
+the plugin's editor follows along). Poly aftertouch is different — it is a first-class VST3
+event and is always delivered as one.
+
+| You send | The plugin receives |
+|---|---|
+| `ControlChange { controller: n }` | the parameter `IMidiMapping` maps controller `n` to, set to `value / 127` |
+| `PitchBend` | the parameter mapped to `kPitchBend`, set to `value / 16383` |
+| `ChannelAftertouch` | the parameter mapped to `kAfterTouch`, set to `pressure / 127` |
+| `PolyAftertouch` | a `kPolyPressureEvent` — a real VST3 event, no mapping needed |
+
+**A controller with no mapping is dropped.** If the plugin does not implement `IMidiMapping`,
+or implements it but returns nothing for that controller/channel, the event is discarded and
+`send_midi_cc` still returns `Ok(())` — there is nothing to send it as, and VST3 forbids
+putting legacy controller events on a component's input event list. Earlier versions of this
+library queued such events anyway; well-behaved plugins ignored them and the rest could
+misbehave.
+
+Check before you send, if it matters:
+
+```rust
+# use vst3_host::{simple, midi::cc};
+# fn main() -> vst3_host::Result<()> {
+# let plugin = simple::load_plugin("/x.vst3")?;
+// bus 0, channel 0 (zero-based), mod wheel
+match plugin.midi_cc_to_parameter(0, 0, cc::MODULATION as u16) {
+    Some(id) => println!("mod wheel drives parameter {id}"),
+    None => println!("this plugin does not map the mod wheel"),
+}
+# Ok(())
+# }
+```
+
+Mappings are cached at load and refreshed when the plugin asks for a restart, so the lookup
+costs nothing on the send path.
+
 ## Sample-accurate timing
 
 `send_midi_event` and `send_midi_note` deliver at the start of the next processed block.

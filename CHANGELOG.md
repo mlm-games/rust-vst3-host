@@ -6,6 +6,194 @@ All notable changes to `vst3-host` are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed (VST3 spec-compliance pass — behavior, some breaking)
+
+A pass over the whole host against the VST3 3.7 specification: every place the library
+guessed at a contract, sent a plugin something the spec forbids, or claimed a capability it
+did not have. Most of it is invisible — plugins simply behave correctly now. These are the
+parts that are visible from your code.
+
+- **MIDI CC, pitch bend and channel aftertouch are now parameter changes, not events
+  (breaking).** VST3 has no MIDI controller event: a plugin declares through `IMidiMapping`
+  which of *its own* parameters each controller drives. `send_midi_cc`,
+  `MidiEvent::PitchBend` and `MidiEvent::ChannelAftertouch` are looked up in that table and
+  queued as sample-accurate parameter automation. **A controller the plugin does not map is
+  now dropped** — silently, still returning `Ok(())` — because the previous code put
+  `kLegacyMIDICCOutEvent` entries on the component's *input* event list, which the spec
+  forbids; well-behaved plugins ignored them and the rest could misbehave. Plugins that
+  implement `IMidiMapping` (most do) respond correctly for the first time; plugins that don't
+  no longer receive controllers at all. Call `Plugin::midi_cc_to_parameter` first if you need
+  to know. Poly aftertouch is unaffected — it is a first-class VST3 event. `midi_panic` now
+  sends real note-offs for every tracked sounding note before routing CC 123/120/121 the same
+  way, so it works on plugins that map no controllers.
+- **`MidiEvent::ProgramChange` is a no-op on plugins without a program list (breaking).** It
+  used to return `Err`. Program changes are resolved through a cache built at load, so the
+  audio thread no longer scans `IUnitInfo` per event.
+- **`save_state` returns a different byte format (breaking on downgrade).** VST3 defines two
+  independent state streams and the library only ever saved one, so a restored plugin's
+  editor could disagree with its sound. The blob is now a versioned envelope
+  (`VST3HOST_STATE` magic, version, two lengths) carrying the component *and* controller
+  streams. Still opaque, still `Vec<u8>`; **blobs written by older versions still load**
+  (anything without the magic is treated as a bare component stream). Blobs written now are
+  not readable by older versions. `save_vstpreset` gained the matching `"Cont"` chunk
+  alongside `"Comp"`.
+- **Sidechain and aux buses no longer start active (breaking).** Bus activation at load now
+  honours `kDefaultActive` instead of switching every bus on. Secondary buses conventionally
+  omit that flag, so a sidechain input that used to receive audio now needs an explicit
+  `Plugin::set_bus_active`. An `activateBus` failure is a load error rather than a logged
+  warning.
+- **Windows class-id spelling fixed (breaking on Windows).** VST3 stores the first three GUID
+  fields in COM byte order on Windows; the library hex-encoded them in memory order, so
+  `PluginInfo::uid` was a byte-swapped non-canonical id there. It is now canonical on every
+  platform. The old spelling is still accepted when *matching* (preset class ids,
+  `load_plugin_class`), so existing presets load — but a Windows session keyed on the old uid
+  string will not compare equal.
+- **`get_parameter_changes` also reports processor-emitted automation.** `ProcessData`'s
+  `outputParameterChanges` were wired up but never read, so a plugin's own automation output
+  (LFOs, envelope followers, mapped CCs) was discarded. It is now drained into the same poll,
+  merged with editor edits rather than short-circuited by them, and marshalled across process
+  isolation (where the call previously always returned an empty `Vec`).
+- **Stepped parameters quantize per spec (breaking, silent).** `Parameter::step_index` /
+  `normalized_to_plain` truncate over `step_count + 1` buckets, as VST3 defines, instead of
+  rounding over `step_count`. Same inputs, different plain values on stepped parameters.
+- **`RtControl` and `AudioHandle` parameter changes no longer call the controller from the
+  audio callback.** `setParamNormalized` belongs to the main-thread domain; the audio path now
+  queues processor automation only, and the controller catches up from a bounded deferred-sync
+  queue the next time a control-thread call runs. A parameter set from the audio side reaches
+  the DSP immediately, the editor on the next control-thread touch.
+- **`DetailedPluginInfo` gained `module_info` and `compatibility` (breaking for struct
+  literals).** JSON round-trips are unaffected (both fields are `serde(default)`).
+- **Editor resize follows the spec callstack.** `IPlugFrame::resizeView` now calls
+  `IPlugView::onSize` back from inside the same call, as VST3 requires, and validates the
+  view pointer and rectangle instead of just acknowledging. `PluginWindow::is_open` /
+  `closed_by_user` may now enter plugin code (they service pending platform events);
+  `EmbeddedEditor` is `!Sync` because it caches the last negotiated size.
+- **Embedding a Wayland surface fails with an actionable error** naming the missing
+  `IWaylandHost`/`IWaylandFrame` support, instead of "expected an X11 handle".
+- **A preset load no longer claims to be a project load (breaking, silent).** VST3 lets a
+  plugin ask where the bytes it is being handed came from — the host attaches an
+  `IStreamAttributes` list to the `setState` stream and the plugin reads
+  `PresetAttributes::kStateType` off it (the SDK ships `Vst::Helpers::isProjectState()` for
+  exactly this). Every restore used to be tagged `StateType::kProject`, so a plugin could not
+  tell a `.vstpreset` load from a session restore and no source path was ever provided. Now:
+  `Plugin::load_state` still means a project restore (`kProject`, unchanged), while
+  `load_vstpreset` and `load_preset` tag the stream `StateType::kTrackPreset` and publish the
+  file's full path under `PresetAttributes::kFilePathStringType` (with the file's stem as
+  `IStreamAttributes::getFileName`). `kTrackPreset` is the choice because `kProject` *is* the
+  project case and `kDefault` is narrower than it reads — the SDK defines it as "restored from
+  a preset (marked as *default*) or the host wants to store a default state of the plug-in" —
+  so only `kTrackPreset` says "a preset file the user picked" without lying. A plugin that
+  restores differently for a preset than for a session will now do so. New public
+  `vst3_host::plugin::StateContext` and `Plugin::load_state_with_context` for hosts holding
+  preset bytes they loaded some other way; the context crosses process isolation, so an
+  isolated plugin's `setState` sees identical attributes. The isolation wire is skew-safe in
+  both directions — the new `LoadState` field is `serde(default)`, and a helper that predates
+  it ignores what it does not know and does the project restore it always did.
+
+### Added (VST3 spec-compliance pass)
+
+- **64-bit processing as a fallback.** The host negotiates `canProcessSampleSize` at load,
+  prefers `kSample32`, and drives the plugin in `kSample64` when it refuses 32-bit. Your
+  buffers stay `f32`; a plugin supporting neither now fails to load instead of being set up
+  wrong.
+- **`IComponentHandler2` tells the plugin the truth, and you can see what it asked for.**
+  `setDirty` / `requestOpenEditor` / `startGroupEdit` / `finishGroupEdit` used to return
+  "done" and discard the request. They are now queued and drained by
+  `Plugin::take_host_notifications`, joined there by `IUnitHandler`/`IUnitHandler2` (unit
+  selection, program-list changes), `IComponentHandler3` context menus (with
+  `execute_context_menu_item` / `dismiss_context_menu`) and `IProgress` reports. **Drain it
+  regularly**: the queue caps at 1024 and a full queue is refused back to the plugin with
+  `kResultFalse`. Note that this stream and `take_parameter_edits` are ordered only within
+  themselves — the group-edit brackets cannot yet be matched to the edits they enclose.
+- **Restart flags are readable and actionable.** `Plugin::take_restart_flags` gained
+  accessors for the remaining `kRestartFlags` (`midi_cc_assignment_changed`,
+  `note_expression_changed`, `io_titles_changed`, `prefetchable_support_changed`,
+  `routing_info_changed`, `keyswitch_changed`, `param_id_mapping_changed`), and the new
+  `Plugin::service_host_requests` performs the deactivate/re-setup/reactivate dance a latency
+  or I/O change requires. Both marshal across process isolation, where restart flags
+  previously always came back empty.
+- **`moduleinfo.json`, snapshots and class compatibility.** `discovery::read_module_info`
+  parses a module's declared metadata (bounded and validated before anything is loaded),
+  `discovery::get_plugin_compatibility` falls back to the factory's `IPluginCompatibility`
+  class, and `discovery::discover_plugin_snapshots` lists the standard UI snapshot PNGs by
+  reading directory metadata only. `Plugin::class_compatibility` / `replaced_class_ids` expose
+  the retired class ids a plugin supersedes, and `Vst3Host::load_plugin_class` loads a
+  specific class from a multi-class factory. These live in `vst3_host::discovery`; they are
+  not re-exported at the crate root.
+- **`IPluginFactory3`.** The host context is passed to the factory, and class metadata is read
+  as UTF-16 where available, so non-ASCII names and versions are no longer mangled.
+- **New plugin interfaces the host now speaks:** `IEditControllerHostEditing`
+  (`begin_host_edit` / `end_host_edit`), `IMidiLearn` (`send_midi_learn`), `IAutomationState`
+  (`set_automation_state`), `IRemapParamID` (`remap_parameter_id`, for loading a project saved
+  with an older version of a plugin), `IProgramListData` / `IUnitData` (`get_program_data` /
+  `set_program_data` / `get_unit_data` / `set_unit_data`), `IUnitInfo` unit selection
+  (`selected_unit` / `select_unit`, `program_pitch_names`), `IStreamAttributes` (host state
+  streams now declare their `StateType`), and `IDataExchange` — a bounded host-side queue with
+  `Plugin::take_data_exchange_blocks` for plugins that stream analysis data to their editor.
+  `IPlugInterfaceSupport` advertises exactly these, and no longer claims host-side interfaces
+  it has no business offering.
+- **Editor sizing and scaling.** `Plugin::editor_can_resize` / `resize_editor` negotiate a
+  size through `checkSizeConstraint` + `onSize` and return what the plugin accepted;
+  `Plugin::set_editor_scale_factor` offers a content scale through
+  `IPlugViewContentScaleSupport`. On Windows `PluginWindow` applies the window's DPI
+  automatically at open and on `WM_DPICHANGED` (serviced by the new
+  `PluginWindow::service_platform_events`). `EmbeddedEditor::try_set_rect` reports the
+  negotiated rectangle and `take_resize_request` surfaces plugin-initiated resizes.
+- **Full VST3 event I/O.** `PluginEvent` / `PluginEventData` carry every event type the spec
+  defines — including SysEx (`Plugin::send_sysex`, `send_sysex_at`), note expression text,
+  chord and scale events — in both directions (`take_output_events`, plus the lock-free
+  `output_event_handle`). `MidiEvent` remains the convenience layer over it.
+- **Per-bus audio.** `Plugin::audio_bus_layout`, `create_bus_audio_buffers` and
+  `process_bus_audio` let a host address a plugin's individual buses (sidechain in, multi-out)
+  instead of one flattened channel list.
+- `RtControl::service_teardown` — see the fix below.
+
+### Fixed (VST3 spec-compliance pass)
+
+- **A zero-sample flush handed the plugin audio buses it must not see.** VST3's parameter-only
+  `process()` call requires no bus counts and no channel pointers; both are now cleared for
+  that call and restored afterwards, including when the plugin reports failure.
+- **Bus arrangements were never negotiated.** The plugin's own advertised arrangements are now
+  fed back through `setBusArrangements` before the first `setupProcessing`, and again when it
+  raises an I/O restart, so a plugin that only finalizes its layout on that call is configured
+  rather than assumed.
+- **Component↔controller messages from the wrong thread vanished without trace.** VST3
+  requires `IConnectionPoint::notify` on the UI thread and the host's proxy drops anything
+  else, exactly as the SDK reference host does — but silently. The drops are now counted and
+  logged (first occurrence, then every 256th, plus a total when the plugin unloads), so a
+  plugin whose meters never update is diagnosable. The "UI thread" is the thread that loaded
+  the plugin; see [the threading model](docs/explanation/threading.md).
+- **The discovery host context could dangle during module unload.** `IPluginFactory3` stores
+  the `setHostContext` pointer in a module global without retaining it, and the host
+  application was declared after the module in all three discovery paths — so it dropped
+  first, leaving that global pointing at freed memory for the rest of teardown. It now
+  outlives the factory and the module.
+- **A dead isolation helper looked like "nothing to report".** The polling accessors
+  (`get_parameter_changes`, `take_parameter_edits`, `take_host_notifications`,
+  `take_data_exchange_blocks`, `take_restart_flags`, `latency_samples`, `tail_samples`,
+  `midi_cc_to_parameter`) turned a transport failure into an empty result. They still return
+  the same types, but now log the failure once per death; the crash itself continues to
+  surface from the next fallible command.
+- **`RealtimePluginRunner` could destroy a plugin on the audio thread.** Teardown is handed to
+  the thread that created the runner over a one-slot channel and serviced by
+  `RtControl::service_teardown`; a full or disconnected channel leaks rather than running COM
+  termination and unloading executable code from a real-time callback.
+- **An isolated load that killed the helper is retried once with a fresh helper.** Some real
+  plugins lose a race inside their own cold-start initialization and take the process down
+  with them: Dexed (JUCE) segfaults or aborts in `juce::MessageQueue::runLoopSourceCallback`,
+  dispatching an async update into an object whose construction has not finished, on ~6% of
+  cold loads in a fresh helper (measured 13 failures in 200 loads). Nothing the host does
+  provokes or prevents it. A helper that dies *during* `LoadPlugin` held nothing worth keeping
+  — its load never completed — so the load is now replayed once against a freshly spawned
+  helper (250 ms backoff, `log::warn!` with the crash detail). This covers the initial
+  isolated load, `Vst3Host::probe_plugin`, `Plugin::recover()` and the auto-recover respawn
+  alike, and it is bounded at one retry so a plugin that genuinely cannot load still errors
+  after two attempts. Only `LoadPlugin` is replayed — every other command runs against a
+  helper holding live plugin state a fresh process would not have. Separately, an auto-recover
+  attempt whose respawn+reload failed used to abandon the command outright; it now spends one
+  of `auto_recover_max_retries` and tries again, which is what that budget always claimed to
+  mean.
+
 ### Fixed (third pass — five parallel subsystem reviews)
 
 Five reviewers went over the whole workspace — COM internals, the realtime path, process
