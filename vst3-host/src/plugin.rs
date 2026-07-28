@@ -1,9 +1,12 @@
 //! VST3 plugin wrapper with safe API
 
 use crate::{
-    audio::{AudioBuffers, AudioLevels},
+    audio::{AudioBuffers, AudioBusLayout, AudioLevels, BusAudioBuffers},
     error::{Error, Result},
-    midi::{MidiChannel, MidiEvent},
+    midi::{
+        MidiChannel, MidiEvent, PluginEvent, PluginEventData, MAX_EVENT_PAYLOAD_BYTES,
+        MAX_EVENT_TEXT_UNITS,
+    },
     parameters::{Parameter, ParameterUpdate},
 };
 use crossbeam_queue::ArrayQueue;
@@ -22,17 +25,22 @@ use std::sync::{Arc, Mutex};
 /// crosses the boundary in the IPC responses instead).
 #[derive(Clone)]
 pub struct OutputMidiConsumer {
-    queue: Arc<ArrayQueue<MidiEvent>>,
+    queue: Arc<ArrayQueue<PluginEvent>>,
 }
 
 impl OutputMidiConsumer {
-    pub(crate) fn from_queue(queue: Arc<ArrayQueue<MidiEvent>>) -> Self {
+    pub(crate) fn from_queue(queue: Arc<ArrayQueue<PluginEvent>>) -> Self {
         Self { queue }
     }
 
     /// Pop the oldest emitted event, or `None` if none are queued. Lock-free.
     pub fn pop(&self) -> Option<MidiEvent> {
-        self.queue.pop()
+        while let Some(event) = self.queue.pop() {
+            if let Some(midi) = event.to_midi() {
+                return Some(midi);
+            }
+        }
+        None
     }
 
     /// Drain all currently queued events in emission order into a `Vec`. Lock-free pops; the
@@ -40,7 +48,33 @@ impl OutputMidiConsumer {
     /// the audio thread — use [`pop`](Self::pop) in a loop to stay allocation-free).
     pub fn drain(&self) -> Vec<MidiEvent> {
         let mut out = Vec::new();
-        while let Some(event) = self.queue.pop() {
+        while let Some(event) = self.pop() {
+            out.push(event);
+        }
+        out
+    }
+}
+
+/// A `Send` + `Sync` handle for draining every owned event a plugin emits.
+#[derive(Clone)]
+pub struct OutputEventConsumer {
+    queue: Arc<ArrayQueue<PluginEvent>>,
+}
+
+impl OutputEventConsumer {
+    pub(crate) fn from_queue(queue: Arc<ArrayQueue<PluginEvent>>) -> Self {
+        Self { queue }
+    }
+
+    /// Pop the oldest emitted event, or `None` if none are queued.
+    pub fn pop(&self) -> Option<PluginEvent> {
+        self.queue.pop()
+    }
+
+    /// Drain all currently queued events in emission order.
+    pub fn drain(&self) -> Vec<PluginEvent> {
+        let mut out = Vec::new();
+        while let Some(event) = self.pop() {
             out.push(event);
         }
         out
@@ -89,6 +123,181 @@ pub struct PluginPreset {
     pub state: Vec<u8>,
 }
 
+/// Why a plugin is being handed a state blob.
+///
+/// VST3 lets a plugin ask *where* the state it is being given came from: the host attaches an
+/// `IStreamAttributes` list to the `IBStream` it passes to `setState`, and the plugin reads the
+/// `PresetAttributes::kStateType` key from it. The SDK ships `Vst::Helpers::isProjectState()`
+/// for exactly this — it answers "yes" only for `StateType::kProject` and "this came from a
+/// preset" for every other value — and plugins use the answer to decide what to restore (a
+/// preset should not, for instance, drag a project's per-instance routing along with it).
+///
+/// Pass this to [`Plugin::load_state_with_context`]. [`Plugin::load_state`] uses
+/// [`StateContext::Project`]; [`Plugin::load_vstpreset`] and [`Plugin::load_preset`] use
+/// [`StateContext::Preset`] with the file they read.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum StateContext {
+    /// The blob is part of a host session/project restore.
+    ///
+    /// Tags the stream `StateType::kProject` — "the state is restored from a project loading
+    /// or it is saved in a project".
+    #[default]
+    Project,
+    /// The blob came from a standalone preset file.
+    ///
+    /// Tags the stream `StateType::kTrackPreset`. Of the three values the SDK defines,
+    /// `kProject` is explicitly the project case and `kDefault` is narrower than it looks —
+    /// "the state is restored from a preset (marked as *default*) or the host wants to store a
+    /// default state of the plug-in" — so claiming it for a preset the user picked would tell
+    /// the plugin this is its initialization patch. `kTrackPreset` ("the state is restored from
+    /// a track preset") is the SDK's remaining preset-file value, and it is what makes
+    /// `Vst::Helpers::isProjectState()` answer "came from a preset" rather than the
+    /// "host doesn't implement this" it returns when the attribute is missing entirely.
+    Preset {
+        /// Full path of the file the state was read from, when the caller knows it.
+        ///
+        /// Published as `PresetAttributes::kFilePathStringType` ("full file path string (if
+        /// available) where the preset comes from"); left off the stream when `None`.
+        ///
+        /// Text rather than a `PathBuf` because it is published as a UTF-16 stream attribute
+        /// and crosses the process-isolation boundary as JSON, neither of which can carry a
+        /// non-UTF-8 path. [`StateContext::preset_from_path`] does the lossy conversion once,
+        /// where it is visible.
+        path: Option<String>,
+    },
+}
+
+impl StateContext {
+    /// A preset load whose source file is unknown (state handed over in memory, say).
+    pub fn preset() -> Self {
+        Self::Preset { path: None }
+    }
+
+    /// A preset load from `path`, which the plugin will see as the stream's file path.
+    pub fn preset_from_path(path: impl AsRef<std::path::Path>) -> Self {
+        Self::Preset {
+            path: Some(path.as_ref().to_string_lossy().into_owned()),
+        }
+    }
+
+    /// The source file this state came from, when one is known.
+    pub fn file_path(&self) -> Option<&std::path::Path> {
+        match self {
+            Self::Project => None,
+            Self::Preset { path } => path.as_deref().map(std::path::Path::new),
+        }
+    }
+}
+
+/// The two independent state streams defined by VST3.
+///
+/// This stays private to the crate. Public callers continue to exchange an opaque `Vec<u8>`;
+/// the versioned envelope below lets that API preserve both streams while still accepting the
+/// raw component blobs returned by older releases.
+pub(crate) struct StateSnapshot {
+    pub component: Vec<u8>,
+    pub controller: Option<Vec<u8>>,
+}
+
+const STATE_SNAPSHOT_MAGIC: &[u8; 16] = b"VST3HOST_STATE\0\0";
+const STATE_SNAPSHOT_VERSION: u32 = 1;
+const STATE_SNAPSHOT_HEADER_SIZE: usize = 16 + 4 + 4 + 4;
+const NO_CONTROLLER_STATE: u32 = u32::MAX;
+/// Preserve the pre-envelope state capacity: component and controller payloads may together use
+/// the same 64 MiB that a host-provided `MemoryStream` permits.
+const MAX_STATE_SNAPSHOT_PAYLOAD_BYTES: usize =
+    crate::internal::com_implementations::MAX_STREAM_BYTES;
+pub(crate) const MAX_STATE_SNAPSHOT_BYTES: usize =
+    STATE_SNAPSHOT_HEADER_SIZE + MAX_STATE_SNAPSHOT_PAYLOAD_BYTES;
+
+pub(crate) fn encode_state_snapshot(snapshot: &StateSnapshot) -> Result<Vec<u8>> {
+    let component_len = u32::try_from(snapshot.component.len())
+        .map_err(|_| Error::Other("component state is too large".to_string()))?;
+    let controller_len = match snapshot.controller.as_ref() {
+        Some(state) => u32::try_from(state.len())
+            .map_err(|_| Error::Other("controller state is too large".to_string()))?,
+        None => NO_CONTROLLER_STATE,
+    };
+    let payload_size = snapshot
+        .component
+        .len()
+        .checked_add(snapshot.controller.as_ref().map_or(0, Vec::len))
+        .ok_or_else(|| Error::Other("plugin state size overflow".to_string()))?;
+    let total = STATE_SNAPSHOT_HEADER_SIZE
+        .checked_add(payload_size)
+        .ok_or_else(|| Error::Other("plugin state size overflow".to_string()))?;
+    if payload_size > MAX_STATE_SNAPSHOT_PAYLOAD_BYTES {
+        return Err(Error::Other(format!(
+            "combined plugin state payload is too large ({payload_size} bytes, maximum \
+             {MAX_STATE_SNAPSHOT_PAYLOAD_BYTES})"
+        )));
+    }
+
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(STATE_SNAPSHOT_MAGIC);
+    out.extend_from_slice(&STATE_SNAPSHOT_VERSION.to_le_bytes());
+    out.extend_from_slice(&component_len.to_le_bytes());
+    out.extend_from_slice(&controller_len.to_le_bytes());
+    out.extend_from_slice(&snapshot.component);
+    if let Some(controller) = snapshot.controller.as_ref() {
+        out.extend_from_slice(controller);
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_state_snapshot(data: &[u8]) -> Result<StateSnapshot> {
+    if !data.starts_with(STATE_SNAPSHOT_MAGIC) {
+        if data.len() > MAX_STATE_SNAPSHOT_PAYLOAD_BYTES {
+            return Err(Error::Other(format!(
+                "legacy component state is too large ({} bytes, maximum \
+                 {MAX_STATE_SNAPSHOT_PAYLOAD_BYTES})",
+                data.len()
+            )));
+        }
+        return Ok(StateSnapshot {
+            component: data.to_vec(),
+            controller: None,
+        });
+    }
+    if data.len() < STATE_SNAPSHOT_HEADER_SIZE {
+        return Err(Error::Other(
+            "truncated vst3-host state snapshot header".to_string(),
+        ));
+    }
+    let version = read_snapshot_u32(&data[16..20]);
+    if version != STATE_SNAPSHOT_VERSION {
+        return Err(Error::Other(format!(
+            "unsupported vst3-host state snapshot version {version}"
+        )));
+    }
+    let component_len = read_snapshot_u32(&data[20..24]) as usize;
+    let encoded_controller_len = read_snapshot_u32(&data[24..28]);
+    let controller_len =
+        (encoded_controller_len != NO_CONTROLLER_STATE).then_some(encoded_controller_len as usize);
+    let payload_size = component_len
+        .checked_add(controller_len.unwrap_or(0))
+        .ok_or_else(|| Error::Other("plugin state size overflow".to_string()))?;
+    let expected = STATE_SNAPSHOT_HEADER_SIZE
+        .checked_add(payload_size)
+        .ok_or_else(|| Error::Other("plugin state size overflow".to_string()))?;
+    if expected != data.len() || expected > MAX_STATE_SNAPSHOT_BYTES {
+        return Err(Error::Other(format!(
+            "invalid vst3-host state snapshot size (header describes {expected} bytes, got {})",
+            data.len()
+        )));
+    }
+    let component_start = STATE_SNAPSHOT_HEADER_SIZE;
+    let component_end = component_start + component_len;
+    Ok(StateSnapshot {
+        component: data[component_start..component_end].to_vec(),
+        controller: controller_len.map(|len| data[component_end..component_end + len].to_vec()),
+    })
+}
+
+fn read_snapshot_u32(bytes: &[u8]) -> u32 {
+    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
 /// A plugin unit (from `IUnitInfo`) and its program list, if any.
 ///
 /// Units form a hierarchy (via [`parent_id`](Self::parent_id)); a unit may carry a named
@@ -101,8 +310,32 @@ pub struct PluginUnit {
     pub parent_id: i32,
     /// Unit display name.
     pub name: String,
+    /// Program-list id associated with this unit, or `None` when it has no program list.
+    pub program_list_id: Option<i32>,
     /// Program names in this unit's program list (empty if the unit has none).
     pub programs: Vec<String>,
+}
+
+/// A plugin-provided name for a MIDI pitch in a particular program.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProgramPitchName {
+    /// MIDI pitch number (`0..=127`).
+    pub midi_pitch: i16,
+    /// Plugin-provided display name.
+    pub name: String,
+}
+
+/// Host automation mode reported to controllers implementing `IAutomationState`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum AutomationState {
+    /// Automation is disabled.
+    Off,
+    /// Read existing automation.
+    Read,
+    /// Write automation.
+    Write,
+    /// Read and write automation.
+    ReadWrite,
 }
 
 /// What kind of parameter-edit gesture event a plugin's editor reported.
@@ -139,15 +372,193 @@ pub struct ParameterEdit {
     pub value: Option<f64>,
 }
 
+/// A control-plane action requested by a plugin through `IComponentHandler2`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ProgressKind {
+    /// Deferred restoration of plugin state.
+    AsyncStateRestoration,
+    /// Work performed for the plugin's user interface.
+    UiBackgroundTask,
+    /// A newer SDK progress kind unknown to this host version.
+    Other(u32),
+}
+
+/// An equality-safe normalized progress value.
+///
+/// Construction rejects NaN, infinities, and values outside `0.0..=1.0`, allowing progress
+/// notifications to retain exact equality and lossless process-isolation serialization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProgressValue(u64);
+
+impl ProgressValue {
+    /// Construct a valid normalized progress value.
+    pub fn new(value: f64) -> Option<Self> {
+        (value.is_finite() && (0.0..=1.0).contains(&value)).then(|| Self(value.to_bits()))
+    }
+
+    /// Return the normalized floating-point value.
+    pub fn get(self) -> f64 {
+        f64::from_bits(self.0)
+    }
+}
+
+/// One entry in a context menu a plugin asked the host to display.
+///
+/// The [`item_id`](Self::item_id) is assigned by the host for one popup and is the value to pass
+/// to [`Plugin::execute_context_menu_item`]. The plugin's own `tag` is included for diagnostics;
+/// it is not necessarily unique.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ContextMenuItem {
+    /// Host-assigned id, unique within the containing popup.
+    pub item_id: u32,
+    /// Plugin-provided menu label.
+    pub name: String,
+    /// Plugin-provided command tag.
+    pub tag: i32,
+    /// Raw VST3 `IContextMenuItem::Flags` bits.
+    pub flags: i32,
+}
+
+impl ContextMenuItem {
+    /// Whether this entry is a separator.
+    pub fn is_separator(&self) -> bool {
+        self.flags & vst3::Steinberg::Vst::IContextMenuItem_::Flags_::kIsSeparator as i32 != 0
+    }
+
+    /// Whether this entry is disabled.
+    pub fn is_disabled(&self) -> bool {
+        self.flags & vst3::Steinberg::Vst::IContextMenuItem_::Flags_::kIsDisabled as i32 != 0
+    }
+
+    /// Whether this entry is checked.
+    pub fn is_checked(&self) -> bool {
+        self.flags & vst3::Steinberg::Vst::IContextMenuItem_::Flags_::kIsChecked as i32 != 0
+    }
+
+    /// Whether this entry begins a logical group.
+    pub fn is_group_start(&self) -> bool {
+        let group_start = vst3::Steinberg::Vst::IContextMenuItem_::Flags_::kIsGroupStart as i32;
+        self.flags & group_start == group_start
+    }
+
+    /// Whether this entry ends a logical group.
+    pub fn is_group_end(&self) -> bool {
+        let group_end = vst3::Steinberg::Vst::IContextMenuItem_::Flags_::kIsGroupEnd as i32;
+        self.flags & group_end == group_end
+    }
+}
+
+/// An owned snapshot sent by a plug-in through VST3's data-exchange API.
+///
+/// The plug-in-owned exchange block is only valid during the controller callback. The host
+/// copies it on a non-realtime thread, so values returned by
+/// [`Plugin::take_data_exchange_blocks`] remain valid after that callback returns.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DataExchangeBlock {
+    /// Host queue identifier assigned when the processor opened the queue.
+    pub queue_id: u32,
+    /// Processor-defined context identifier associated with the queue.
+    pub user_context_id: u32,
+    /// Queue-local block identifier.
+    pub block_id: u32,
+    /// Complete block payload.
+    #[serde(with = "crate::process_isolation::state_codec")]
+    pub data: Vec<u8>,
+}
+
+/// A control-plane action requested by a plugin through its host callbacks.
+///
+/// # Ordering
+///
+/// Notifications keep their order relative to each other, and so do the
+/// [`ParameterEdit`]s from [`Plugin::take_parameter_edits`] — but the two streams are buffered
+/// independently, so their relative order is not preserved. In particular, the
+/// [`GroupEditStarted`](Self::GroupEditStarted) / [`GroupEditFinished`](Self::GroupEditFinished)
+/// bracket cannot be correlated with the edits that fell inside it: treat it as "the plugin is
+/// currently in a grouped gesture", not as a delimiter around specific parameter edits.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum HostNotification {
+    /// The plugin changed whether its state needs saving.
+    DirtyChanged(bool),
+    /// The plugin asked the host to open an editor, optionally by view name.
+    OpenEditorRequested {
+        /// Requested view name, or `None` for the default editor.
+        name: Option<String>,
+    },
+    /// The plugin began a grouped edit.
+    GroupEditStarted,
+    /// The plugin finished a grouped edit.
+    GroupEditFinished,
+    /// The plugin selected a different unit in its own UI.
+    UnitSelectionChanged {
+        /// Newly selected unit id.
+        unit_id: i32,
+    },
+    /// A program list, or one program in it, changed in the plugin.
+    ProgramListChanged {
+        /// Program-list id.
+        list_id: i32,
+        /// Changed program, or `None` when the whole list changed.
+        program_index: Option<i32>,
+    },
+    /// The plugin changed its bus/channel-to-unit assignments.
+    UnitByBusChanged,
+    /// The plugin began a bounded progress operation.
+    ProgressStarted {
+        /// Host-assigned progress operation id.
+        id: u64,
+        /// Kind of work the plugin is performing.
+        kind: ProgressKind,
+        /// Optional plugin-provided description.
+        description: Option<String>,
+    },
+    /// The plugin updated an existing progress operation.
+    ProgressUpdated {
+        /// Host-assigned progress operation id.
+        id: u64,
+        /// Normalized progress in the inclusive `0.0..=1.0` range.
+        value: ProgressValue,
+    },
+    /// The plugin finished an existing progress operation.
+    ProgressFinished {
+        /// Host-assigned progress operation id.
+        id: u64,
+    },
+    /// The plugin populated a context menu and asked the host to display it.
+    ///
+    /// After showing the menu, call [`Plugin::execute_context_menu_item`] for the chosen entry,
+    /// or [`Plugin::dismiss_context_menu`] if it was dismissed. Either call releases the
+    /// plugin-owned menu targets retained for this popup.
+    ContextMenuRequested {
+        /// Host-assigned popup id.
+        menu_id: u64,
+        /// Parameter the menu belongs to, or `None` for a view-wide menu.
+        parameter_id: Option<u32>,
+        /// Horizontal popup coordinate in the plugin view.
+        x: i32,
+        /// Vertical popup coordinate in the plugin view.
+        y: i32,
+        /// Menu entries in display order.
+        items: Vec<ContextMenuItem>,
+    },
+}
+
+impl HostNotification {
+    pub(crate) fn invalidates_unit_cache(&self) -> bool {
+        matches!(
+            self,
+            Self::ProgramListChanged { .. } | Self::UnitByBusChanged
+        )
+    }
+}
+
 /// What a plugin asked the host to re-read, reported through `IComponentHandler::restartComponent`
 /// and drained with [`Plugin::take_restart_flags`].
 ///
 /// A plugin raises these when something about it changed behind the host's back — a preset load
 /// that renamed its parameters, a mode switch that changed its latency, an oversampling toggle
-/// that changed its bus layout. **This library records the flags but does not act on any of
-/// them**: reacting is the host's call, since only the host knows whether it can afford to
-/// re-read parameters or rebuild its graph mid-stream. Poll this alongside
-/// [`Plugin::take_parameter_edits`] and respond to the flags you care about:
+/// that changed its bus layout. Poll this alongside [`Plugin::take_parameter_edits`] and respond
+/// directly, or use [`Plugin::service_host_requests`] for lifecycle-sensitive changes:
 ///
 /// - [`param_values_changed`](Self::param_values_changed) — re-read values with
 ///   [`Plugin::get_parameters`].
@@ -185,6 +596,11 @@ impl RestartFlags {
         self.has(vst3::Steinberg::Vst::RestartFlags_::kParamValuesChanged)
     }
 
+    /// `kReloadComponent`: the component must be recreated by the outer host.
+    pub fn reload_component(self) -> bool {
+        self.has(vst3::Steinberg::Vst::RestartFlags_::kReloadComponent)
+    }
+
     /// `kParamTitlesChanged`: the parameter list itself changed (ids, names, ranges, count).
     pub fn param_titles_changed(self) -> bool {
         self.has(vst3::Steinberg::Vst::RestartFlags_::kParamTitlesChanged)
@@ -199,16 +615,91 @@ impl RestartFlags {
     pub fn io_changed(self) -> bool {
         self.has(vst3::Steinberg::Vst::RestartFlags_::kIoChanged)
     }
+
+    /// `kMidiCCAssignmentChanged`: controller-to-parameter mappings changed.
+    pub fn midi_cc_assignment_changed(self) -> bool {
+        self.has(vst3::Steinberg::Vst::RestartFlags_::kMidiCCAssignmentChanged)
+    }
+
+    /// `kNoteExpressionChanged`: note-expression metadata changed.
+    pub fn note_expression_changed(self) -> bool {
+        self.has(vst3::Steinberg::Vst::RestartFlags_::kNoteExpressionChanged)
+    }
+
+    /// `kIoTitlesChanged`: bus names changed.
+    pub fn io_titles_changed(self) -> bool {
+        self.has(vst3::Steinberg::Vst::RestartFlags_::kIoTitlesChanged)
+    }
+
+    /// `kPrefetchableSupportChanged`: prefetch support changed.
+    pub fn prefetchable_support_changed(self) -> bool {
+        self.has(vst3::Steinberg::Vst::RestartFlags_::kPrefetchableSupportChanged)
+    }
+
+    /// `kRoutingInfoChanged`: routing metadata changed.
+    pub fn routing_info_changed(self) -> bool {
+        self.has(vst3::Steinberg::Vst::RestartFlags_::kRoutingInfoChanged)
+    }
+
+    /// `kKeyswitchChanged`: keyswitch metadata changed.
+    pub fn keyswitch_changed(self) -> bool {
+        self.has(vst3::Steinberg::Vst::RestartFlags_::kKeyswitchChanged)
+    }
+
+    /// `kParamIDMappingChanged`: processor/controller parameter-id mappings changed.
+    pub fn param_id_mapping_changed(self) -> bool {
+        self.has(vst3::Steinberg::Vst::RestartFlags_::kParamIDMappingChanged)
+    }
 }
 
-/// How the plugin should run: real-time (live playback) or offline (faster-than-real-time
-/// bounce/render). Maps to VST3 `kRealtime` / `kOffline`; plugins may switch quality or
+#[cfg(test)]
+mod restart_flag_tests {
+    use super::RestartFlags;
+    use vst3::Steinberg::Vst::RestartFlags_ as Flags;
+
+    #[test]
+    fn exposes_every_vst3_restart_flag() {
+        let bits = Flags::kReloadComponent
+            | Flags::kIoChanged
+            | Flags::kParamValuesChanged
+            | Flags::kLatencyChanged
+            | Flags::kParamTitlesChanged
+            | Flags::kMidiCCAssignmentChanged
+            | Flags::kNoteExpressionChanged
+            | Flags::kIoTitlesChanged
+            | Flags::kPrefetchableSupportChanged
+            | Flags::kRoutingInfoChanged
+            | Flags::kKeyswitchChanged
+            | Flags::kParamIDMappingChanged;
+        let flags = RestartFlags::from_bits(bits);
+        assert!(flags.reload_component());
+        assert!(flags.io_changed());
+        assert!(flags.param_values_changed());
+        assert!(flags.latency_changed());
+        assert!(flags.param_titles_changed());
+        assert!(flags.midi_cc_assignment_changed());
+        assert!(flags.note_expression_changed());
+        assert!(flags.io_titles_changed());
+        assert!(flags.prefetchable_support_changed());
+        assert!(flags.routing_info_changed());
+        assert!(flags.keyswitch_changed());
+        assert!(flags.param_id_mapping_changed());
+    }
+}
+
+/// How the plugin should run: real-time, read-ahead prefetch, or offline rendering.
+/// Maps to VST3 `kRealtime` / `kPrefetch` / `kOffline`; plugins may switch quality or
 /// look-ahead accordingly. Defaults to [`ProcessMode::Realtime`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum ProcessMode {
     /// Real-time / live processing (the default; `kRealtime`).
     #[default]
     Realtime,
+    /// Real-time playback with data available ahead of the play cursor (`kPrefetch`).
+    ///
+    /// A plugin implementing VST3 `IPrefetchableSupport` may reject this mode when it reports
+    /// that it is never, or not yet, prefetchable.
+    Prefetch,
     /// Offline / non-real-time processing such as a render or bounce (`kOffline`).
     Offline,
 }
@@ -218,6 +709,7 @@ pub enum ProcessMode {
 pub struct Plugin {
     // Internal state is hidden from public API
     pub(crate) info: PluginInfo,
+    pub(crate) compatibility: Vec<crate::discovery::ClassCompatibility>,
     pub(crate) is_processing: bool,
     /// Configured sample rate (exposed via [`Plugin::sample_rate`]).
     pub(crate) sample_rate: f64,
@@ -240,10 +732,35 @@ pub(crate) trait PluginInternal: Send {
     fn set_parameter_at(&mut self, id: u32, value: f64, _sample_offset: i32) -> Result<()> {
         self.set_parameter(id, value)
     }
+    /// Queue automation for the processor without touching `IEditController`.
+    ///
+    /// Audio callbacks use this path because controller methods belong to the main-thread
+    /// domain. Implementations without a split component/controller path may fall back to the
+    /// ordinary setter.
+    fn queue_processor_parameter_at(
+        &mut self,
+        id: u32,
+        value: f64,
+        sample_offset: i32,
+    ) -> Result<()> {
+        self.set_parameter_at(id, value, sample_offset)
+    }
     fn get_parameter(&self, id: u32) -> Result<f64>;
     fn get_all_parameters(&self) -> Result<Vec<Parameter>>;
     fn format_parameter(&self, id: u32, normalized: f64) -> Result<String>;
     fn process(&mut self, buffers: &mut AudioBuffers) -> Result<()>;
+    /// Query the current per-bus channel counts and activation state.
+    fn audio_bus_layout(&self) -> Result<AudioBusLayout> {
+        Err(Error::Other(
+            "bus-aware audio processing is not supported for this plugin".to_string(),
+        ))
+    }
+    /// Process buffers while preserving VST3 bus boundaries.
+    fn process_buses(&mut self, _buffers: &mut BusAudioBuffers) -> Result<()> {
+        Err(Error::Other(
+            "bus-aware audio processing is not supported for this plugin".to_string(),
+        ))
+    }
     /// Re-run `setupProcessing` for a new sample rate / block size. Defaults to unsupported
     /// for implementations that don't support it.
     fn reconfigure(&mut self, _sample_rate: f64, _block_size: usize) -> Result<()> {
@@ -318,6 +835,27 @@ pub(crate) trait PluginInternal: Send {
     fn send_midi_event_at(&mut self, event: MidiEvent, _sample_offset: i32) -> Result<()> {
         self.send_midi_event(event)
     }
+    /// Send a fully owned VST3 event.
+    fn send_plugin_event(&mut self, _event: PluginEvent) -> Result<()> {
+        Err(Error::Other(
+            "owned VST3 events are not supported for this plugin".to_string(),
+        ))
+    }
+    /// Silence all notes currently tracked by the implementation.
+    fn midi_panic(&mut self) -> Result<()> {
+        for i in 0..16 {
+            if let Some(channel) = MidiChannel::from_index(i) {
+                for controller in [123, 120, 121] {
+                    self.send_midi_event(MidiEvent::ControlChange {
+                        channel,
+                        controller,
+                        value: 0,
+                    })?;
+                }
+            }
+        }
+        Ok(())
+    }
     /// Start a note and return a per-voice [`NoteId`] for targeting note-expression. Default:
     /// unsupported, for implementations that don't support per-note expression.
     fn note_on(
@@ -364,6 +902,20 @@ pub(crate) trait PluginInternal: Send {
     fn open_editor(&mut self, parent: *mut std::ffi::c_void) -> Result<()>;
     fn close_editor(&mut self) -> Result<()>;
     fn get_editor_size(&self) -> Result<(i32, i32)>;
+    /// Whether the editor accepts host-driven size changes.
+    fn editor_can_resize(&self) -> bool {
+        false
+    }
+    /// Ask the open editor to accept a host-driven size change. The returned size includes any
+    /// constraint adjustment made by the plugin.
+    fn resize_editor(&mut self, _width: i32, _height: i32) -> Result<(i32, i32)> {
+        Err(Error::Other("plugin editor is not resizable".to_string()))
+    }
+    /// Set the editor's logical-to-physical content scale. Returns `false` when the view does not
+    /// implement `IPlugViewContentScaleSupport`.
+    fn set_editor_scale_factor(&mut self, _factor: f32) -> Result<bool> {
+        Ok(false)
+    }
     /// Service the Linux `IRunLoop` registrations the plugin's editor made
     /// (fire due timers, dispatch ready file descriptors). No-op by default
     /// (non-Linux, or process isolation where the editor isn't bridged).
@@ -375,19 +927,47 @@ pub(crate) trait PluginInternal: Send {
     fn take_parameter_edits(&mut self) -> Vec<ParameterEdit> {
         Vec::new()
     }
+    /// Drain ordered requests reported through `IComponentHandler2`.
+    fn take_host_notifications(&mut self) -> Vec<HostNotification> {
+        Vec::new()
+    }
+    /// Dispatch any main-thread data-exchange blocks to the controller and drain owned host
+    /// snapshots. Background-dispatched queues are copied into the same bounded snapshot sink.
+    fn take_data_exchange_blocks(&mut self) -> Vec<DataExchangeBlock> {
+        Vec::new()
+    }
+    /// Execute one entry from a pending plugin context-menu popup.
+    fn execute_context_menu_item(&mut self, _menu_id: u64, _item_id: u32) -> Result<()> {
+        Err(Error::Other(
+            "plugin context menus are not supported".to_string(),
+        ))
+    }
+    /// Dismiss a pending plugin context-menu popup without choosing an entry.
+    fn dismiss_context_menu(&mut self, _menu_id: u64) -> Result<()> {
+        Err(Error::Other(
+            "plugin context menus are not supported".to_string(),
+        ))
+    }
     /// Take the `restartComponent` flags the plugin has raised since the last call. Defaults to
     /// empty for implementations that don't record them.
     fn take_restart_flags(&mut self) -> RestartFlags {
         RestartFlags::default()
     }
+    /// Drain and service restart requests which require a component lifecycle transition.
+    fn service_host_requests(&mut self) -> Result<RestartFlags> {
+        Ok(self.take_restart_flags())
+    }
     /// Take the MIDI events the plugin has emitted since the last call. Defaults to empty
     /// for implementations that don't capture output MIDI.
-    fn take_output_events(&self) -> Vec<MidiEvent> {
+    fn take_output_events(&self) -> Vec<PluginEvent> {
         Vec::new()
     }
     /// A lock-free handle for draining emitted MIDI from another thread. Defaults to `None`
     /// for implementations without a shared in-process queue (e.g. process isolation).
     fn output_midi_handle(&self) -> Option<OutputMidiConsumer> {
+        None
+    }
+    fn output_event_handle(&self) -> Option<OutputEventConsumer> {
         None
     }
     /// Enumerate the plugin's units and their program lists (`IUnitInfo`). Defaults to empty
@@ -402,6 +982,70 @@ pub(crate) trait PluginInternal: Send {
         Err(Error::Other(
             "program selection is not supported for this plugin".to_string(),
         ))
+    }
+    fn selected_unit(&self) -> Result<Option<i32>> {
+        Ok(None)
+    }
+    fn select_unit(&mut self, _unit_id: i32) -> Result<()> {
+        Err(Error::Other(
+            "unit selection is not supported for this plugin".to_string(),
+        ))
+    }
+    fn program_pitch_names(
+        &self,
+        _program_list_id: i32,
+        _program_index: i32,
+    ) -> Result<Vec<ProgramPitchName>> {
+        Ok(Vec::new())
+    }
+    fn get_program_data(
+        &self,
+        _program_list_id: i32,
+        _program_index: i32,
+    ) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+    fn set_program_data(
+        &mut self,
+        _program_list_id: i32,
+        _program_index: i32,
+        _data: &[u8],
+    ) -> Result<()> {
+        Err(Error::Other(
+            "program data is not supported for this plugin".to_string(),
+        ))
+    }
+    fn get_unit_data(&self, _unit_id: i32) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+    fn set_unit_data(&mut self, _unit_id: i32, _data: &[u8]) -> Result<()> {
+        Err(Error::Other(
+            "unit data is not supported for this plugin".to_string(),
+        ))
+    }
+    fn begin_host_edit(&mut self, _parameter_id: u32) -> Result<()> {
+        Err(Error::Other(
+            "host edit sessions are not supported for this plugin".to_string(),
+        ))
+    }
+    fn end_host_edit(&mut self, _parameter_id: u32) -> Result<()> {
+        Err(Error::Other(
+            "host edit sessions are not supported for this plugin".to_string(),
+        ))
+    }
+    fn send_midi_learn(&mut self, _bus: i32, _channel: i16, _controller: u16) -> Result<()> {
+        Err(Error::Other(
+            "MIDI learn is not supported for this plugin".to_string(),
+        ))
+    }
+    fn set_automation_state(&mut self, _state: AutomationState) -> Result<()> {
+        Err(Error::Other(
+            "automation state is not supported for this plugin".to_string(),
+        ))
+    }
+    /// Ask the controller to map a parameter id from a plugin class it replaces.
+    fn remap_parameter_id(&self, _old_plugin_uid: &str, _old_param_id: u32) -> Result<Option<u32>> {
+        Ok(None)
     }
     /// Processing latency in samples (`IAudioProcessor::getLatencySamples`). Defaults to 0.
     fn latency_samples(&self) -> u32 {
@@ -422,11 +1066,20 @@ pub(crate) trait PluginInternal: Send {
             "state save/restore is not supported".to_string(),
         ))
     }
-    /// Restore the plugin's state from a blob previously returned by [`Self::save_state`].
-    fn load_state(&mut self, _data: &[u8]) -> Result<()> {
+    /// Restore the plugin's state from a blob previously returned by [`Self::save_state`],
+    /// telling the plugin what kind of restore this is via the stream's attributes.
+    ///
+    /// This is the method implementors override; [`Self::load_state`] is the project-restore
+    /// shorthand that delegates here.
+    fn load_state_with_context(&mut self, _data: &[u8], _context: &StateContext) -> Result<()> {
         Err(Error::Other(
             "state save/restore is not supported".to_string(),
         ))
+    }
+    /// Restore the plugin's state from a blob previously returned by [`Self::save_state`],
+    /// as a project/session restore ([`StateContext::Project`]).
+    fn load_state(&mut self, data: &[u8]) -> Result<()> {
+        self.load_state_with_context(data, &StateContext::Project)
     }
     /// OS process id of the isolated helper, if this plugin runs out-of-process.
     fn helper_pid(&self) -> Option<u32> {
@@ -458,6 +1111,24 @@ impl Plugin {
     /// Get plugin information
     pub fn info(&self) -> &PluginInfo {
         &self.info
+    }
+
+    /// Current/retired class-id replacement mappings advertised by this plug-in.
+    ///
+    /// These come from `moduleinfo.json` when present, otherwise from the factory's optional
+    /// `IPluginCompatibility` class.
+    pub fn class_compatibility(&self) -> &[crate::discovery::ClassCompatibility] {
+        &self.compatibility
+    }
+
+    /// Retired class ids which this loaded audio class replaces.
+    pub fn replaced_class_ids(&self) -> &[String] {
+        self.compatibility
+            .iter()
+            .find(|mapping| {
+                crate::internal::utils::class_uid_matches(&mapping.new_class_id, &self.info.uid)
+            })
+            .map_or(&[], |mapping| mapping.old_class_ids.as_slice())
     }
 
     /// The sample rate (Hz) this plugin was configured with at load.
@@ -649,6 +1320,27 @@ impl Plugin {
             .set_parameter_at(id, value, sample_offset)
     }
 
+    /// Audio-thread automation path: queue a processor point without invoking the controller
+    /// or user callback. Values are validated on the control thread before commands enter the
+    /// playback rings; this defensive check keeps direct internal callers honest.
+    pub(crate) fn queue_processor_parameter_at(
+        &mut self,
+        id: u32,
+        value: f64,
+        sample_offset: i32,
+    ) -> Result<()> {
+        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+            return Err(Error::InvalidParameter(format!(
+                "Value {} is out of range [0.0, 1.0]",
+                value
+            )));
+        }
+        self.internal
+            .as_mut()
+            .ok_or_else(|| Error::Other("Plugin not initialized".to_string()))?
+            .queue_processor_parameter_at(id, value, sample_offset)
+    }
+
     /// Change the transport tempo (beats per minute) advertised to the plugin in the host
     /// `ProcessContext`, taking effect on the **next** processed block — even while the plugin
     /// is actively processing. Drives tempo-synced DSP (LFOs, synced delays, arpeggiators).
@@ -735,6 +1427,129 @@ impl Plugin {
             .as_mut()
             .ok_or_else(|| Error::Other("Plugin not initialized".to_string()))?
             .select_program(unit_id, program_index)
+    }
+
+    /// Return the unit currently selected by the plugin, or `None` without `IUnitInfo`.
+    pub fn selected_unit(&self) -> Result<Option<i32>> {
+        self.internal
+            .as_ref()
+            .ok_or_else(|| Error::Other("Plugin not initialized".to_string()))?
+            .selected_unit()
+    }
+
+    /// Select a unit through `IUnitInfo::selectUnit`.
+    pub fn select_unit(&mut self, unit_id: i32) -> Result<()> {
+        self.internal
+            .as_mut()
+            .ok_or_else(|| Error::Other("Plugin not initialized".to_string()))?
+            .select_unit(unit_id)
+    }
+
+    /// Query the plugin's MIDI-pitch names for one program.
+    pub fn program_pitch_names(
+        &self,
+        program_list_id: i32,
+        program_index: i32,
+    ) -> Result<Vec<ProgramPitchName>> {
+        self.internal
+            .as_ref()
+            .ok_or_else(|| Error::Other("Plugin not initialized".to_string()))?
+            .program_pitch_names(program_list_id, program_index)
+    }
+
+    /// Read opaque per-program data, or `None` when `IProgramListData` is absent/unsupported.
+    pub fn get_program_data(
+        &self,
+        program_list_id: i32,
+        program_index: i32,
+    ) -> Result<Option<Vec<u8>>> {
+        self.internal
+            .as_ref()
+            .ok_or_else(|| Error::Other("Plugin not initialized".to_string()))?
+            .get_program_data(program_list_id, program_index)
+    }
+
+    /// Restore opaque per-program data through `IProgramListData`.
+    pub fn set_program_data(
+        &mut self,
+        program_list_id: i32,
+        program_index: i32,
+        data: &[u8],
+    ) -> Result<()> {
+        self.internal
+            .as_mut()
+            .ok_or_else(|| Error::Other("Plugin not initialized".to_string()))?
+            .set_program_data(program_list_id, program_index, data)
+    }
+
+    /// Read opaque per-unit data, or `None` when `IUnitData` is absent/unsupported.
+    pub fn get_unit_data(&self, unit_id: i32) -> Result<Option<Vec<u8>>> {
+        self.internal
+            .as_ref()
+            .ok_or_else(|| Error::Other("Plugin not initialized".to_string()))?
+            .get_unit_data(unit_id)
+    }
+
+    /// Restore opaque per-unit data through `IUnitData`.
+    pub fn set_unit_data(&mut self, unit_id: i32, data: &[u8]) -> Result<()> {
+        self.internal
+            .as_mut()
+            .ok_or_else(|| Error::Other("Plugin not initialized".to_string()))?
+            .set_unit_data(unit_id, data)
+    }
+
+    /// Begin a controller-side host edit session for a parameter.
+    pub fn begin_host_edit(&mut self, parameter_id: u32) -> Result<()> {
+        self.internal
+            .as_mut()
+            .ok_or_else(|| Error::Other("Plugin not initialized".to_string()))?
+            .begin_host_edit(parameter_id)
+    }
+
+    /// End a controller-side host edit session previously begun with [`Self::begin_host_edit`].
+    pub fn end_host_edit(&mut self, parameter_id: u32) -> Result<()> {
+        self.internal
+            .as_mut()
+            .ok_or_else(|| Error::Other("Plugin not initialized".to_string()))?
+            .end_host_edit(parameter_id)
+    }
+
+    /// Notify a controller implementing `IMidiLearn` of live MIDI-controller input.
+    pub fn send_midi_learn(&mut self, bus: i32, channel: i16, controller: u16) -> Result<()> {
+        self.internal
+            .as_mut()
+            .ok_or_else(|| Error::Other("Plugin not initialized".to_string()))?
+            .send_midi_learn(bus, channel, controller)
+    }
+
+    /// Report the host's automation mode to a controller implementing `IAutomationState`.
+    pub fn set_automation_state(&mut self, state: AutomationState) -> Result<()> {
+        self.internal
+            .as_mut()
+            .ok_or_else(|| Error::Other("Plugin not initialized".to_string()))?
+            .set_automation_state(state)
+    }
+
+    /// Map a parameter id from an older/replaced plugin class through `IRemapParamID`.
+    ///
+    /// `old_plugin_uid` must be the canonical separator-free 32-hex-character VST3 class id.
+    /// Returns `None` when the controller does not implement remapping or has no mapping for
+    /// this class/id pair. On Windows the canonical id is converted to COM-compatible byte
+    /// order before the controller is called. Works both in-process and across isolation.
+    pub fn remap_parameter_id(
+        &self,
+        old_plugin_uid: &str,
+        old_param_id: u32,
+    ) -> Result<Option<u32>> {
+        if crate::internal::utils::parse_class_uid(old_plugin_uid).is_none() {
+            return Err(Error::InvalidParameter(
+                "plugin UID must contain exactly 32 hexadecimal characters".to_string(),
+            ));
+        }
+        self.internal
+            .as_ref()
+            .ok_or_else(|| Error::Other("Plugin not initialized".to_string()))?
+            .remap_parameter_id(old_plugin_uid, old_param_id)
     }
 
     /// The plugin's reported processing latency in samples (e.g. from look-ahead or
@@ -893,6 +1708,29 @@ impl Plugin {
             .send_midi_event_at(event, sample_offset)
     }
 
+    /// Send a fully owned VST3 event.
+    ///
+    /// This is the lossless event path for SysEx, note-expression text/integer values, chord,
+    /// and scale events. Pointer-backed data is owned by `event` and kept alive until the plugin
+    /// has consumed it.
+    pub fn send_plugin_event(&mut self, event: PluginEvent) -> Result<()> {
+        validate_plugin_event(&event)?;
+        self.internal
+            .as_mut()
+            .ok_or_else(|| Error::Other("Plugin not initialized".to_string()))?
+            .send_plugin_event(event)
+    }
+
+    /// Send MIDI SysEx bytes at block start.
+    pub fn send_sysex(&mut self, bytes: Vec<u8>) -> Result<()> {
+        self.send_plugin_event(PluginEvent::sysex(bytes))
+    }
+
+    /// Send MIDI SysEx bytes at a sample offset within the next process block.
+    pub fn send_sysex_at(&mut self, bytes: Vec<u8>, sample_offset: i32) -> Result<()> {
+        self.send_plugin_event(PluginEvent::sysex(bytes).at(sample_offset))
+    }
+
     /// Start a note and get a per-voice [`NoteId`](crate::midi::NoteId) handle for sending
     /// per-note (MPE-style) expression to that exact voice via
     /// [`send_note_expression`](Self::send_note_expression).
@@ -1046,6 +1884,54 @@ impl Plugin {
         Ok(())
     }
 
+    /// Return every audio bus's current channel count and activation state.
+    pub fn audio_bus_layout(&self) -> Result<AudioBusLayout> {
+        self.internal
+            .as_ref()
+            .ok_or_else(|| Error::Other("Plugin not initialized".to_string()))?
+            .audio_bus_layout()
+    }
+
+    /// Allocate a bus-aware silent buffer set matching the plug-in's current configuration.
+    ///
+    /// Do this on the control thread when configuring an audio stream, then reuse the returned
+    /// storage for every callback. If bus activation or arrangements change, query/create again.
+    pub fn create_bus_audio_buffers(&self, block_size: usize) -> Result<BusAudioBuffers> {
+        if block_size == 0 {
+            return Err(Error::Other(
+                "bus audio block size must be greater than zero".to_string(),
+            ));
+        }
+        Ok(BusAudioBuffers::new(
+            &self.audio_bus_layout()?,
+            block_size,
+            self.sample_rate,
+        ))
+    }
+
+    /// Process audio without flattening VST3 bus boundaries.
+    ///
+    /// The buffer set must contain every bus in index order, including inactive buses. Its
+    /// activation flags and channel counts are validated against the current component state.
+    /// Reuse a set created by [`Self::create_bus_audio_buffers`] for allocation-free in-process
+    /// steady-state processing.
+    pub fn process_bus_audio(&mut self, buffers: &mut BusAudioBuffers) -> Result<()> {
+        if !self.is_processing {
+            return Err(Error::NotProcessing);
+        }
+        self.internal
+            .as_mut()
+            .ok_or_else(|| Error::Other("Plugin not initialized".to_string()))?
+            .process_buses(buffers)?;
+        if let Ok(mut levels) = self.audio_levels.lock() {
+            levels.update_from_bus_buffers(&buffers.outputs);
+            if let Some(ref callback) = self.audio_callback {
+                callback(&levels);
+            }
+        }
+        Ok(())
+    }
+
     /// Get current output levels.
     ///
     /// Recovers automatically if the audio thread panicked while holding the lock
@@ -1069,12 +1955,8 @@ impl Plugin {
     /// # This callback runs on the caller's thread — including the audio thread
     ///
     /// It fires inline from `set_parameter`, so it runs on whichever thread made that call.
-    /// Driven through either playback path that is the **audio thread**:
-    /// [`AudioHandle`](crate::AudioHandle) applies queued parameter changes inside the audio
-    /// callback, and [`RealtimePluginRunner`](crate::RealtimePluginRunner) drains its command
-    /// ring there. Keep the body real-time safe — no allocation, no locks, no I/O, no
-    /// blocking on a UI thread. To drive a UI, push into a lock-free queue here and read it
-    /// from the UI thread, or poll [`Self::get_parameter_changes`] instead.
+    /// Playback-ring automation uses a processor-only queue and does not invoke this callback
+    /// (or `IEditController`) on the audio thread.
     pub fn on_parameter_change<F>(&mut self, callback: F)
     where
         F: Fn(u32, f64) + Send + 'static,
@@ -1142,6 +2024,37 @@ impl Plugin {
             .get_editor_size()
     }
 
+    /// Whether the plugin editor accepts host-driven resize requests.
+    ///
+    /// With an editor open this reads the live view. With no editor open it has to *create* a
+    /// throwaway view to ask, which costs on the order of milliseconds (~4.6 ms for Dexed) —
+    /// cache the answer rather than calling it per UI frame.
+    pub fn editor_can_resize(&self) -> bool {
+        self.internal
+            .as_ref()
+            .is_some_and(|internal| internal.editor_can_resize())
+    }
+
+    /// Resize the open plugin editor, honoring the plugin's size constraints.
+    ///
+    /// Returns the size the plugin accepted, which may differ from the requested dimensions.
+    pub fn resize_editor(&mut self, width: i32, height: i32) -> Result<(i32, i32)> {
+        self.internal
+            .as_mut()
+            .ok_or_else(|| Error::Other("Plugin not initialized".to_string()))?
+            .resize_editor(width, height)
+    }
+
+    /// Communicate the editor's logical-to-physical content scale.
+    ///
+    /// Returns `false` when the editor does not implement VST3 content-scale support.
+    pub fn set_editor_scale_factor(&mut self, factor: f32) -> Result<bool> {
+        self.internal
+            .as_mut()
+            .ok_or_else(|| Error::Other("Plugin not initialized".to_string()))?
+            .set_editor_scale_factor(factor)
+    }
+
     /// Collect several parameter changes with a [`ParameterUpdate`] and apply them in one call.
     ///
     /// # This batch is not atomic
@@ -1163,22 +2076,20 @@ impl Plugin {
 
     /// Send MIDI panic (all notes off, all sounds off, reset controllers)
     pub fn midi_panic(&mut self) -> Result<()> {
-        for i in 0..16 {
-            if let Some(channel) = MidiChannel::from_index(i) {
-                // All Notes Off
-                self.send_midi_cc(123, 0, channel)?;
-                // All Sounds Off
-                self.send_midi_cc(120, 0, channel)?;
-                // Reset All Controllers
-                self.send_midi_cc(121, 0, channel)?;
-            }
-        }
-        Ok(())
+        self.internal
+            .as_mut()
+            .ok_or_else(|| Error::Other("Plugin not initialized".to_string()))?
+            .midi_panic()
     }
 
-    /// Get parameter changes from plugin GUI
-    /// Returns a vector of (parameter_id, normalized_value) pairs
-    /// This should be called regularly to pick up parameter changes made through the plugin's GUI
+    /// Drain the parameter values that changed behind the host's back, as
+    /// `(parameter_id, normalized_value)` pairs.
+    ///
+    /// Two sources feed this: edits the plugin's **editor** reported through
+    /// `IComponentHandler::performEdit`, and points the **processor** wrote into its
+    /// `outputParameterChanges` queue during `process()` (a compressor's gain-reduction readout,
+    /// an internal LFO driving a visible control). Call it regularly — every UI frame — to keep
+    /// the host's own display in step with the plugin.
     pub fn get_parameter_changes(&self) -> Vec<(u32, f64)> {
         self.internal
             .as_ref()
@@ -1204,18 +2115,71 @@ impl Plugin {
             .unwrap_or_default()
     }
 
+    /// Drain ordered requests the plugin reported through `IComponentHandler2`.
+    pub fn take_host_notifications(&mut self) -> Vec<HostNotification> {
+        self.internal
+            .as_mut()
+            .map(|i| i.take_host_notifications())
+            .unwrap_or_default()
+    }
+
+    /// Dispatch and drain blocks sent through VST3's `IDataExchangeHandler`.
+    ///
+    /// Call this regularly on the plug-in's control/UI thread. Queues whose controller requested
+    /// background dispatch are delivered automatically, but their owned snapshots are drained
+    /// here too. Storage is bounded; when the host-side snapshot sink is full, newer snapshots
+    /// are dropped while controller delivery continues.
+    pub fn take_data_exchange_blocks(&mut self) -> Vec<DataExchangeBlock> {
+        self.internal
+            .as_mut()
+            .map(|i| i.take_data_exchange_blocks())
+            .unwrap_or_default()
+    }
+
+    /// Execute a plugin context-menu entry previously received through
+    /// [`Self::take_host_notifications`].
+    ///
+    /// A popup can be completed once. Calling this invokes the plugin-provided
+    /// `IContextMenuTarget` on the plugin control/UI thread and releases all targets retained for
+    /// that popup.
+    pub fn execute_context_menu_item(&mut self, menu_id: u64, item_id: u32) -> Result<()> {
+        self.internal
+            .as_mut()
+            .ok_or_else(|| Error::Other("Plugin not initialized".to_string()))?
+            .execute_context_menu_item(menu_id, item_id)
+    }
+
+    /// Dismiss a pending plugin context menu and release its retained targets.
+    pub fn dismiss_context_menu(&mut self, menu_id: u64) -> Result<()> {
+        self.internal
+            .as_mut()
+            .ok_or_else(|| Error::Other("Plugin not initialized".to_string()))?
+            .dismiss_context_menu(menu_id)
+    }
+
     /// Take the flags the plugin raised via `IComponentHandler::restartComponent` since the
     /// last call — its way of saying "something about me changed, re-read it".
     ///
-    /// Poll this next to [`Self::take_parameter_edits`] (e.g. each UI frame). The library
-    /// records the flags but acts on none of them; see [`RestartFlags`] for what each one asks
-    /// of the host. Returns an empty set for a plugin that hasn't raised anything, and for the
-    /// process-isolated path (flags are not marshalled across the boundary yet).
+    /// Poll this next to [`Self::take_parameter_edits`] (e.g. each UI frame). See
+    /// [`RestartFlags`] for what each one asks of the host. Returns an empty set for a plugin
+    /// that hasn't raised anything. Works across process isolation.
     pub fn take_restart_flags(&mut self) -> RestartFlags {
         self.internal
             .as_mut()
             .map(|i| i.take_restart_flags())
             .unwrap_or_default()
+    }
+
+    /// Service pending restart requests on the caller's control thread.
+    ///
+    /// Latency and I/O requests are applied through the required stop/deactivate/reactivate
+    /// lifecycle. The returned flags still describe every request; in particular,
+    /// [`RestartFlags::reload_component`] means the caller must replace this plugin instance.
+    pub fn service_host_requests(&mut self) -> Result<RestartFlags> {
+        self.internal
+            .as_mut()
+            .ok_or_else(|| Error::Other("Plugin not initialized".to_string()))?
+            .service_host_requests()
     }
 
     /// Take the MIDI events the plugin has emitted (e.g. from an arpeggiator or MPE
@@ -1231,6 +2195,19 @@ impl Plugin {
     pub fn take_output_midi(&self) -> Vec<MidiEvent> {
         self.internal
             .as_ref()
+            .map(|i| {
+                i.take_output_events()
+                    .into_iter()
+                    .filter_map(|event| event.to_midi())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Take every event the plugin has emitted, preserving SysEx and all VST3 event variants.
+    pub fn take_output_events(&self) -> Vec<crate::midi::OutputEvent> {
+        self.internal
+            .as_ref()
             .map(|i| i.take_output_events())
             .unwrap_or_default()
     }
@@ -1244,14 +2221,23 @@ impl Plugin {
         self.internal.as_ref().and_then(|i| i.output_midi_handle())
     }
 
+    /// Get a lock-free handle for draining all emitted VST3 events.
+    pub fn output_event_handle(&self) -> Option<OutputEventConsumer> {
+        self.internal.as_ref().and_then(|i| i.output_event_handle())
+    }
+
     /// Save the plugin's current state (parameters, internal settings, loaded preset) to
     /// an opaque byte blob.
     ///
-    /// The bytes are the plugin's own serialized state — treat them as opaque and pair them
-    /// with the plugin's identity ([`PluginInfo::uid`]); they only mean something to the
-    /// same plugin. Persist them to restore a patch later with [`Self::load_state`], or to
-    /// snapshot a session. Call this on the main thread (see the
-    /// [threading model](https://docs.rs/vst3-host)).
+    /// The blob is a versioned envelope holding the two streams VST3 defines — the component's
+    /// state and, for a plugin whose controller is a separate object, the controller's — not a
+    /// bare copy of either. Treat it as opaque and pair it with the plugin's identity
+    /// ([`PluginInfo::uid`]); it only means something to the same plugin, and only
+    /// [`Self::load_state`] can unpack it. (Blobs written by older releases, which were the raw
+    /// component stream, still load.) Persist it to restore a patch later, or to snapshot a
+    /// session. Call this on the main thread (see the
+    /// [threading model](https://docs.rs/vst3-host)). For a blob other VST3 hosts can read,
+    /// use [`Self::save_vstpreset`].
     ///
     /// Works both in-process and across process isolation (the state blob is marshalled over
     /// the IPC boundary). Returns an error for plugins that don't implement state saving.
@@ -1268,11 +2254,32 @@ impl Plugin {
     ///
     /// Passing bytes from a different plugin has undefined results (the plugin decides what
     /// to do with bytes it doesn't recognize). Call this on the main thread.
+    ///
+    /// The plugin is told this is a project/session restore ([`StateContext::Project`]). Use
+    /// [`Self::load_state_with_context`] when the bytes came from a preset file instead.
     pub fn load_state(&mut self, data: &[u8]) -> Result<()> {
         self.internal
             .as_mut()
             .ok_or_else(|| Error::Other("Plugin not initialized".to_string()))?
             .load_state(data)
+    }
+
+    /// Restore plugin state as [`Self::load_state`] does, and tell the plugin where the bytes
+    /// came from.
+    ///
+    /// VST3 plugins can read the context off the stream they are given (the SDK's
+    /// `Vst::Helpers::isProjectState()` does exactly that) and restore differently for a
+    /// session than for a preset. [`Self::load_vstpreset`] and [`Self::load_preset`] already
+    /// pass [`StateContext::Preset`] with the file they read; reach for this directly when
+    /// your host holds preset bytes it loaded some other way.
+    ///
+    /// Works both in-process and across process isolation — an isolated plugin's `setState`
+    /// sees the same attributes.
+    pub fn load_state_with_context(&mut self, data: &[u8], context: &StateContext) -> Result<()> {
+        self.internal
+            .as_mut()
+            .ok_or_else(|| Error::Other("Plugin not initialized".to_string()))?
+            .load_state_with_context(data, context)
     }
 
     /// Save this plugin's state to a file as a [`PluginPreset`] (JSON: the plugin's `uid`
@@ -1294,18 +2301,22 @@ impl Plugin {
     /// Load a [`PluginPreset`] file written by [`Self::save_preset`] and apply its state.
     /// Returns an error if the preset's `uid` doesn't match this plugin (loading another
     /// plugin's state is undefined).
+    ///
+    /// The plugin sees this as a preset load ([`StateContext::Preset`]) carrying `path`, not
+    /// as a session restore.
     pub fn load_preset<P: AsRef<std::path::Path>>(&mut self, path: P) -> Result<()> {
+        let path = path.as_ref();
         let bytes = std::fs::read(path).map_err(|e| Error::Other(format!("read preset: {e}")))?;
         let preset: PluginPreset = serde_json::from_slice(&bytes)
             .map_err(|e| Error::Other(format!("parse preset: {e}")))?;
-        if preset.uid != self.info().uid {
+        if !self.accepts_state_class_id(&preset.uid)? {
             return Err(Error::Other(format!(
                 "preset is for a different plugin ({}, expected {})",
                 preset.plugin_name,
                 self.info().name
             )));
         }
-        self.load_state(&preset.state)
+        self.load_state_with_context(&preset.state, &StateContext::preset_from_path(path))
     }
 
     /// Save this plugin's state to a standard Steinberg `.vstpreset` file.
@@ -1313,35 +2324,64 @@ impl Plugin {
     /// Unlike [`Self::save_preset`] (a JSON wrapper specific to this library), the
     /// `.vstpreset` container is the interchange format shared by VST3 hosts and plugins, so
     /// the file can be read by other hosts (and by the plugin's own preset browser). It wraps
-    /// the same opaque bytes from [`Self::save_state`] in a single `"Comp"` (component state)
-    /// chunk, tagged with this plugin's class id ([`PluginInfo::uid`]) so a loader can reject
-    /// presets from a different plugin. Call this on the main thread.
+    /// the component and optional controller streams from [`Self::save_state`] in `"Comp"` and
+    /// `"Cont"` chunks, tagged with this plugin's class id ([`PluginInfo::uid`]) so a loader can
+    /// reject presets from a different plugin. Call this on the main thread.
     pub fn save_vstpreset<P: AsRef<std::path::Path>>(&self, path: P) -> Result<()> {
-        let state = self.save_state()?;
-        let bytes = vstpreset::build(&self.info().uid, &state)?;
+        let state = decode_state_snapshot(&self.save_state()?)?;
+        let bytes = vstpreset::build(
+            &self.info().uid,
+            &state.component,
+            state.controller.as_deref(),
+        )?;
         std::fs::write(path, bytes).map_err(|e| Error::Other(format!("write vstpreset: {e}")))?;
         Ok(())
     }
 
-    /// Load a Steinberg `.vstpreset` file and apply its component state to this plugin.
+    /// Load a Steinberg `.vstpreset` file and apply its component and controller state.
     ///
     /// Parses the `.vstpreset` container written by [`Self::save_vstpreset`] (or another VST3
-    /// host), extracts the `"Comp"` (component state) chunk and passes it to
+    /// host), extracts the `"Comp"` and optional `"Cont"` chunks and passes them to
     /// [`Self::load_state`]. Returns an error if the file's magic is invalid, or if its class
     /// id doesn't match this plugin (loading another plugin's state is undefined). Call this
     /// on the main thread.
+    ///
+    /// The plugin is told this is a preset load ([`StateContext::Preset`]) and is given the
+    /// file's full path, the way a DAW's preset browser would — not the project-restore
+    /// context [`Self::load_state`] uses.
     pub fn load_vstpreset<P: AsRef<std::path::Path>>(&mut self, path: P) -> Result<()> {
+        let path = path.as_ref();
         let bytes =
             std::fs::read(path).map_err(|e| Error::Other(format!("read vstpreset: {e}")))?;
         let parsed = vstpreset::parse(&bytes)?;
-        if parsed.class_id != self.info().uid {
+        if !self.accepts_state_class_id(&parsed.class_id)? {
             return Err(Error::Other(format!(
                 "vstpreset is for a different plugin (class id {}, expected {})",
                 parsed.class_id,
                 self.info().uid
             )));
         }
-        self.load_state(&parsed.component_state)
+        let state = encode_state_snapshot(&StateSnapshot {
+            component: parsed.component_state,
+            controller: parsed.controller_state,
+        })?;
+        self.load_state_with_context(&state, &StateContext::preset_from_path(path))
+    }
+
+    /// Accept the current class id or a retired id which this bundle's moduleinfo declares as
+    /// replaced by the current class. This is deliberately evaluated from validated bundle
+    /// metadata rather than trusting a preset to name its own replacement.
+    fn accepts_state_class_id(&self, candidate: &str) -> Result<bool> {
+        if crate::internal::utils::class_uid_matches(&self.info().uid, candidate) {
+            return Ok(true);
+        }
+        Ok(self.compatibility.iter().any(|mapping| {
+            crate::internal::utils::class_uid_matches(&mapping.new_class_id, &self.info().uid)
+                && mapping
+                    .old_class_ids
+                    .iter()
+                    .any(|old| crate::internal::utils::class_uid_matches(old, candidate))
+        }))
     }
 
     /// The OS process id of the isolated helper hosting this plugin, or `None` if it runs
@@ -1503,6 +2543,134 @@ fn validate_midi_event(event: &MidiEvent) -> Result<()> {
     }
 }
 
+fn validate_plugin_event(event: &PluginEvent) -> Result<()> {
+    if event.bus_index < 0 {
+        return Err(Error::MidiError(format!(
+            "Invalid event bus index: {}",
+            event.bus_index
+        )));
+    }
+    if event.sample_offset < 0 {
+        return Err(Error::MidiError(format!(
+            "Invalid event sample offset: {}",
+            event.sample_offset
+        )));
+    }
+    if !event.ppq_position.is_finite() {
+        return Err(Error::MidiError(
+            "Event PPQ position must be finite".to_string(),
+        ));
+    }
+
+    let validate_channel = |channel: i16| {
+        if (0..16).contains(&channel) {
+            Ok(())
+        } else {
+            Err(Error::MidiError(format!(
+                "Invalid VST3 event channel: {channel}"
+            )))
+        }
+    };
+    let validate_pitch = |pitch: i16| {
+        if (0..=127).contains(&pitch) {
+            Ok(())
+        } else {
+            Err(Error::MidiError(format!(
+                "Invalid VST3 event pitch: {pitch}"
+            )))
+        }
+    };
+    let validate_normalized = |name: &str, value: f64| {
+        if value.is_finite() && (0.0..=1.0).contains(&value) {
+            Ok(())
+        } else {
+            Err(Error::MidiError(format!(
+                "{name} must be finite and normalized to [0.0, 1.0]"
+            )))
+        }
+    };
+
+    match &event.data {
+        PluginEventData::NoteOn {
+            channel,
+            pitch,
+            tuning,
+            velocity,
+            length,
+            ..
+        } => {
+            validate_channel(*channel)?;
+            validate_pitch(*pitch)?;
+            validate_normalized("note velocity", f64::from(*velocity))?;
+            if !tuning.is_finite() || *length < 0 {
+                return Err(Error::MidiError(
+                    "note tuning must be finite and length non-negative".to_string(),
+                ));
+            }
+            Ok(())
+        }
+        PluginEventData::NoteOff {
+            channel,
+            pitch,
+            velocity,
+            tuning,
+            ..
+        } => {
+            validate_channel(*channel)?;
+            validate_pitch(*pitch)?;
+            validate_normalized("note-off velocity", f64::from(*velocity))?;
+            if !tuning.is_finite() {
+                return Err(Error::MidiError(
+                    "note-off tuning must be finite".to_string(),
+                ));
+            }
+            Ok(())
+        }
+        PluginEventData::Data { data_type, bytes } => {
+            if *data_type != 0 {
+                return Err(Error::MidiError(format!(
+                    "Unsupported VST3 data event type: {data_type}"
+                )));
+            }
+            if bytes.len() > MAX_EVENT_PAYLOAD_BYTES {
+                return Err(Error::MidiError(format!(
+                    "Event payload is {} bytes; maximum is {MAX_EVENT_PAYLOAD_BYTES}",
+                    bytes.len()
+                )));
+            }
+            Ok(())
+        }
+        PluginEventData::PolyPressure {
+            channel,
+            pitch,
+            pressure,
+            ..
+        } => {
+            validate_channel(*channel)?;
+            validate_pitch(*pitch)?;
+            validate_normalized("poly pressure", f64::from(*pressure))
+        }
+        PluginEventData::NoteExpressionValue { value, .. } => {
+            validate_normalized("note-expression value", *value)
+        }
+        PluginEventData::NoteExpressionText { text, .. }
+        | PluginEventData::Chord { text, .. }
+        | PluginEventData::Scale { text, .. } => {
+            if text.len() > MAX_EVENT_TEXT_UNITS {
+                return Err(Error::MidiError(format!(
+                    "Event text is {} UTF-16 units; maximum is {MAX_EVENT_TEXT_UNITS}",
+                    text.len()
+                )));
+            }
+            Ok(())
+        }
+        PluginEventData::NoteExpressionIntValue { .. } => Ok(()),
+        PluginEventData::LegacyMidiCcOut { .. } => Err(Error::MidiError(
+            "Legacy MIDI CC events are plugin output only".to_string(),
+        )),
+    }
+}
+
 /// Platform-specific window handle
 pub struct WindowHandle(pub(crate) *mut std::ffi::c_void);
 
@@ -1510,7 +2678,10 @@ impl WindowHandle {
     /// Create from a raw window handle
     ///
     /// # Safety
-    /// The pointer must be a valid window handle for the platform
+    /// The pointer must be a valid window handle for the platform. On Linux this API currently
+    /// selects VST3's `X11EmbedWindowID` contract; a `wl_surface` is not accepted because VST 3.8
+    /// Wayland embedding additionally requires host-provided `IWaylandHost`/`IWaylandFrame`
+    /// services.
     pub unsafe fn from_raw(handle: *mut std::ffi::c_void) -> Self {
         Self(handle)
     }
@@ -1566,8 +2737,8 @@ impl WindowHandle {
 /// - Header (48 bytes): magic `b"VST3"` (4) + version `i32` = 1 (4) + 32-char ASCII class
 ///   id (the plugin's FUID hex) (32) + `i64` byte offset from the start of the file to the
 ///   chunk list (8).
-/// - Body: the chunk payloads, written back to back after the header. We write a single
-///   `"Comp"` (component state) chunk.
+/// - Body: the chunk payloads, written back to back after the header: required `"Comp"`
+///   component state and optional `"Cont"` controller state.
 /// - Chunk list (at the header's list offset): magic `b"List"` (4) + entry count `i32` (4),
 ///   then per entry: 4-byte chunk id + `i64` absolute offset + `i64` size.
 mod vstpreset {
@@ -1576,9 +2747,12 @@ mod vstpreset {
     const MAGIC: &[u8; 4] = b"VST3";
     const LIST_MAGIC: &[u8; 4] = b"List";
     const COMPONENT_CHUNK: &[u8; 4] = b"Comp";
+    const CONTROLLER_CHUNK: &[u8; 4] = b"Cont";
     const VERSION: i32 = 1;
     const CLASS_ID_LEN: usize = 32;
     const HEADER_SIZE: usize = 4 + 4 + CLASS_ID_LEN + 8;
+    const LIST_HEADER_SIZE: usize = 8;
+    const ENTRY_SIZE: usize = 20;
 
     /// A parsed `.vstpreset` container.
     pub(super) struct Parsed {
@@ -1586,42 +2760,63 @@ mod vstpreset {
         pub class_id: String,
         /// The bytes of the `"Comp"` (component state) chunk.
         pub component_state: Vec<u8>,
+        /// The bytes of the optional `"Cont"` (controller state) chunk.
+        pub controller_state: Option<Vec<u8>>,
     }
 
-    /// Build a `.vstpreset` file wrapping `component_state` in a single component chunk,
-    /// tagged with `class_id` (a 32-char ASCII FUID hex string).
-    pub(super) fn build(class_id: &str, component_state: &[u8]) -> Result<Vec<u8>> {
+    /// Build a `.vstpreset` file containing component and optional controller state.
+    pub(super) fn build(
+        class_id: &str,
+        component_state: &[u8],
+        controller_state: Option<&[u8]>,
+    ) -> Result<Vec<u8>> {
         let class_bytes = class_id.as_bytes();
-        if class_bytes.len() != CLASS_ID_LEN || !class_id.is_ascii() {
+        if class_bytes.len() != CLASS_ID_LEN
+            || !class_bytes.iter().all(|byte| byte.is_ascii_hexdigit())
+        {
             return Err(Error::Other(format!(
-                "vstpreset class id must be {CLASS_ID_LEN} ASCII chars, got {:?}",
+                "vstpreset class id must be {CLASS_ID_LEN} ASCII hex chars, got {:?}",
                 class_id
             )));
         }
 
         let comp_offset = HEADER_SIZE as i64;
         let comp_size = component_state.len() as i64;
-        let list_offset = HEADER_SIZE + component_state.len();
+        let controller_offset = HEADER_SIZE
+            .checked_add(component_state.len())
+            .ok_or_else(|| Error::Other("vstpreset size overflow".to_string()))?;
+        let list_offset = controller_offset
+            .checked_add(controller_state.map_or(0, <[u8]>::len))
+            .ok_or_else(|| Error::Other("vstpreset size overflow".to_string()))?;
+        let entry_count = if controller_state.is_some() { 2 } else { 1 };
 
-        let mut out = Vec::with_capacity(list_offset + 8 + 24);
+        let mut out = Vec::with_capacity(list_offset + LIST_HEADER_SIZE + entry_count * ENTRY_SIZE);
         // Header.
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&VERSION.to_le_bytes());
-        out.extend_from_slice(class_bytes);
+        out.extend(class_bytes.iter().map(u8::to_ascii_uppercase));
         out.extend_from_slice(&(list_offset as i64).to_le_bytes());
         // Body.
         out.extend_from_slice(component_state);
+        if let Some(controller) = controller_state {
+            out.extend_from_slice(controller);
+        }
         // Chunk list.
         out.extend_from_slice(LIST_MAGIC);
-        out.extend_from_slice(&1i32.to_le_bytes());
+        out.extend_from_slice(&(entry_count as i32).to_le_bytes());
         out.extend_from_slice(COMPONENT_CHUNK);
         out.extend_from_slice(&comp_offset.to_le_bytes());
         out.extend_from_slice(&comp_size.to_le_bytes());
+        if let Some(controller) = controller_state {
+            out.extend_from_slice(CONTROLLER_CHUNK);
+            out.extend_from_slice(&(controller_offset as i64).to_le_bytes());
+            out.extend_from_slice(&(controller.len() as i64).to_le_bytes());
+        }
 
         Ok(out)
     }
 
-    /// Parse a `.vstpreset` file, extracting the class id and the component-state chunk.
+    /// Parse a `.vstpreset` file, extracting component and optional controller state.
     pub(super) fn parse(bytes: &[u8]) -> Result<Parsed> {
         if bytes.len() < HEADER_SIZE {
             return Err(Error::Other("vstpreset too short for header".to_string()));
@@ -1641,6 +2836,11 @@ mod vstpreset {
         }
         let class_id = String::from_utf8(bytes[8..8 + CLASS_ID_LEN].to_vec())
             .map_err(|e| Error::Other(format!("vstpreset class id not UTF-8: {e}")))?;
+        if !class_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(Error::Other(
+                "vstpreset class id is not 32 ASCII hex characters".to_string(),
+            ));
+        }
         let list_offset = read_i64(&bytes[8 + CLASS_ID_LEN..HEADER_SIZE]);
         if list_offset < HEADER_SIZE as i64 || list_offset as usize > bytes.len() {
             return Err(Error::Other(format!(
@@ -1658,42 +2858,84 @@ mod vstpreset {
         if count < 0 {
             return Err(Error::Other("vstpreset negative entry count".to_string()));
         }
-        let mut cursor = 8;
+        let count = count as usize;
+        let list_size = LIST_HEADER_SIZE
+            .checked_add(
+                count
+                    .checked_mul(ENTRY_SIZE)
+                    .ok_or_else(|| Error::Other("vstpreset entry count overflow".to_string()))?,
+            )
+            .ok_or_else(|| Error::Other("vstpreset list size overflow".to_string()))?;
+        if list.len() < list_size {
+            return Err(Error::Other(
+                "vstpreset chunk-list entry truncated".to_string(),
+            ));
+        }
+
+        let body_end = list_offset as usize;
+        let mut cursor = LIST_HEADER_SIZE;
+        let mut component_state = None;
+        let mut controller_state = None;
+        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(count);
         for _ in 0..count {
-            if list.len() < cursor + 20 {
-                return Err(Error::Other(
-                    "vstpreset chunk-list entry truncated".to_string(),
-                ));
-            }
             let id = &list[cursor..cursor + 4];
             let offset = read_i64(&list[cursor + 4..cursor + 12]);
             let size = read_i64(&list[cursor + 12..cursor + 20]);
-            cursor += 20;
-            if id == COMPONENT_CHUNK {
-                if offset < 0 || size < 0 {
-                    return Err(Error::Other(
-                        "vstpreset component chunk has negative offset/size".to_string(),
-                    ));
+            cursor += ENTRY_SIZE;
+            if offset < HEADER_SIZE as i64 || size < 0 {
+                return Err(Error::Other(
+                    "vstpreset chunk has invalid offset/size".to_string(),
+                ));
+            }
+            let start = usize::try_from(offset)
+                .map_err(|_| Error::Other("vstpreset chunk offset overflow".to_string()))?;
+            let size = usize::try_from(size)
+                .map_err(|_| Error::Other("vstpreset chunk size overflow".to_string()))?;
+            let end = start
+                .checked_add(size)
+                .ok_or_else(|| Error::Other("vstpreset chunk size overflow".to_string()))?;
+            if end > body_end {
+                return Err(Error::Other(format!(
+                    "vstpreset chunk [{start}..{end}] is outside the payload body \
+                     [{HEADER_SIZE}..{body_end}]"
+                )));
+            }
+            if ranges
+                .iter()
+                .any(|&(other_start, other_end)| start < other_end && other_start < end)
+            {
+                return Err(Error::Other("vstpreset chunk payloads overlap".to_string()));
+            }
+            ranges.push((start, end));
+
+            match id {
+                id if id == COMPONENT_CHUNK => {
+                    if component_state.is_some() {
+                        return Err(Error::Other(
+                            "vstpreset has duplicate component chunks".to_string(),
+                        ));
+                    }
+                    component_state = Some(bytes[start..end].to_vec());
                 }
-                let start = offset as usize;
-                let end = start
-                    .checked_add(size as usize)
-                    .ok_or_else(|| Error::Other("vstpreset chunk size overflow".to_string()))?;
-                if end > bytes.len() {
-                    return Err(Error::Other(format!(
-                        "vstpreset component chunk [{start}..{end}] out of bounds (len {})",
-                        bytes.len()
-                    )));
+                id if id == CONTROLLER_CHUNK => {
+                    if controller_state.is_some() {
+                        return Err(Error::Other(
+                            "vstpreset has duplicate controller chunks".to_string(),
+                        ));
+                    }
+                    controller_state = Some(bytes[start..end].to_vec());
                 }
-                return Ok(Parsed {
-                    class_id,
-                    component_state: bytes[start..end].to_vec(),
-                });
+                _ => {}
             }
         }
-        Err(Error::Other(
-            "vstpreset has no component (\"Comp\") chunk".to_string(),
-        ))
+        let component_state = component_state.ok_or_else(|| {
+            Error::Other("vstpreset has no component (\"Comp\") chunk".to_string())
+        })?;
+        Ok(Parsed {
+            class_id,
+            component_state,
+            controller_state,
+        })
     }
 
     fn read_i32(b: &[u8]) -> i32 {
@@ -1726,6 +2968,7 @@ mod public_surface_tests {
                 has_midi_output: false,
                 has_gui: false,
             },
+            compatibility: Vec::new(),
             is_processing: false,
             sample_rate: 44_100.0,
             block_size: 512,
@@ -1903,9 +3146,9 @@ mod output_midi_consumer_tests {
         let consumer = OutputMidiConsumer::from_queue(q.clone());
 
         // force_push mirrors what process() does: when full, the oldest is dropped.
-        q.force_push(note(60));
-        q.force_push(note(61));
-        q.force_push(note(62)); // capacity 2 → drops note 60
+        q.force_push(note(60).into());
+        q.force_push(note(61).into());
+        q.force_push(note(62).into()); // capacity 2 → drops note 60
 
         assert_eq!(consumer.drain(), vec![note(61), note(62)]);
         // Drained: now empty.
@@ -1920,7 +3163,7 @@ mod output_midi_consumer_tests {
         // Push from another thread (the audio side is a different thread in practice).
         let producer = q.clone();
         std::thread::spawn(move || {
-            producer.force_push(note(64));
+            producer.force_push(note(64).into());
         })
         .join()
         .unwrap();
@@ -1930,14 +3173,18 @@ mod output_midi_consumer_tests {
 
 #[cfg(test)]
 mod vstpreset_tests {
-    use super::vstpreset;
+    use super::{
+        decode_state_snapshot, encode_state_snapshot, vstpreset, StateSnapshot,
+        STATE_SNAPSHOT_MAGIC,
+    };
 
     const TEST_CLASS_ID: &str = "0123456789ABCDEF0123456789ABCDEF";
 
     #[test]
     fn build_parse_round_trip() {
         let state = b"opaque plugin state \x00\x01\x02\xff bytes".to_vec();
-        let bytes = vstpreset::build(TEST_CLASS_ID, &state).expect("build");
+        let controller = b"controller-only state".to_vec();
+        let bytes = vstpreset::build(TEST_CLASS_ID, &state, Some(&controller)).expect("build");
 
         // Sanity-check the header layout.
         assert_eq!(&bytes[0..4], b"VST3");
@@ -1950,24 +3197,34 @@ mod vstpreset_tests {
         let parsed = vstpreset::parse(&bytes).expect("parse");
         assert_eq!(parsed.class_id, TEST_CLASS_ID);
         assert_eq!(parsed.component_state, state);
+        assert_eq!(parsed.controller_state, Some(controller));
     }
 
     #[test]
     fn round_trip_empty_state() {
-        let bytes = vstpreset::build(TEST_CLASS_ID, &[]).expect("build");
+        let bytes = vstpreset::build(TEST_CLASS_ID, &[], None).expect("build");
         let parsed = vstpreset::parse(&bytes).expect("parse");
         assert_eq!(parsed.class_id, TEST_CLASS_ID);
         assert!(parsed.component_state.is_empty());
+        assert!(parsed.controller_state.is_none());
+    }
+
+    #[test]
+    fn round_trip_empty_controller_state() {
+        let bytes = vstpreset::build(TEST_CLASS_ID, b"component", Some(&[])).expect("build");
+        let parsed = vstpreset::parse(&bytes).expect("parse");
+        assert_eq!(parsed.controller_state, Some(Vec::new()));
     }
 
     #[test]
     fn build_rejects_wrong_length_class_id() {
-        assert!(vstpreset::build("short", b"x").is_err());
+        assert!(vstpreset::build("short", b"x", None).is_err());
+        assert!(vstpreset::build("Z123456789ABCDEF0123456789ABCDEF", b"x", None).is_err());
     }
 
     #[test]
     fn parse_rejects_bad_magic() {
-        let mut bytes = vstpreset::build(TEST_CLASS_ID, b"x").expect("build");
+        let mut bytes = vstpreset::build(TEST_CLASS_ID, b"x", None).expect("build");
         bytes[0] = b'X';
         assert!(vstpreset::parse(&bytes).is_err());
     }
@@ -1979,10 +3236,94 @@ mod vstpreset_tests {
 
     #[test]
     fn parse_rejects_out_of_bounds_list_offset() {
-        let mut bytes = vstpreset::build(TEST_CLASS_ID, b"hello").expect("build");
+        let mut bytes = vstpreset::build(TEST_CLASS_ID, b"hello", None).expect("build");
         // Corrupt the list offset (bytes 40..48) to point past the end.
         let bad = (bytes.len() as i64 + 100).to_le_bytes();
         bytes[40..48].copy_from_slice(&bad);
         assert!(vstpreset::parse(&bytes).is_err());
+    }
+
+    #[test]
+    fn parser_accepts_unknown_chunk_and_controller_before_component() {
+        let comp = b"component";
+        let cont = b"controller";
+        let unknown = b"metadata";
+        let body_len = comp.len() + cont.len() + unknown.len();
+        let list_offset = 48 + body_len;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"VST3");
+        bytes.extend_from_slice(&1i32.to_le_bytes());
+        bytes.extend_from_slice(TEST_CLASS_ID.as_bytes());
+        bytes.extend_from_slice(&(list_offset as i64).to_le_bytes());
+        bytes.extend_from_slice(comp);
+        bytes.extend_from_slice(cont);
+        bytes.extend_from_slice(unknown);
+        bytes.extend_from_slice(b"List");
+        bytes.extend_from_slice(&3i32.to_le_bytes());
+        for (id, offset, state) in [
+            (b"Cont", 48 + comp.len(), cont.as_slice()),
+            (b"Info", 48 + comp.len() + cont.len(), unknown.as_slice()),
+            (b"Comp", 48, comp.as_slice()),
+        ] {
+            bytes.extend_from_slice(id);
+            bytes.extend_from_slice(&(offset as i64).to_le_bytes());
+            bytes.extend_from_slice(&(state.len() as i64).to_le_bytes());
+        }
+        let parsed = vstpreset::parse(&bytes).expect("parse");
+        assert_eq!(parsed.component_state, comp);
+        assert_eq!(parsed.controller_state.as_deref(), Some(cont.as_slice()));
+    }
+
+    #[test]
+    fn parser_rejects_duplicate_or_overlapping_chunks() {
+        let mut duplicate =
+            vstpreset::build(TEST_CLASS_ID, b"component", Some(b"controller")).expect("build");
+        let list_offset = i64::from_le_bytes(duplicate[40..48].try_into().unwrap()) as usize;
+        duplicate[list_offset + 28..list_offset + 32].copy_from_slice(b"Comp");
+        assert!(vstpreset::parse(&duplicate).is_err());
+
+        let mut overlap =
+            vstpreset::build(TEST_CLASS_ID, b"component", Some(b"controller")).expect("build");
+        let list_offset = i64::from_le_bytes(overlap[40..48].try_into().unwrap()) as usize;
+        let comp_offset = i64::from_le_bytes(
+            overlap[list_offset + 12..list_offset + 20]
+                .try_into()
+                .unwrap(),
+        );
+        overlap[list_offset + 32..list_offset + 40]
+            .copy_from_slice(&(comp_offset + 1).to_le_bytes());
+        assert!(vstpreset::parse(&overlap).is_err());
+    }
+
+    #[test]
+    fn state_snapshot_round_trip_and_legacy_component_compatibility() {
+        let snapshot = StateSnapshot {
+            component: b"component".to_vec(),
+            controller: Some(b"controller".to_vec()),
+        };
+        let bytes = encode_state_snapshot(&snapshot).expect("encode");
+        assert!(bytes.starts_with(STATE_SNAPSHOT_MAGIC));
+        let decoded = decode_state_snapshot(&bytes).expect("decode");
+        assert_eq!(decoded.component, snapshot.component);
+        assert_eq!(decoded.controller, snapshot.controller);
+
+        let legacy = decode_state_snapshot(b"old raw component blob").expect("legacy");
+        assert_eq!(legacy.component, b"old raw component blob");
+        assert!(legacy.controller.is_none());
+    }
+
+    #[test]
+    fn state_snapshot_rejects_bad_lengths_and_versions() {
+        let snapshot = StateSnapshot {
+            component: b"component".to_vec(),
+            controller: Some(b"controller".to_vec()),
+        };
+        let mut bytes = encode_state_snapshot(&snapshot).expect("encode");
+        bytes[16..20].copy_from_slice(&2u32.to_le_bytes());
+        assert!(decode_state_snapshot(&bytes).is_err());
+
+        let mut bytes = encode_state_snapshot(&snapshot).expect("encode");
+        bytes[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decode_state_snapshot(&bytes).is_err());
     }
 }

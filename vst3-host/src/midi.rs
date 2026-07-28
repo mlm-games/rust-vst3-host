@@ -159,6 +159,290 @@ pub enum MidiEvent {
     },
 }
 
+/// Maximum pointer-backed payload accepted for one VST3 event.
+///
+/// This bounds both in-process plugin output and process-isolation messages. A SysEx message
+/// larger than this is rejected instead of allowing an untrusted plugin or IPC peer to force an
+/// unbounded allocation in the host.
+pub const MAX_EVENT_PAYLOAD_BYTES: usize = 1024 * 1024;
+
+/// Maximum UTF-16 code units accepted from a pointer-backed VST3 event.
+pub const MAX_EVENT_TEXT_UNITS: usize = 16 * 1024;
+
+/// A fully owned VST3 event.
+///
+/// Unlike the SDK's raw `Event` union, pointer-backed payloads live in this value and remain safe
+/// to queue, move between threads, or serialize across process isolation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PluginEvent {
+    /// Event-bus index.
+    pub bus_index: i32,
+    /// Sample offset within the next process block.
+    pub sample_offset: i32,
+    /// Musical position in quarter notes, when known.
+    pub ppq_position: f64,
+    /// Raw VST3 event flags.
+    pub flags: u16,
+    /// Event payload.
+    pub data: PluginEventData,
+}
+
+/// An event emitted by a plugin.
+///
+/// Input and output use the same owned representation, so this alias mainly documents direction
+/// at API boundaries such as [`Plugin::take_output_events`](crate::Plugin::take_output_events).
+pub type OutputEvent = PluginEvent;
+
+/// The owned payload of a [`PluginEvent`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+#[allow(missing_docs)]
+pub enum PluginEventData {
+    /// VST3 note-on event.
+    NoteOn {
+        channel: i16,
+        pitch: i16,
+        tuning: f32,
+        velocity: f32,
+        length: i32,
+        note_id: i32,
+    },
+    /// VST3 note-off event.
+    NoteOff {
+        channel: i16,
+        pitch: i16,
+        velocity: f32,
+        note_id: i32,
+        tuning: f32,
+    },
+    /// Pointer-backed data event. VST3 currently defines data type `0` as MIDI SysEx.
+    Data { data_type: u32, bytes: Vec<u8> },
+    /// Polyphonic pressure.
+    PolyPressure {
+        channel: i16,
+        pitch: i16,
+        pressure: f32,
+        note_id: i32,
+    },
+    /// Floating-point per-note expression.
+    NoteExpressionValue {
+        type_id: u32,
+        note_id: i32,
+        value: f64,
+    },
+    /// UTF-16 per-note expression text.
+    NoteExpressionText {
+        type_id: u32,
+        note_id: i32,
+        text: Vec<u16>,
+    },
+    /// Integer per-note expression.
+    NoteExpressionIntValue {
+        type_id: u32,
+        note_id: i32,
+        value: u64,
+    },
+    /// Chord event with owned UTF-16 display text.
+    Chord {
+        root: i16,
+        bass_note: i16,
+        mask: i16,
+        text: Vec<u16>,
+    },
+    /// Scale event with owned UTF-16 display text.
+    Scale {
+        root: i16,
+        mask: i16,
+        text: Vec<u16>,
+    },
+    /// Legacy MIDI output event. This is valid only as plugin output.
+    LegacyMidiCcOut {
+        control_number: u8,
+        channel: i8,
+        value: u8,
+        value2: u8,
+    },
+}
+
+impl PluginEvent {
+    /// Construct a MIDI SysEx data event on bus 0 at block start.
+    pub fn sysex(bytes: Vec<u8>) -> Self {
+        Self {
+            bus_index: 0,
+            sample_offset: 0,
+            ppq_position: 0.0,
+            flags: 0,
+            data: PluginEventData::Data {
+                data_type: 0,
+                bytes,
+            },
+        }
+    }
+
+    /// Set the sample offset for this event.
+    pub fn at(mut self, sample_offset: i32) -> Self {
+        self.sample_offset = sample_offset;
+        self
+    }
+
+    /// Convert a channel-voice event into the compatibility [`MidiEvent`] model.
+    ///
+    /// SysEx, note-expression, chord, and scale events intentionally return `None`; callers that
+    /// need those events should use the owned event API.
+    pub fn to_midi(&self) -> Option<MidiEvent> {
+        let byte = |value: f32| (value * 127.0).round().clamp(0.0, 127.0) as u8;
+        match &self.data {
+            PluginEventData::NoteOn {
+                channel,
+                pitch,
+                velocity,
+                ..
+            } => Some(MidiEvent::NoteOn {
+                channel: MidiChannel::from_index(u8::try_from(*channel).ok()?)?,
+                note: u8::try_from(*pitch).ok().filter(|pitch| *pitch <= 127)?,
+                velocity: byte(*velocity),
+            }),
+            PluginEventData::NoteOff {
+                channel,
+                pitch,
+                velocity,
+                ..
+            } => Some(MidiEvent::NoteOff {
+                channel: MidiChannel::from_index(u8::try_from(*channel).ok()?)?,
+                note: u8::try_from(*pitch).ok().filter(|pitch| *pitch <= 127)?,
+                velocity: byte(*velocity),
+            }),
+            PluginEventData::PolyPressure {
+                channel,
+                pitch,
+                pressure,
+                ..
+            } => Some(MidiEvent::PolyAftertouch {
+                channel: MidiChannel::from_index(u8::try_from(*channel).ok()?)?,
+                note: u8::try_from(*pitch).ok().filter(|pitch| *pitch <= 127)?,
+                pressure: byte(*pressure),
+            }),
+            PluginEventData::LegacyMidiCcOut {
+                control_number,
+                channel,
+                value,
+                value2,
+            } => {
+                let channel = MidiChannel::from_index(u8::try_from(*channel).ok()?)?;
+                match u32::from(*control_number) {
+                    129 => Some(MidiEvent::PitchBend {
+                        channel,
+                        value: (u16::from(*value2 & 0x7f) << 7) | u16::from(*value & 0x7f),
+                    }),
+                    128 => Some(MidiEvent::ChannelAftertouch {
+                        channel,
+                        pressure: *value & 0x7f,
+                    }),
+                    130 => Some(MidiEvent::ProgramChange {
+                        channel,
+                        program: *value & 0x7f,
+                    }),
+                    cc if cc < 128 => Some(MidiEvent::ControlChange {
+                        channel,
+                        controller: cc as u8,
+                        value: *value & 0x7f,
+                    }),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Bytes owned by pointer-backed fields in this event.
+    pub(crate) fn payload_bytes(&self) -> usize {
+        match &self.data {
+            PluginEventData::Data { bytes, .. } => bytes.len(),
+            PluginEventData::NoteExpressionText { text, .. }
+            | PluginEventData::Chord { text, .. }
+            | PluginEventData::Scale { text, .. } => text.len().saturating_mul(2),
+            _ => 0,
+        }
+    }
+}
+
+impl From<MidiEvent> for PluginEvent {
+    fn from(event: MidiEvent) -> Self {
+        let data = match event {
+            MidiEvent::NoteOn {
+                channel,
+                note,
+                velocity,
+            } => PluginEventData::NoteOn {
+                channel: i16::from(channel.as_index()),
+                pitch: i16::from(note),
+                tuning: 0.0,
+                velocity: f32::from(velocity) / 127.0,
+                length: 0,
+                note_id: -1,
+            },
+            MidiEvent::NoteOff {
+                channel,
+                note,
+                velocity,
+            } => PluginEventData::NoteOff {
+                channel: i16::from(channel.as_index()),
+                pitch: i16::from(note),
+                velocity: f32::from(velocity) / 127.0,
+                note_id: -1,
+                tuning: 0.0,
+            },
+            MidiEvent::ControlChange {
+                channel,
+                controller,
+                value,
+            } => PluginEventData::LegacyMidiCcOut {
+                control_number: controller,
+                channel: channel.as_index() as i8,
+                value,
+                value2: 0,
+            },
+            MidiEvent::ProgramChange { channel, program } => PluginEventData::LegacyMidiCcOut {
+                control_number: 130,
+                channel: channel.as_index() as i8,
+                value: program,
+                value2: 0,
+            },
+            MidiEvent::PitchBend { channel, value } => PluginEventData::LegacyMidiCcOut {
+                control_number: 129,
+                channel: channel.as_index() as i8,
+                value: (value & 0x7f) as u8,
+                value2: ((value >> 7) & 0x7f) as u8,
+            },
+            MidiEvent::ChannelAftertouch { channel, pressure } => {
+                PluginEventData::LegacyMidiCcOut {
+                    control_number: 128,
+                    channel: channel.as_index() as i8,
+                    value: pressure,
+                    value2: 0,
+                }
+            }
+            MidiEvent::PolyAftertouch {
+                channel,
+                note,
+                pressure,
+            } => PluginEventData::PolyPressure {
+                channel: i16::from(channel.as_index()),
+                pitch: i16::from(note),
+                pressure: f32::from(pressure) / 127.0,
+                note_id: -1,
+            },
+        };
+        Self {
+            bus_index: 0,
+            sample_offset: 0,
+            ppq_position: 0.0,
+            flags: 0,
+            data,
+        }
+    }
+}
+
 /// An opaque per-voice handle returned by [`Plugin::note_on`](crate::Plugin::note_on), used to
 /// target note-expression events (and the note-off) at a specific sounding note — the basis for
 /// MPE-style per-note control.

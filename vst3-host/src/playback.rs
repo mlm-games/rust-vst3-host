@@ -70,7 +70,7 @@ impl AudioSideChannels {
                 let _ = plugin.send_midi_event_at(event, offset);
             }
             HybridCommand::Param { id, value } => {
-                let _ = plugin.set_parameter(id, value);
+                let _ = plugin.queue_processor_parameter_at(id, value, 0);
             }
             HybridCommand::Transport(change) => {
                 change.apply(plugin);
@@ -287,6 +287,20 @@ impl AudioHandle {
     /// value is rejected here (returns `false`) rather than queued, so the caller learns about
     /// it instead of the audio thread silently discarding it. Returns `false` if the ring is
     /// full.
+    ///
+    /// # The editor catches up later
+    ///
+    /// The audio thread applies the value to the plugin's DSP, but `IEditController` belongs to
+    /// the main-thread domain, so the plugin's *own editor* (and
+    /// [`Plugin::get_parameter`](crate::Plugin::get_parameter),
+    /// [`format_parameter`](crate::Plugin::format_parameter) and saved state) is updated from
+    /// the control thread instead. That happens the next time the control thread touches the
+    /// plugin — reading a parameter, draining
+    /// [`Plugin::get_parameter_changes`](crate::Plugin::get_parameter_changes), or calling
+    /// [`Plugin::service_host_requests`](crate::Plugin::service_host_requests). A host that
+    /// polls the plugin every UI frame (the usual editor loop) never notices the gap; a host
+    /// that never calls back in will see a stale editor. The queue is bounded and drops its
+    /// oldest entry when full, so the newest value for a parameter always wins.
     pub fn set_parameter(&self, id: u32, value: f64) -> bool {
         crate::realtime::is_normalized(value)
             && queue_command(&self.ui.control_tx, HybridCommand::Param { id, value })

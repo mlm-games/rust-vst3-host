@@ -82,9 +82,9 @@ pub mod midi_input;
 mod internal;
 
 pub use audio::{
-    read_wav, AudioBackend, AudioBuffers, AudioConfig, AudioLevels, AudioStream, BusArrangements,
-    BusDirection, ChannelLevel, InputSource, MediaType, PeakMeter, RmsWindow, SignalSource,
-    SpeakerArrangement,
+    read_wav, AudioBackend, AudioBuffers, AudioBusBuffer, AudioBusConfig, AudioBusLayout,
+    AudioConfig, AudioLevels, AudioStream, BusArrangements, BusAudioBuffers, BusDirection,
+    ChannelLevel, InputSource, MediaType, PeakMeter, RmsWindow, SignalSource, SpeakerArrangement,
 };
 pub use discovery::{
     discover_plugins_safe, get_detailed_plugin_info, probe_plugin_info_isolated, BusInfo,
@@ -95,7 +95,10 @@ pub use discovery::{
 pub use embed::{EditorRect, EmbeddedEditor};
 pub use error::{Error, Result};
 pub use host::{DiscoveryProgress, ProbeResult, Vst3Host, Vst3HostBuilder};
-pub use midi::{cc, MidiChannel, MidiEvent, NoteExpressionInfo, NoteExpressionType, NoteId};
+pub use midi::{
+    cc, MidiChannel, MidiEvent, NoteExpressionInfo, NoteExpressionType, NoteId, OutputEvent,
+    PluginEvent, PluginEventData,
+};
 #[cfg(feature = "midi-input")]
 pub use midi_input::{
     bind_to_handle, connect, list_midi_input_ports, MidiInputConnection, MidiInputPort,
@@ -108,8 +111,9 @@ pub use playback::{
     RtAudioHandle,
 };
 pub use plugin::{
-    OutputMidiConsumer, ParameterEdit, ParameterEditKind, Plugin, PluginInfo, PluginPreset,
-    PluginUnit, ProcessMode, RestartFlags, WindowHandle,
+    AutomationState, ContextMenuItem, DataExchangeBlock, HostNotification, OutputMidiConsumer,
+    ParameterEdit, ParameterEditKind, Plugin, PluginInfo, PluginPreset, PluginUnit, ProcessMode,
+    ProgramPitchName, ProgressKind, ProgressValue, RestartFlags, StateContext, WindowHandle,
 };
 pub use realtime::{RealtimePluginRunner, RtControl};
 pub use transport::{AutomationLane, BlockEvents, MidiClip, Timeline};
@@ -119,8 +123,9 @@ pub use window::PluginWindow;
 pub mod prelude {
     pub use crate::{
         audio::{
-            AudioBackend, AudioBuffers, AudioConfig, AudioLevels, AudioStream, BusArrangements,
-            BusDirection, ChannelLevel, InputSource, MediaType, PeakMeter, RmsWindow, SignalSource,
+            AudioBackend, AudioBuffers, AudioBusBuffer, AudioBusConfig, AudioBusLayout,
+            AudioConfig, AudioLevels, AudioStream, BusArrangements, BusAudioBuffers, BusDirection,
+            ChannelLevel, InputSource, MediaType, PeakMeter, RmsWindow, SignalSource,
             SpeakerArrangement,
         },
         // NOTE: `Result` is intentionally NOT re-exported here. A single-type-param
@@ -128,10 +133,18 @@ pub mod prelude {
         // any `Result<T, E>` written by consumers. Use `vst3_host::Result` explicitly.
         error::Error,
         host::{DiscoveryProgress, Vst3Host, Vst3HostBuilder},
-        midi::{cc, MidiChannel, MidiEvent, NoteExpressionInfo, NoteExpressionType, NoteId},
+        midi::{
+            cc, MidiChannel, MidiEvent, NoteExpressionInfo, NoteExpressionType, NoteId,
+            OutputEvent, PluginEvent, PluginEventData,
+        },
         parameters::{AutomationCurve, AutomationPoint, Parameter, ParameterAutomation},
         playback::{play_with_backend, AudioHandle},
-        plugin::{ParameterEdit, ParameterEditKind, Plugin, PluginInfo, ProcessMode, WindowHandle},
+        plugin::{
+            AutomationState, ContextMenuItem, DataExchangeBlock, HostNotification,
+            OutputEventConsumer, OutputMidiConsumer, ParameterEdit, ParameterEditKind, Plugin,
+            PluginInfo, ProcessMode, ProgramPitchName, ProgressKind, ProgressValue, StateContext,
+            WindowHandle,
+        },
         transport::{AutomationLane, MidiClip, Timeline},
         window::PluginWindow,
     };

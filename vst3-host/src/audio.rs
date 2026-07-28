@@ -53,6 +53,85 @@ impl AudioBuffers {
     }
 }
 
+/// Configuration of one VST3 audio bus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AudioBusConfig {
+    /// Number of channels advertised for this bus.
+    pub channel_count: usize,
+    /// Whether the bus is currently active in the component.
+    pub active: bool,
+}
+
+/// Current audio-bus configuration, preserving every VST3 bus index.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AudioBusLayout {
+    /// Input buses in VST3 bus-index order.
+    pub inputs: Vec<AudioBusConfig>,
+    /// Output buses in VST3 bus-index order.
+    pub outputs: Vec<AudioBusConfig>,
+}
+
+/// Sample storage for one VST3 audio bus.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AudioBusBuffer {
+    /// Whether this bus was active when the buffer set was created.
+    ///
+    /// Processing validates this against the plug-in's current activation state. Recreate the
+    /// buffer set after changing bus activation.
+    pub active: bool,
+    /// Samples indexed `[channel][sample]`. Inactive buses retain their advertised channels so
+    /// their bus index and shape are never lost; their inputs are ignored and outputs silenced.
+    #[serde(with = "crate::process_isolation::audio_codec")]
+    pub channels: Vec<Vec<f32>>,
+}
+
+impl AudioBusBuffer {
+    /// Allocate a silent bus with the requested shape.
+    pub fn new(channel_count: usize, block_size: usize, active: bool) -> Self {
+        Self {
+            active,
+            channels: vec![vec![0.0; block_size]; channel_count],
+        }
+    }
+}
+
+/// Bus-aware audio buffers preserving every input/output bus as a distinct slot.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BusAudioBuffers {
+    /// Input buses in VST3 bus-index order.
+    pub inputs: Vec<AudioBusBuffer>,
+    /// Output buses in VST3 bus-index order.
+    pub outputs: Vec<AudioBusBuffer>,
+    /// Sample rate in Hz.
+    pub sample_rate: f64,
+    /// Nominal number of samples per channel.
+    pub block_size: usize,
+}
+
+impl BusAudioBuffers {
+    /// Allocate silent buffers from a previously queried [`AudioBusLayout`].
+    pub fn new(layout: &AudioBusLayout, block_size: usize, sample_rate: f64) -> Self {
+        let make = |config: &AudioBusConfig| {
+            AudioBusBuffer::new(config.channel_count, block_size, config.active)
+        };
+        Self {
+            inputs: layout.inputs.iter().map(make).collect(),
+            outputs: layout.outputs.iter().map(make).collect(),
+            sample_rate,
+            block_size,
+        }
+    }
+
+    /// Clear all input and output buses to silence.
+    pub fn clear(&mut self) {
+        for bus in self.inputs.iter_mut().chain(&mut self.outputs) {
+            for channel in &mut bus.channels {
+                channel.fill(0.0);
+            }
+        }
+    }
+}
+
 /// Audio level information for a single channel
 #[derive(Debug, Clone, Copy)]
 pub struct ChannelLevel {
@@ -141,6 +220,37 @@ impl AudioLevels {
             if peak > channel.peak_hold {
                 channel.peak_hold = peak;
             }
+        }
+    }
+
+    /// Update levels from active output buses, preserving bus/channel order.
+    pub fn update_from_bus_buffers(&mut self, buses: &[AudioBusBuffer]) {
+        let mut level_index = 0usize;
+        for channel in buses
+            .iter()
+            .filter(|bus| bus.active)
+            .flat_map(|bus| &bus.channels)
+        {
+            let Some(level) = self.channels.get_mut(level_index) else {
+                break;
+            };
+            let peak = channel
+                .iter()
+                .map(|sample| sample.abs())
+                .fold(0.0, f32::max);
+            let sum_squares: f32 = channel.iter().map(|sample| sample * sample).sum();
+            level.peak = peak;
+            level.rms = if channel.is_empty() {
+                0.0
+            } else {
+                (sum_squares / channel.len() as f32).sqrt()
+            };
+            level.peak_hold = level.peak_hold.max(peak);
+            level_index += 1;
+        }
+        for level in self.channels.iter_mut().skip(level_index) {
+            level.peak = 0.0;
+            level.rms = 0.0;
         }
     }
 
@@ -782,7 +892,7 @@ mod wav_tests {
     #[test]
     fn write_wav_has_correct_header_and_size() {
         let ch = vec![vec![0.0f32, 0.5, -0.5, 1.0], vec![0.1, 0.2, 0.3, 0.4]];
-        let path = std::env::temp_dir().join("vh_write_wav_test.wav");
+        let path = std::env::temp_dir().join(format!("vh_write_wav_{}.wav", std::process::id()));
         write_wav(&path, &ch, 48_000).unwrap();
         let bytes = std::fs::read(&path).unwrap();
         let _ = std::fs::remove_file(&path);

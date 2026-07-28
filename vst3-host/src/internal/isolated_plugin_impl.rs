@@ -4,11 +4,11 @@
 //! operations to a plugin running in a separate process via IPC.
 
 use crate::{
-    audio::AudioBuffers,
+    audio::{AudioBuffers, AudioBusConfig, AudioBusLayout, BusAudioBuffers},
     error::{Error, Result},
-    midi::MidiEvent,
+    midi::{MidiEvent, PluginEvent},
     parameters::Parameter,
-    plugin::{PluginInfo, PluginInternal},
+    plugin::{PluginInfo, PluginInternal, StateContext},
     process_isolation::{HostCommand, HostResponse, PluginHostProcess},
 };
 use std::path::PathBuf;
@@ -49,7 +49,7 @@ pub struct IsolatedPluginImpl {
     output_channels: usize,
     /// MIDI the plugin has emitted across the boundary, buffered for the host to poll
     /// (mirrors PluginImpl::output_midi). Capped to bound growth if never read.
-    output_midi: Mutex<Vec<MidiEvent>>,
+    output_events: Mutex<Vec<PluginEvent>>,
     /// Explicit helper-binary path override (re-used when respawning after a crash).
     helper_path: Option<PathBuf>,
     /// Per-command IPC response timeout (re-used when respawning after a crash).
@@ -63,10 +63,17 @@ pub struct IsolatedPluginImpl {
     /// plugin was respawned+reloaded (and thus reset to defaults) even when auto-recover
     /// swallowed the crash and returned `Ok`.
     recovery_count: std::sync::atomic::AtomicU64,
+    /// Latched while [`Self::poll`] is failing, so a host polling every UI frame logs the
+    /// helper's death once rather than once per frame. Cleared by the next successful poll.
+    poll_error_logged: std::sync::atomic::AtomicBool,
 }
 
 /// Cap on buffered output MIDI, matching the in-process path's MAX_OUTPUT_MIDI.
 const MAX_OUTPUT_MIDI: usize = 4096;
+
+/// Pause between auto-recover attempts whose respawn+reload itself failed, so a helper that
+/// cannot start at all is not hammered for the whole retry budget.
+const RECOVERY_RETRY_BACKOFF: Duration = Duration::from_millis(250);
 
 impl IsolatedPluginImpl {
     /// Create a new isolated plugin implementation
@@ -99,12 +106,13 @@ impl IsolatedPluginImpl {
             has_open_editor: false,
             editor_size: None,
             output_channels,
-            output_midi: Mutex::new(Vec::new()),
+            output_events: Mutex::new(Vec::new()),
             helper_path,
             response_timeout,
             auto_recover,
             auto_recover_max_retries,
             recovery_count: std::sync::atomic::AtomicU64::new(0),
+            poll_error_logged: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -162,9 +170,21 @@ impl IsolatedPluginImpl {
                         "isolated plugin crashed/hung ({e}); auto-recover attempt {attempt}/{}",
                         self.auto_recover_max_retries
                     );
-                    // Best-effort respawn+reload; on failure surface the original error.
-                    if self.recover_locked().is_err() {
-                        return Err(e);
+                    if let Err(recovery_error) = self.recover_locked() {
+                        // A respawn whose reload dies inside the plugin's own initialization
+                        // is the same flake the original crash was, so it spends one of the
+                        // caller's attempts rather than ending the loop outright. Only an
+                        // exhausted budget gives up — and it reports the crash the caller
+                        // actually hit, not the recovery's echo of it.
+                        log::warn!(
+                            "isolated plugin recovery attempt {attempt}/{} failed \
+                             ({recovery_error})",
+                            self.auto_recover_max_retries
+                        );
+                        if attempt >= self.auto_recover_max_retries {
+                            return Err(e);
+                        }
+                        std::thread::sleep(RECOVERY_RETRY_BACKOFF);
                     }
                 }
             }
@@ -196,6 +216,47 @@ impl IsolatedPluginImpl {
             HostResponse::Success { .. } => Ok(()),
             HostResponse::Error { message } => Err(Error::Other(format!("{what}: {message}"))),
             _ => Err(Error::Other(format!("{what}: unexpected response"))),
+        }
+    }
+
+    /// Run a poll command whose `PluginInternal` signature has no way to report failure.
+    ///
+    /// These accessors return "nothing to report" (an empty `Vec`, default flags) on the
+    /// happy path, which is indistinguishable from a helper that just died — so the transport
+    /// error is logged here instead of vanishing. It is logged **once per death**: the flag
+    /// latches on the first failure and is cleared by the next successful poll, so a host
+    /// polling every UI frame gets one line, not sixty a second.
+    ///
+    /// The death itself is not swallowed. [`PluginHostProcess`] latches its `dead` flag on the
+    /// failing exchange and answers every later command with "Helper process is no longer
+    /// running", which [`classify_ipc_error`] maps to [`Error::PluginCrashed`] — so the next
+    /// fallible command (or [`PluginInternal::recover`]) still surfaces it. With auto-recover
+    /// enabled, a poll is itself a control-plane command and will respawn+reload the helper.
+    fn poll<T>(
+        &self,
+        command: HostCommand,
+        what: &str,
+        extract: impl FnOnce(HostResponse) -> Option<T>,
+    ) -> Option<T> {
+        let outcome = match self.send_command(command) {
+            Ok(response) => extract(response).ok_or_else(|| "unexpected response".to_string()),
+            Err(error) => Err(error.to_string()),
+        };
+        use std::sync::atomic::Ordering;
+        match outcome {
+            Ok(value) => {
+                self.poll_error_logged.store(false, Ordering::Relaxed);
+                Some(value)
+            }
+            Err(reason) => {
+                if !self.poll_error_logged.swap(true, Ordering::Relaxed) {
+                    log::warn!(
+                        "isolated {what} reported nothing: {reason}. The helper is not \
+                         answering; the next fallible command will surface the failure."
+                    );
+                }
+                None
+            }
         }
     }
 }
@@ -295,7 +356,7 @@ impl PluginInternal for IsolatedPluginImpl {
         match response {
             HostResponse::AudioOutput {
                 outputs,
-                output_midi,
+                output_events,
             } => {
                 for (ch_idx, output_channel) in buffers.outputs.iter_mut().enumerate() {
                     if let Some(src) = outputs.get(ch_idx) {
@@ -309,9 +370,9 @@ impl PluginInternal for IsolatedPluginImpl {
                     }
                 }
                 // Buffer any MIDI the plugin emitted this block for the host to poll.
-                if !output_midi.is_empty() {
-                    if let Ok(mut buf) = self.output_midi.lock() {
-                        buf.extend(output_midi);
+                if !output_events.is_empty() {
+                    if let Ok(mut buf) = self.output_events.lock() {
+                        buf.extend(output_events);
                         if buf.len() > MAX_OUTPUT_MIDI {
                             let drop = buf.len() - MAX_OUTPUT_MIDI;
                             buf.drain(0..drop);
@@ -329,6 +390,81 @@ impl PluginInternal for IsolatedPluginImpl {
         }
     }
 
+    fn audio_bus_layout(&self) -> Result<AudioBusLayout> {
+        match self.send_command(HostCommand::AudioBusLayout)? {
+            HostResponse::AudioBusLayout { layout } => Ok(layout),
+            HostResponse::Error { message } => {
+                Err(Error::Other(format!("AudioBusLayout: {message}")))
+            }
+            _ => Err(Error::Other(
+                "AudioBusLayout: unexpected response".to_string(),
+            )),
+        }
+    }
+
+    fn process_buses(&mut self, buffers: &mut BusAudioBuffers) -> Result<()> {
+        let frames = buffers
+            .outputs
+            .iter()
+            .chain(&buffers.inputs)
+            .flat_map(|bus| &bus.channels)
+            .map(Vec::len)
+            .next()
+            .unwrap_or(buffers.block_size);
+        let outputs = buffers
+            .outputs
+            .iter()
+            .map(|bus| AudioBusConfig {
+                channel_count: bus.channels.len(),
+                active: bus.active,
+            })
+            .collect();
+        let response = self.send_command_once(HostCommand::ProcessBuses {
+            inputs: buffers.inputs.clone(),
+            outputs,
+            frames: frames as u32,
+        })?;
+        match response {
+            HostResponse::BusAudioOutput {
+                outputs,
+                output_events,
+            } => {
+                for (destination_bus, source_bus) in buffers.outputs.iter_mut().zip(&outputs) {
+                    for (destination, source) in destination_bus
+                        .channels
+                        .iter_mut()
+                        .zip(&source_bus.channels)
+                    {
+                        let count = destination.len().min(source.len());
+                        destination[..count].copy_from_slice(&source[..count]);
+                        destination[count..].fill(0.0);
+                    }
+                }
+                for destination_bus in buffers.outputs.iter_mut().skip(outputs.len()) {
+                    for destination in &mut destination_bus.channels {
+                        destination.fill(0.0);
+                    }
+                }
+                if !output_events.is_empty() {
+                    if let Ok(mut queued) = self.output_events.lock() {
+                        queued.extend(output_events);
+                        if queued.len() > MAX_OUTPUT_MIDI {
+                            let drop_count = queued.len() - MAX_OUTPUT_MIDI;
+                            queued.drain(0..drop_count);
+                        }
+                    }
+                }
+                Ok(())
+            }
+            HostResponse::Error { message } => Err(Error::ProcessError(format!(
+                "ProcessBuses error: {message}"
+            ))),
+            _ => Err(Error::Other(
+                "ProcessBuses: unexpected response".to_string(),
+            )),
+        }
+    }
+
     fn send_midi_event(&mut self, event: MidiEvent) -> Result<()> {
         self.expect_success(HostCommand::SendMidi { event }, "SendMidi")
     }
@@ -341,6 +477,14 @@ impl PluginInternal for IsolatedPluginImpl {
             },
             "SendMidiAt",
         )
+    }
+
+    fn send_plugin_event(&mut self, event: PluginEvent) -> Result<()> {
+        self.expect_success(HostCommand::SendPluginEvent { event }, "SendPluginEvent")
+    }
+
+    fn midi_panic(&mut self) -> Result<()> {
+        self.expect_success(HostCommand::MidiPanic, "MidiPanic")
     }
 
     fn set_bus_active(
@@ -479,25 +623,176 @@ impl PluginInternal for IsolatedPluginImpl {
         }
     }
 
-    fn latency_samples(&self) -> u32 {
-        match self.send_command(HostCommand::LatencySamples) {
-            Ok(HostResponse::LatencySamples { samples }) => samples,
-            _ => 0,
+    fn selected_unit(&self) -> Result<Option<i32>> {
+        match self.send_command(HostCommand::GetSelectedUnit)? {
+            HostResponse::SelectedUnit { unit_id } => Ok(unit_id),
+            HostResponse::Error { message } => {
+                Err(Error::Other(format!("GetSelectedUnit: {message}")))
+            }
+            _ => Err(Error::Other(
+                "GetSelectedUnit: unexpected response".to_string(),
+            )),
         }
+    }
+
+    fn select_unit(&mut self, unit_id: i32) -> Result<()> {
+        self.expect_success(HostCommand::SelectUnit { unit_id }, "SelectUnit")
+    }
+
+    fn program_pitch_names(
+        &self,
+        program_list_id: i32,
+        program_index: i32,
+    ) -> Result<Vec<crate::plugin::ProgramPitchName>> {
+        match self.send_command(HostCommand::ProgramPitchNames {
+            program_list_id,
+            program_index,
+        })? {
+            HostResponse::ProgramPitchNames { names } => Ok(names),
+            HostResponse::Error { message } => {
+                Err(Error::Other(format!("ProgramPitchNames: {message}")))
+            }
+            _ => Err(Error::Other(
+                "ProgramPitchNames: unexpected response".to_string(),
+            )),
+        }
+    }
+
+    fn get_program_data(
+        &self,
+        program_list_id: i32,
+        program_index: i32,
+    ) -> Result<Option<Vec<u8>>> {
+        match self.send_command(HostCommand::GetProgramData {
+            program_list_id,
+            program_index,
+        })? {
+            HostResponse::OpaqueData { supported, data } => Ok(supported.then_some(data)),
+            HostResponse::Error { message } => {
+                Err(Error::Other(format!("GetProgramData: {message}")))
+            }
+            _ => Err(Error::Other(
+                "GetProgramData: unexpected response".to_string(),
+            )),
+        }
+    }
+
+    fn set_program_data(
+        &mut self,
+        program_list_id: i32,
+        program_index: i32,
+        data: &[u8],
+    ) -> Result<()> {
+        self.expect_success(
+            HostCommand::SetProgramData {
+                program_list_id,
+                program_index,
+                data: data.to_vec(),
+            },
+            "SetProgramData",
+        )
+    }
+
+    fn get_unit_data(&self, unit_id: i32) -> Result<Option<Vec<u8>>> {
+        match self.send_command(HostCommand::GetUnitData { unit_id })? {
+            HostResponse::OpaqueData { supported, data } => Ok(supported.then_some(data)),
+            HostResponse::Error { message } => Err(Error::Other(format!("GetUnitData: {message}"))),
+            _ => Err(Error::Other("GetUnitData: unexpected response".to_string())),
+        }
+    }
+
+    fn set_unit_data(&mut self, unit_id: i32, data: &[u8]) -> Result<()> {
+        self.expect_success(
+            HostCommand::SetUnitData {
+                unit_id,
+                data: data.to_vec(),
+            },
+            "SetUnitData",
+        )
+    }
+
+    fn begin_host_edit(&mut self, parameter_id: u32) -> Result<()> {
+        self.expect_success(HostCommand::BeginHostEdit { parameter_id }, "BeginHostEdit")
+    }
+
+    fn end_host_edit(&mut self, parameter_id: u32) -> Result<()> {
+        self.expect_success(HostCommand::EndHostEdit { parameter_id }, "EndHostEdit")
+    }
+
+    fn send_midi_learn(&mut self, bus: i32, channel: i16, controller: u16) -> Result<()> {
+        self.expect_success(
+            HostCommand::SendMidiLearn {
+                bus,
+                channel,
+                controller,
+            },
+            "SendMidiLearn",
+        )
+    }
+
+    fn set_automation_state(&mut self, state: crate::plugin::AutomationState) -> Result<()> {
+        self.expect_success(
+            HostCommand::SetAutomationState { state },
+            "SetAutomationState",
+        )
+    }
+
+    fn remap_parameter_id(&self, old_plugin_uid: &str, old_param_id: u32) -> Result<Option<u32>> {
+        if crate::internal::utils::parse_class_uid(old_plugin_uid).is_none() {
+            return Err(Error::InvalidParameter(
+                "plugin UID must contain exactly 32 hexadecimal characters".to_string(),
+            ));
+        }
+        match self.send_command(HostCommand::RemapParameterId {
+            old_plugin_uid: old_plugin_uid.to_string(),
+            old_param_id,
+        })? {
+            HostResponse::RemappedParameter { id } => Ok(id),
+            HostResponse::Error { message } => {
+                Err(Error::Other(format!("RemapParameterId: {message}")))
+            }
+            _ => Err(Error::Other(
+                "RemapParameterId: unexpected response".to_string(),
+            )),
+        }
+    }
+
+    fn latency_samples(&self) -> u32 {
+        self.poll(
+            HostCommand::LatencySamples,
+            "LatencySamples",
+            |response| match response {
+                HostResponse::LatencySamples { samples } => Some(samples),
+                _ => None,
+            },
+        )
+        .unwrap_or(0)
     }
 
     fn tail_samples(&self) -> u32 {
-        match self.send_command(HostCommand::TailSamples) {
-            Ok(HostResponse::TailSamples { samples }) => samples,
-            _ => 0,
-        }
+        self.poll(
+            HostCommand::TailSamples,
+            "TailSamples",
+            |response| match response {
+                HostResponse::TailSamples { samples } => Some(samples),
+                _ => None,
+            },
+        )
+        .unwrap_or(0)
     }
 
     fn midi_cc_to_parameter(&self, bus: i32, channel: i16, cc: u16) -> Option<u32> {
-        match self.send_command(HostCommand::MidiCcToParameter { bus, channel, cc }) {
-            Ok(HostResponse::MidiParameterMapping { id }) => id,
-            _ => None,
-        }
+        // The inner `Option` is the plugin's own answer ("this controller is not mapped");
+        // the outer one is whether the helper answered at all.
+        self.poll(
+            HostCommand::MidiCcToParameter { bus, channel, cc },
+            "MidiCcToParameter",
+            |response| match response {
+                HostResponse::MidiParameterMapping { id } => Some(id),
+                _ => None,
+            },
+        )
+        .flatten()
     }
 
     fn start_processing(&mut self) -> Result<()> {
@@ -588,16 +883,102 @@ impl PluginInternal for IsolatedPluginImpl {
     }
 
     fn get_parameter_changes(&self) -> Vec<(u32, f64)> {
-        // Parameter changes not supported in process isolation mode
-        Vec::new()
+        self.poll(
+            HostCommand::TakeParameterChanges,
+            "TakeParameterChanges",
+            |response| match response {
+                HostResponse::ParameterChanges { changes } => Some(changes),
+                _ => None,
+            },
+        )
+        .unwrap_or_default()
     }
 
     fn take_parameter_edits(&mut self) -> Vec<crate::plugin::ParameterEdit> {
         // Pulled on demand across the boundary, like the value-change drain: the helper's
         // in-process plugin accumulates gestures from its editor and hands them back here.
-        match self.send_command(HostCommand::TakeParameterEdits) {
-            Ok(HostResponse::ParameterEdits { edits }) => edits,
-            _ => Vec::new(),
+        self.poll(
+            HostCommand::TakeParameterEdits,
+            "TakeParameterEdits",
+            |response| match response {
+                HostResponse::ParameterEdits { edits } => Some(edits),
+                _ => None,
+            },
+        )
+        .unwrap_or_default()
+    }
+
+    fn take_host_notifications(&mut self) -> Vec<crate::plugin::HostNotification> {
+        self.poll(
+            HostCommand::TakeHostNotifications,
+            "TakeHostNotifications",
+            |response| match response {
+                HostResponse::HostNotifications { notifications } => Some(notifications),
+                _ => None,
+            },
+        )
+        .unwrap_or_default()
+    }
+
+    fn take_data_exchange_blocks(&mut self) -> Vec<crate::plugin::DataExchangeBlock> {
+        self.poll(
+            HostCommand::TakeDataExchangeBlocks,
+            "TakeDataExchangeBlocks",
+            |response| match response {
+                HostResponse::DataExchangeBlocks { blocks } => Some(blocks),
+                _ => None,
+            },
+        )
+        .unwrap_or_default()
+    }
+
+    fn execute_context_menu_item(&mut self, menu_id: u64, item_id: u32) -> Result<()> {
+        match self.send_command(HostCommand::ExecuteContextMenuItem { menu_id, item_id })? {
+            HostResponse::Success { .. } => Ok(()),
+            HostResponse::Error { message } => {
+                Err(Error::Other(format!("ExecuteContextMenuItem: {message}")))
+            }
+            _ => Err(Error::Other(
+                "ExecuteContextMenuItem: unexpected response".to_string(),
+            )),
+        }
+    }
+
+    fn dismiss_context_menu(&mut self, menu_id: u64) -> Result<()> {
+        match self.send_command(HostCommand::DismissContextMenu { menu_id })? {
+            HostResponse::Success { .. } => Ok(()),
+            HostResponse::Error { message } => {
+                Err(Error::Other(format!("DismissContextMenu: {message}")))
+            }
+            _ => Err(Error::Other(
+                "DismissContextMenu: unexpected response".to_string(),
+            )),
+        }
+    }
+
+    fn take_restart_flags(&mut self) -> crate::plugin::RestartFlags {
+        self.poll(
+            HostCommand::TakeRestartFlags,
+            "TakeRestartFlags",
+            |response| match response {
+                HostResponse::RestartFlags { bits } => {
+                    Some(crate::plugin::RestartFlags::from_bits(bits))
+                }
+                _ => None,
+            },
+        )
+        .unwrap_or_default()
+    }
+
+    fn service_host_requests(&mut self) -> Result<crate::plugin::RestartFlags> {
+        match self.send_command(HostCommand::ServiceHostRequests)? {
+            HostResponse::RestartFlags { bits } => Ok(crate::plugin::RestartFlags::from_bits(bits)),
+            HostResponse::Error { message } => {
+                Err(Error::Other(format!("ServiceHostRequests: {message}")))
+            }
+            _ => Err(Error::Other(
+                "ServiceHostRequests: unexpected response".to_string(),
+            )),
         }
     }
 
@@ -609,17 +990,18 @@ impl PluginInternal for IsolatedPluginImpl {
         }
     }
 
-    fn load_state(&mut self, data: &[u8]) -> Result<()> {
+    fn load_state_with_context(&mut self, data: &[u8], context: &StateContext) -> Result<()> {
         self.expect_success(
             HostCommand::LoadState {
                 data: data.to_vec(),
+                context: context.clone(),
             },
             "LoadState",
         )
     }
 
-    fn take_output_events(&self) -> Vec<MidiEvent> {
-        self.output_midi
+    fn take_output_events(&self) -> Vec<PluginEvent> {
+        self.output_events
             .lock()
             .map(|mut o| std::mem::take(&mut *o))
             .unwrap_or_default()
@@ -667,6 +1049,8 @@ impl IsolatedPluginImpl {
             tempo: self.tempo,
             time_sig_numerator: self.time_sig_numerator,
             time_sig_denominator: self.time_sig_denominator,
+            // Reload the exact class selected originally, not merely the bundle's first class.
+            class_id: Some(self.info.uid.clone()),
         }) {
             Ok(HostResponse::PluginInfo { .. }) => {}
             Ok(HostResponse::Error { message }) => {
@@ -711,6 +1095,16 @@ mod tests {
     use super::*;
     use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt;
+
+    /// Response deadline for the fake helper below.
+    ///
+    /// Deliberately far above the library's production default. The fake helper is a `/bin/sh`
+    /// loop, so its turnaround is bounded by how soon the OS schedules another process — which
+    /// on a machine running the suite alongside a build is nowhere near instant. These tests
+    /// assert on *what* crossed the boundary, never on how quickly, so a deadline tight enough
+    /// to be tripped by scheduling latency only makes them flaky. The deadline behaviour itself
+    /// is covered by `process_isolation`'s own timeout test, which sets its own short one.
+    const FAKE_HELPER_TIMEOUT: Duration = Duration::from_secs(120);
 
     /// A stand-in helper: logs every request it receives and answers each one, so a test can
     /// assert on exactly what the host sent across the boundary.
@@ -768,7 +1162,7 @@ mod tests {
     }
 
     fn isolated(fake: &FakeHelper) -> IsolatedPluginImpl {
-        let process = PluginHostProcess::new(Some(fake.script.clone()), Duration::from_secs(5))
+        let process = PluginHostProcess::new(Some(fake.script.clone()), FAKE_HELPER_TIMEOUT)
             .expect("spawn fake helper");
         let info = PluginInfo {
             path: PathBuf::from("/tmp/fake.vst3"),
@@ -793,7 +1187,7 @@ mod tests {
             4,
             2,
             Some(fake.script.clone()),
-            Duration::from_secs(5),
+            FAKE_HELPER_TIMEOUT,
             false,
             0,
         )
@@ -829,6 +1223,75 @@ mod tests {
                 .iter()
                 .any(|r| r.contains("SetPlaying")),
             "a stopped transport must be replayed after the reload, got {requests:?}"
+        );
+    }
+
+    /// An isolated plugin's `setState` must see the same stream attributes an in-process one
+    /// would, so the restore context has to survive the boundary rather than defaulting to a
+    /// project restore on the helper's side.
+    #[test]
+    fn a_state_restore_carries_its_context_across_the_boundary() {
+        let fake = FakeHelper::new("state_context");
+        let mut plugin = isolated(&fake);
+
+        plugin
+            .load_state_with_context(&[1, 2, 3], &StateContext::Project)
+            .expect("project restore");
+        plugin
+            .load_state_with_context(
+                &[1, 2, 3],
+                &StateContext::preset_from_path("/Users/me/Presets/Big Lead.vstpreset"),
+            )
+            .expect("preset restore");
+        plugin
+            .load_state_with_context(&[1, 2, 3], &StateContext::preset())
+            .expect("pathless preset restore");
+
+        let loads: Vec<String> = fake
+            .requests()
+            .into_iter()
+            .filter(|r| r.contains("LoadState"))
+            .collect();
+        assert_eq!(
+            loads.len(),
+            3,
+            "expected three LoadState commands: {loads:?}"
+        );
+        assert!(
+            loads[0].contains(r#""context":"Project""#),
+            "a project restore must say so on the wire, got {}",
+            loads[0]
+        );
+        assert!(
+            loads[1].contains(r#""Preset""#)
+                && loads[1].contains("/Users/me/Presets/Big Lead.vstpreset"),
+            "a preset restore must carry its source path, got {}",
+            loads[1]
+        );
+        assert!(
+            loads[2].contains(r#""Preset""#) && loads[2].contains(r#""path":null"#),
+            "a pathless preset restore must still say it is a preset, got {}",
+            loads[2]
+        );
+    }
+
+    /// The plain `load_state` entry point keeps meaning "session restore", so hosts that never
+    /// heard of a restore context see exactly the behaviour they had before.
+    #[test]
+    fn a_context_free_state_restore_still_says_project() {
+        let fake = FakeHelper::new("state_default");
+        let mut plugin = isolated(&fake);
+
+        plugin.load_state(&[9]).expect("load_state");
+
+        let load = fake
+            .requests()
+            .into_iter()
+            .find(|r| r.contains("LoadState"))
+            .expect("a LoadState command");
+        assert!(
+            load.contains(r#""context":"Project""#),
+            "load_state must default to a project restore, got {load}"
         );
     }
 }

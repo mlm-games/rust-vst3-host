@@ -26,7 +26,8 @@ pub(crate) const DEFAULT_SLOW_COMMAND_TIMEOUT: Duration = Duration::from_secs(30
 /// Maximum bytes accepted for a single line on the protocol stream. Longer lines are
 /// discarded rather than buffered, so a helper (or a plugin sharing its stdout) that never
 /// terminates a line cannot grow the host's memory without bound.
-const MAX_RESPONSE_LINE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_STATE_BASE64_BYTES: usize = crate::plugin::MAX_STATE_SNAPSHOT_BYTES.div_ceil(3) * 4;
+const MAX_RESPONSE_LINE_BYTES: usize = MAX_STATE_BASE64_BYTES + 1024 * 1024;
 
 /// Maximum unread lines buffered from the helper. Beyond this the reader drops new lines
 /// (counting them) instead of queueing them forever.
@@ -41,12 +42,23 @@ const MAX_WIRE_FRAMES: usize = 1 << 20;
 /// Upper bound on a bus count taken from the wire.
 const MAX_WIRE_BUSES: i32 = 256;
 
+/// The in-process host has two independently bounded feedback sources: processor output
+/// parameters and controller/editor changes. One response drains both, so its wire cap is the
+/// sum of their 4096-entry limits.
+const MAX_WIRE_PARAMETER_CHANGES: usize = 8192;
+
 /// Whether a command belongs to the slow class — module load and state I/O — which gets
 /// [`DEFAULT_SLOW_COMMAND_TIMEOUT`] instead of the per-block response deadline.
 pub(crate) fn is_slow_command(command: &HostCommand) -> bool {
     matches!(
         command,
-        HostCommand::LoadPlugin { .. } | HostCommand::SaveState | HostCommand::LoadState { .. }
+        HostCommand::LoadPlugin { .. }
+            | HostCommand::SaveState
+            | HostCommand::LoadState { .. }
+            | HostCommand::GetProgramData { .. }
+            | HostCommand::SetProgramData { .. }
+            | HostCommand::GetUnitData { .. }
+            | HostCommand::SetUnitData { .. }
     )
 }
 
@@ -57,7 +69,7 @@ pub(crate) fn is_slow_command(command: &HostCommand) -> bool {
 /// would therefore break every block on the boundary. Samples cross as base64 of their
 /// little-endian IEEE-754 bit patterns instead, which is exact for every `f32` — and about
 /// three times smaller than the decimal number array it replaces.
-mod audio_codec {
+pub(crate) mod audio_codec {
     use super::{Deserialize, Deserializer, Serializer, MAX_WIRE_CHANNELS, MAX_WIRE_FRAMES};
 
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -141,14 +153,14 @@ mod audio_codec {
         )
     }
 
-    pub(super) fn serialize<S: Serializer>(
+    pub(crate) fn serialize<S: Serializer>(
         channels: &[Vec<f32>],
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
         serializer.collect_seq(channels.iter().map(|c| encode_channel(c)))
     }
 
-    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
     ) -> Result<Vec<Vec<f32>>, D::Error> {
         let encoded = Vec::<String>::deserialize(deserializer)?;
@@ -175,6 +187,108 @@ mod audio_codec {
                 Ok(samples)
             })
             .collect()
+    }
+}
+
+/// Compact, bounded wire encoding for opaque plugin state.
+///
+/// `Vec<u8>`'s default JSON representation is a decimal integer array and can expand a valid
+/// 64 MiB state by roughly four times. Base64 keeps the expansion to 4/3. The deserializer also
+/// accepts the old array representation so a new host/helper can finish an in-flight exchange
+/// with a peer from an earlier release.
+pub(crate) mod state_codec {
+    use super::{Deserialize, Deserializer, Serializer, MAX_STATE_BASE64_BYTES};
+
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const MAX_STATE_BYTES: usize = crate::plugin::MAX_STATE_SNAPSHOT_BYTES;
+
+    pub(crate) fn serialize<S: Serializer>(state: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        if state.len() > MAX_STATE_BYTES {
+            return Err(serde::ser::Error::custom("plugin state exceeds wire limit"));
+        }
+        let mut out = String::with_capacity(state.len().div_ceil(3) * 4);
+        for chunk in state.chunks(3) {
+            let b1 = chunk.get(1).copied().unwrap_or(0);
+            let b2 = chunk.get(2).copied().unwrap_or(0);
+            let n = (u32::from(chunk[0]) << 16) | (u32::from(b1) << 8) | u32::from(b2);
+            out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+            out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+            out.push(if chunk.len() > 1 {
+                ALPHABET[(n >> 6) as usize & 63] as char
+            } else {
+                '='
+            });
+            out.push(if chunk.len() > 2 {
+                ALPHABET[n as usize & 63] as char
+            } else {
+                '='
+            });
+        }
+        serializer.serialize_str(&out)
+    }
+
+    fn sextet(byte: u8) -> Option<u32> {
+        Some(u32::from(match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        }))
+    }
+
+    fn decode(encoded: &str) -> Option<Vec<u8>> {
+        let bytes = encoded.as_bytes();
+        if bytes.len() > MAX_STATE_BASE64_BYTES || bytes.len() % 4 != 0 {
+            return None;
+        }
+        let mut raw = Vec::with_capacity(bytes.len() / 4 * 3);
+        let chunk_count = bytes.len() / 4;
+        for (chunk_index, chunk) in bytes.chunks(4).enumerate() {
+            let pad = chunk.iter().rev().take_while(|&&byte| byte == b'=').count();
+            if pad > 2 || (pad != 0 && chunk_index + 1 != chunk_count) {
+                return None;
+            }
+            let mut n = 0u32;
+            for (index, &byte) in chunk.iter().enumerate() {
+                if byte == b'=' {
+                    if index < 4 - pad {
+                        return None;
+                    }
+                } else {
+                    n |= sextet(byte)? << (18 - 6 * index);
+                }
+            }
+            raw.push((n >> 16) as u8);
+            if pad < 2 {
+                raw.push((n >> 8) as u8);
+            }
+            if pad == 0 {
+                raw.push(n as u8);
+            }
+        }
+        (raw.len() <= MAX_STATE_BYTES).then_some(raw)
+    }
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StateWire {
+        Base64(String),
+        Legacy(Vec<u8>),
+    }
+
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<u8>, D::Error> {
+        match StateWire::deserialize(deserializer)? {
+            StateWire::Base64(encoded) => decode(&encoded)
+                .ok_or_else(|| serde::de::Error::custom("malformed or oversized plugin state")),
+            StateWire::Legacy(state) if state.len() <= MAX_STATE_BYTES => Ok(state),
+            StateWire::Legacy(_) => {
+                Err(serde::de::Error::custom("plugin state exceeds wire limit"))
+            }
+        }
     }
 }
 
@@ -237,6 +351,69 @@ mod lossless_f64 {
     }
 }
 
+/// Compact, lossless, bounded encoding for processor/controller parameter feedback.
+///
+/// Values travel as IEEE-754 bits so a misbehaving plugin returning NaN or infinity cannot make
+/// serde_json turn the whole helper response into an undecodable `null`.
+mod parameter_changes_codec {
+    use super::{Deserializer, Serializer, MAX_WIRE_PARAMETER_CHANGES};
+    use serde::de::{SeqAccess, Visitor};
+    use serde::ser::SerializeSeq;
+    use std::fmt;
+
+    pub(super) fn serialize<S: Serializer>(
+        changes: &[(u32, f64)],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        if changes.len() > MAX_WIRE_PARAMETER_CHANGES {
+            return Err(serde::ser::Error::custom(
+                "parameter feedback exceeds wire limit",
+            ));
+        }
+        let mut sequence = serializer.serialize_seq(Some(changes.len()))?;
+        for &(id, value) in changes {
+            sequence.serialize_element(&(id, value.to_bits()))?;
+        }
+        sequence.end()
+    }
+
+    struct ParameterChangesVisitor;
+
+    impl<'de> Visitor<'de> for ParameterChangesVisitor {
+        type Value = Vec<(u32, f64)>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                formatter,
+                "at most {MAX_WIRE_PARAMETER_CHANGES} parameter-id/value-bit pairs"
+            )
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<Self::Value, A::Error> {
+            let capacity = sequence
+                .size_hint()
+                .unwrap_or(0)
+                .min(MAX_WIRE_PARAMETER_CHANGES);
+            let mut changes = Vec::with_capacity(capacity);
+            while let Some((id, bits)) = sequence.next_element::<(u32, u64)>()? {
+                if changes.len() >= MAX_WIRE_PARAMETER_CHANGES {
+                    return Err(serde::de::Error::custom(
+                        "parameter feedback exceeds wire limit",
+                    ));
+                }
+                changes.push((id, f64::from_bits(bits)));
+            }
+            Ok(changes)
+        }
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<(u32, f64)>, D::Error> {
+        deserializer.deserialize_seq(ParameterChangesVisitor)
+    }
+}
+
 /// Clamp a wire-provided channel count into `0..=MAX_WIRE_CHANNELS`.
 fn clamped_channel_count<'de, D: Deserializer<'de>>(deserializer: D) -> Result<i32, D::Error> {
     let raw = i32::deserialize(deserializer)?;
@@ -272,6 +449,9 @@ pub enum HostCommand {
         time_sig_numerator: i32,
         /// Time signature denominator to advertise in the host `ProcessContext`.
         time_sig_denominator: i32,
+        /// Specific current or moduleinfo-retired audio class id to instantiate.
+        #[serde(default)]
+        class_id: Option<String>,
     },
     /// Unload the current plugin
     UnloadPlugin,
@@ -362,6 +542,13 @@ pub enum HostCommand {
         /// Sample offset within the next processed block.
         sample_offset: i32,
     },
+    /// Send a fully owned VST3 event, including pointer-backed SysEx/text payloads.
+    SendPluginEvent {
+        /// The event to deliver.
+        event: crate::midi::PluginEvent,
+    },
+    /// Release all notes currently tracked by the plugin.
+    MidiPanic,
     /// Process one block of audio. `inputs` is per-channel; `frames` is the block length.
     Process {
         /// Per-channel input samples (`[channel][frame]`), carried as base64 bit patterns.
@@ -370,12 +557,32 @@ pub enum HostCommand {
         /// Number of frames in this block.
         frames: u32,
     },
+    /// Process one block while preserving every VST3 audio bus.
+    ProcessBuses {
+        /// Input buses in bus-index order, including inactive buses.
+        inputs: Vec<crate::audio::AudioBusBuffer>,
+        /// Output bus shapes and activation flags.
+        outputs: Vec<crate::audio::AudioBusConfig>,
+        /// Number of frames in this block.
+        frames: u32,
+    },
+    /// Query per-bus channel counts and activation state.
+    AudioBusLayout,
     /// Serialize the plugin's current state to an opaque byte blob.
     SaveState,
     /// Restore the plugin's state from a blob previously returned by `SaveState`.
     LoadState {
         /// The opaque state bytes.
+        #[serde(with = "state_codec")]
         data: Vec<u8>,
+        /// Where the bytes came from, so the helper's `setState` stream carries the same
+        /// `IStreamAttributes` an in-process restore would.
+        ///
+        /// Absent on the wire means [`crate::plugin::StateContext::Project`], which is what
+        /// every release before this field sent — so a new helper reads an old host's
+        /// `LoadState`, and an old helper simply ignores a field it does not know.
+        #[serde(default)]
+        context: crate::plugin::StateContext,
     },
     /// Start a note (MPE). The helper's plugin allocates the per-voice note id and returns
     /// it in [`HostResponse::NoteStarted`] (in isolation the helper owns the real plugin).
@@ -445,6 +652,81 @@ pub enum HostCommand {
     },
     /// Enumerate the plugin's units and their program lists (`IUnitInfo`).
     GetUnits,
+    /// Query the currently selected unit.
+    GetSelectedUnit,
+    /// Select a unit.
+    SelectUnit {
+        /// Unit id.
+        unit_id: i32,
+    },
+    /// Query pitch names for a program.
+    ProgramPitchNames {
+        /// Program-list id.
+        program_list_id: i32,
+        /// Program index.
+        program_index: i32,
+    },
+    /// Read opaque data for a program.
+    GetProgramData {
+        /// Program-list id.
+        program_list_id: i32,
+        /// Program index.
+        program_index: i32,
+    },
+    /// Restore opaque data for a program.
+    SetProgramData {
+        /// Program-list id.
+        program_list_id: i32,
+        /// Program index.
+        program_index: i32,
+        /// Opaque plugin data.
+        #[serde(with = "state_codec")]
+        data: Vec<u8>,
+    },
+    /// Read opaque data for a unit.
+    GetUnitData {
+        /// Unit id.
+        unit_id: i32,
+    },
+    /// Restore opaque data for a unit.
+    SetUnitData {
+        /// Unit id.
+        unit_id: i32,
+        /// Opaque plugin data.
+        #[serde(with = "state_codec")]
+        data: Vec<u8>,
+    },
+    /// Begin a host-edit session.
+    BeginHostEdit {
+        /// Parameter id.
+        parameter_id: u32,
+    },
+    /// End a host-edit session.
+    EndHostEdit {
+        /// Parameter id.
+        parameter_id: u32,
+    },
+    /// Forward live MIDI controller input to `IMidiLearn`.
+    SendMidiLearn {
+        /// Event bus.
+        bus: i32,
+        /// MIDI channel.
+        channel: i16,
+        /// MIDI controller number.
+        controller: u16,
+    },
+    /// Report the current automation state.
+    SetAutomationState {
+        /// Automation state.
+        state: crate::plugin::AutomationState,
+    },
+    /// Map a parameter id from a plugin class this controller replaces (`IRemapParamID`).
+    RemapParameterId {
+        /// Canonical separator-free 32-hex-character VST3 class id.
+        old_plugin_uid: String,
+        /// Parameter id used by the replaced plugin class.
+        old_param_id: u32,
+    },
     /// Query the plugin's reported processing latency in samples
     /// (`IAudioProcessor::getLatencySamples`).
     LatencySamples,
@@ -462,6 +744,28 @@ pub enum HostCommand {
     /// Drain the ordered parameter-edit gesture log (begin/change/end) the helper's plugin has
     /// accumulated from its editor since the last poll.
     TakeParameterEdits,
+    /// Drain processor- and controller-originated parameter value feedback.
+    TakeParameterChanges,
+    /// Drain ordered `IComponentHandler2` requests from the helper.
+    TakeHostNotifications,
+    /// Dispatch and drain owned VST3 data-exchange blocks from the helper.
+    TakeDataExchangeBlocks,
+    /// Execute an item from a pending plugin-provided context menu.
+    ExecuteContextMenuItem {
+        /// Host-assigned popup id.
+        menu_id: u64,
+        /// Host-assigned item id within the popup.
+        item_id: u32,
+    },
+    /// Dismiss a pending plugin-provided context menu.
+    DismissContextMenu {
+        /// Host-assigned popup id.
+        menu_id: u64,
+    },
+    /// Drain accumulated `restartComponent` flags without applying lifecycle changes.
+    TakeRestartFlags,
+    /// Drain restart flags and apply required lifecycle changes in the helper.
+    ServiceHostRequests,
     /// Shutdown the helper process
     Shutdown,
 }
@@ -490,8 +794,20 @@ pub enum HostResponse {
         /// Output samples per channel, carried as base64 bit patterns.
         #[serde(with = "audio_codec")]
         outputs: Vec<Vec<f32>>,
-        /// MIDI events the plugin emitted this block, in order.
-        output_midi: Vec<crate::midi::MidiEvent>,
+        /// Owned VST3 events the plugin emitted this block, in order.
+        output_events: Vec<crate::midi::PluginEvent>,
+    },
+    /// Bus-preserving audio output from a `ProcessBuses` request.
+    BusAudioOutput {
+        /// Output buses in VST3 bus-index order.
+        outputs: Vec<crate::audio::AudioBusBuffer>,
+        /// Owned VST3 events emitted during the block.
+        output_events: Vec<crate::midi::PluginEvent>,
+    },
+    /// Current audio-bus layout and activation state.
+    AudioBusLayout {
+        /// Complete input/output layout.
+        layout: crate::audio::AudioBusLayout,
     },
     /// A single parameter value (normalized).
     ParameterValue {
@@ -512,6 +828,7 @@ pub enum HostResponse {
     /// Opaque plugin state bytes (reply to `SaveState`).
     State {
         /// The serialized state.
+        #[serde(with = "state_codec")]
         data: Vec<u8>,
     },
     /// The isolated editor window was created (reply to `CreateGui`); carries the
@@ -550,6 +867,9 @@ pub enum HostResponse {
         has_midi_input: bool,
         /// Whether the plugin has a MIDI/event output bus.
         has_midi_output: bool,
+        /// Current/retired class-id mappings discovered by the helper.
+        #[serde(default)]
+        compatibility: Vec<crate::discovery::ClassCompatibility>,
     },
     /// A note was started (reply to `NoteOn`); carries the helper-allocated raw note id.
     NoteStarted {
@@ -567,6 +887,27 @@ pub enum HostResponse {
         /// The gesture events, in the order the plugin's editor reported them.
         edits: Vec<crate::plugin::ParameterEdit>,
     },
+    /// Processor- and controller-originated parameter feedback drained from the helper.
+    ParameterChanges {
+        /// Parameter id and normalized value pairs, in drain order.
+        #[serde(with = "parameter_changes_codec")]
+        changes: Vec<(u32, f64)>,
+    },
+    /// Ordered `IComponentHandler2` requests drained from the helper.
+    HostNotifications {
+        /// The queued host requests.
+        notifications: Vec<crate::plugin::HostNotification>,
+    },
+    /// Owned VST3 data-exchange blocks drained from the helper.
+    DataExchangeBlocks {
+        /// Block snapshots, in delivery order.
+        blocks: Vec<crate::plugin::DataExchangeBlock>,
+    },
+    /// Accumulated `restartComponent` flags.
+    RestartFlags {
+        /// Raw VST3 restart flag bits.
+        bits: i32,
+    },
     /// Each audio bus's current speaker arrangement (reply to `BusArrangements`).
     BusArrangements {
         /// The input/output arrangements.
@@ -576,6 +917,24 @@ pub enum HostResponse {
     Units {
         /// The advertised units.
         units: Vec<crate::plugin::PluginUnit>,
+    },
+    /// Currently selected unit.
+    SelectedUnit {
+        /// Unit id, or `None` when units are unsupported/unselected.
+        unit_id: Option<i32>,
+    },
+    /// Program pitch names.
+    ProgramPitchNames {
+        /// Advertised pitch names.
+        names: Vec<crate::plugin::ProgramPitchName>,
+    },
+    /// Opaque program/unit data.
+    OpaqueData {
+        /// Whether the corresponding interface/data kind is supported.
+        supported: bool,
+        /// Opaque bytes; empty is a valid supported payload.
+        #[serde(with = "state_codec")]
+        data: Vec<u8>,
     },
     /// The plugin's reported processing latency in samples (reply to `LatencySamples`).
     LatencySamples {
@@ -590,6 +949,11 @@ pub enum HostResponse {
     /// The parameter a MIDI controller is mapped to, if any (reply to `MidiCcToParameter`).
     MidiParameterMapping {
         /// The mapped parameter id, or `None` if unmapped / not implemented.
+        id: Option<u32>,
+    },
+    /// A parameter-id compatibility mapping returned by `IRemapParamID`.
+    RemappedParameter {
+        /// The replacement parameter id, or `None` if unsupported/unmapped.
         id: Option<u32>,
     },
 }
@@ -702,6 +1066,58 @@ pub struct PluginHostProcess {
     slow_timeout: Duration,
     /// Set once the child has been killed/exited so we stop trying to talk to it.
     dead: bool,
+    /// The helper binary this child was spawned from, kept so [`Self::send_command`] can put a
+    /// fresh one in its place when a load kills it. Resolved once by [`Self::new`], so a
+    /// respawn cannot pick a different binary than the original search did.
+    helper_path: std::path::PathBuf,
+}
+
+/// How many times a `LoadPlugin` that killed the helper is replayed against a freshly spawned
+/// one.
+///
+/// Loading a plugin runs the plugin's own module and instance initialization, and some real
+/// plugins lose a race in there: Dexed (JUCE) segfaults or aborts inside
+/// `juce::MessageQueue::runLoopSourceCallback` on roughly 6% of cold loads, dispatching an
+/// async update into an object whose construction has not finished. Nothing the host does
+/// provokes it and nothing it does prevents it — but a *fresh* helper is an independent roll,
+/// and the crashed one had no state worth preserving (its load never completed), so replaying
+/// the load is exactly what a human would do.
+///
+/// One retry, not a loop: it takes a 6% failure to 0.4%, while a plugin that genuinely cannot
+/// load still reports that after two attempts instead of grinding.
+const LOAD_CRASH_RETRIES: u32 = 1;
+
+/// Pause before replaying a crashed load, so the retry is not a tight respawn loop and the
+/// dying child's teardown (crash reporter, atexit handlers) has a moment to finish.
+const LOAD_CRASH_RETRY_BACKOFF: Duration = Duration::from_millis(250);
+
+/// Why one host↔helper exchange failed.
+///
+/// The variants exist to tell "the helper died while handling *this* command" — the only case
+/// worth replaying against a fresh child — from a timeout, a helper that was already gone, or
+/// a local transport failure. Each carries the message the public API reports, unchanged:
+/// [`crate::internal::isolated_plugin_impl`] classifies those strings into
+/// [`crate::Error::PluginCrashed`] / [`crate::Error::PluginTimeout`].
+enum ExchangeError {
+    /// The helper was already known dead; nothing was sent.
+    AlreadyDead(String),
+    /// The helper crashed or exited while this command was in flight.
+    DiedDuringCommand(String),
+    /// No answer within the deadline; the child has been killed.
+    TimedOut(String),
+    /// The command could not be encoded (never reached the helper).
+    Encoding(String),
+}
+
+impl From<ExchangeError> for String {
+    fn from(error: ExchangeError) -> String {
+        match error {
+            ExchangeError::AlreadyDead(message)
+            | ExchangeError::DiedDuringCommand(message)
+            | ExchangeError::TimedOut(message)
+            | ExchangeError::Encoding(message) => message,
+        }
+    }
 }
 
 /// One read from the helper's stdout.
@@ -912,7 +1328,25 @@ impl PluginHostProcess {
             timeout,
             slow_timeout: DEFAULT_SLOW_COMMAND_TIMEOUT.max(timeout),
             dead: false,
+            helper_path,
         })
+    }
+
+    /// Put a freshly spawned helper in place of the current (dead) child, keeping the
+    /// deadlines and the diagnostic counters this handle has accumulated.
+    fn respawn(&mut self) -> Result<(), String> {
+        self.shutdown();
+        let slow_timeout = self.slow_timeout;
+        let unparsed_lines = self.unparsed_lines;
+        let discarded = self.discarded_by_reader.load(Ordering::Relaxed);
+
+        *self = Self::spawn(self.helper_path.clone(), self.timeout)?;
+
+        self.slow_timeout = slow_timeout;
+        self.unparsed_lines = unparsed_lines;
+        self.discarded_by_reader
+            .fetch_add(discarded, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Set how long to wait for a helper response before declaring a timeout.
@@ -973,27 +1407,67 @@ impl PluginHostProcess {
     /// reported as a crash — or noise on the stream, which is dropped so the exchange stays
     /// in sync instead of answering every later command with the previous one's reply. The
     /// deadline covers the whole exchange, not each individual line.
+    ///
+    /// One command heals itself: a [`HostCommand::LoadPlugin`] that *kills* the helper is
+    /// replayed once against a freshly spawned one. A helper
+    /// that died mid-load holds nothing worth preserving — its load never completed — so the
+    /// replay is observationally identical to the caller having spawned the helper a moment
+    /// later, and it absorbs the cold-load crashes some real plugins lose a race to. A
+    /// timeout is not retried (it already cost a full deadline, and a plugin that hangs while
+    /// loading will hang again), and no other command is: those run against a helper holding
+    /// live plugin state that a fresh process would not have.
     pub fn send_command(&mut self, command: HostCommand) -> Result<HostResponse, String> {
+        if !matches!(command, HostCommand::LoadPlugin { .. }) {
+            return self.exchange(command).map_err(String::from);
+        }
+
+        let mut retries_left = LOAD_CRASH_RETRIES;
+        loop {
+            match self.exchange(command.clone()) {
+                Ok(response) => return Ok(response),
+                Err(ExchangeError::DiedDuringCommand(detail)) if retries_left > 0 => {
+                    retries_left -= 1;
+                    log::warn!(
+                        "isolation: the helper died while loading the plugin ({detail}); \
+                         retrying once with a fresh helper"
+                    );
+                    std::thread::sleep(LOAD_CRASH_RETRY_BACKOFF);
+                    if let Err(spawn_error) = self.respawn() {
+                        // No fresh helper to retry against — report the crash, not the spawn.
+                        log::warn!("isolation: could not respawn the helper: {spawn_error}");
+                        return Err(detail);
+                    }
+                }
+                Err(other) => return Err(String::from(other)),
+            }
+        }
+    }
+
+    /// One request/response exchange with the current child, with no recovery.
+    fn exchange(&mut self, command: HostCommand) -> Result<HostResponse, ExchangeError> {
         if self.dead {
-            return Err("Helper process is no longer running".to_string());
+            return Err(ExchangeError::AlreadyDead(
+                "Helper process is no longer running".to_string(),
+            ));
         }
 
         let command_json = serde_json::to_string(&command)
-            .map_err(|e| format!("Failed to serialize command: {}", e))?;
+            .map_err(|e| ExchangeError::Encoding(format!("Failed to serialize command: {}", e)))?;
 
         // Anything already queued predates this command.
         self.drop_stale_lines();
 
         {
-            let stdin = self.stdin.as_mut().ok_or("No stdin available")?;
-            writeln!(stdin, "{}", command_json).map_err(|e| {
+            let Some(stdin) = self.stdin.as_mut() else {
+                return Err(ExchangeError::AlreadyDead("No stdin available".to_string()));
+            };
+            if let Err(e) = writeln!(stdin, "{}", command_json).and_then(|()| stdin.flush()) {
                 self.dead = true;
-                format!("Failed to write command (helper gone?): {}", e)
-            })?;
-            stdin.flush().map_err(|e| {
-                self.dead = true;
-                format!("Failed to flush stdin (helper gone?): {}", e)
-            })?;
+                return Err(ExchangeError::DiedDuringCommand(format!(
+                    "Failed to write command (helper gone?): {}",
+                    e
+                )));
+            }
         }
 
         let timeout = self.timeout_for(&command);
@@ -1010,9 +1484,9 @@ impl PluginHostProcess {
                             // that is a crash, not noise, and must be reported as one.
                             if let Some(status) = self.exit_status() {
                                 self.dead = true;
-                                return Err(format!(
+                                return Err(ExchangeError::DiedDuringCommand(format!(
                                     "Helper process crashed: exited with {status} while writing a response ({parse_error})"
-                                ));
+                                )));
                             }
                             self.unparsed_lines += 1;
                             log::warn!(
@@ -1027,18 +1501,19 @@ impl PluginHostProcess {
                     if let Some(ref mut process) = self.process {
                         let _ = process.kill();
                     }
-                    return Err(format!(
+                    return Err(ExchangeError::TimedOut(format!(
                         "Timed out after {:?} waiting for helper response (plugin may have hung)",
                         timeout
-                    ));
+                    )));
                 }
                 Err(RecvTimeoutError::Disconnected) => {
                     // Reader thread ended => stdout closed => helper exited/crashed.
                     self.dead = true;
-                    return match self.check_process_status() {
-                        Err(status) => Err(format!("Helper process crashed: {}", status)),
-                        Ok(()) => Err("Helper process exited unexpectedly".to_string()),
+                    let detail = match self.check_process_status() {
+                        Err(status) => format!("Helper process crashed: {}", status),
+                        Ok(()) => "Helper process exited unexpectedly".to_string(),
                     };
+                    return Err(ExchangeError::DiedDuringCommand(detail));
                 }
             }
         }
@@ -1186,17 +1661,19 @@ mod wire_tests {
         // round-trips through the JSON transport host and helper share.
         let resp = HostResponse::AudioOutput {
             outputs: vec![vec![0.0, 0.5], vec![-0.5, 0.0]],
-            output_midi: vec![
+            output_events: vec![
                 MidiEvent::NoteOn {
                     channel: MidiChannel::Ch1,
                     note: 60,
                     velocity: 100,
-                },
+                }
+                .into(),
                 MidiEvent::NoteOff {
                     channel: MidiChannel::Ch1,
                     note: 60,
                     velocity: 0,
-                },
+                }
+                .into(),
             ],
         };
         let json = serde_json::to_string(&resp).expect("serialize");
@@ -1204,17 +1681,17 @@ mod wire_tests {
         match back {
             HostResponse::AudioOutput {
                 outputs,
-                output_midi,
+                output_events,
             } => {
                 assert_eq!(outputs, vec![vec![0.0, 0.5], vec![-0.5, 0.0]]);
-                assert_eq!(output_midi.len(), 2);
+                assert_eq!(output_events.len(), 2);
                 assert_eq!(
-                    output_midi[0],
-                    MidiEvent::NoteOn {
+                    output_events[0].to_midi(),
+                    Some(MidiEvent::NoteOn {
                         channel: MidiChannel::Ch1,
                         note: 60,
                         velocity: 100
-                    }
+                    })
                 );
             }
             other => panic!("round-trip changed the variant: {other:?}"),
@@ -1232,11 +1709,30 @@ mod wire_tests {
             HostCommand::SaveState
         ));
 
-        let load = HostCommand::LoadState { data: blob.clone() };
+        let load = HostCommand::LoadState {
+            data: blob.clone(),
+            context: crate::plugin::StateContext::Project,
+        };
         let load_json = serde_json::to_string(&load).expect("serialize LoadState");
+        assert!(
+            load_json.contains("\"data\":\""),
+            "state should use compact base64, not a JSON integer array"
+        );
         match serde_json::from_str::<HostCommand>(&load_json).expect("deserialize LoadState") {
-            HostCommand::LoadState { data } => assert_eq!(data, blob),
+            HostCommand::LoadState { data, context } => {
+                assert_eq!(data, blob);
+                assert_eq!(context, crate::plugin::StateContext::Project);
+            }
             other => panic!("LoadState round-trip changed the variant: {other:?}"),
+        }
+
+        let legacy = r#"{"LoadState":{"data":[0,1,2,250,255,42]}}"#;
+        match serde_json::from_str::<HostCommand>(legacy).expect("deserialize legacy LoadState") {
+            HostCommand::LoadState { data, context } => {
+                assert_eq!(data, blob);
+                assert_eq!(context, crate::plugin::StateContext::Project);
+            }
+            other => panic!("legacy LoadState changed the variant: {other:?}"),
         }
 
         let state = HostResponse::State { data: blob.clone() };
@@ -1297,6 +1793,31 @@ mod wire_tests {
                 assert_eq!(sample_offset, 256);
             }
             other => panic!("round-trip changed the variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn owned_sysex_round_trips_in_commands_and_process_output() {
+        let event = crate::midi::PluginEvent::sysex(vec![0xf0, 0x7d, 1, 2, 0xf7]).at(37);
+        let command = HostCommand::SendPluginEvent {
+            event: event.clone(),
+        };
+        let json = serde_json::to_string(&command).expect("serialize owned event");
+        match serde_json::from_str::<HostCommand>(&json).expect("deserialize owned event") {
+            HostCommand::SendPluginEvent { event: decoded } => assert_eq!(decoded, event),
+            other => panic!("owned event command changed variant: {other:?}"),
+        }
+
+        let response = HostResponse::AudioOutput {
+            outputs: Vec::new(),
+            output_events: vec![event.clone()],
+        };
+        let json = serde_json::to_string(&response).expect("serialize owned output");
+        match serde_json::from_str::<HostResponse>(&json).expect("deserialize owned output") {
+            HostResponse::AudioOutput { output_events, .. } => {
+                assert_eq!(output_events, vec![event])
+            }
+            other => panic!("owned event response changed variant: {other:?}"),
         }
     }
 
@@ -1432,6 +1953,7 @@ mod wire_tests {
             id: 0,
             parent_id: -1,
             name: "Root".to_string(),
+            program_list_id: Some(12),
             programs: vec!["Init".to_string(), "Lead".to_string()],
         }];
         let resp = HostResponse::Units {
@@ -1505,6 +2027,50 @@ mod wire_tests {
     }
 
     #[test]
+    fn parameter_id_remapping_round_trips_uid_and_optional_result() {
+        let uid = "123456789ABCDEF01122334455667788";
+        let command = HostCommand::RemapParameterId {
+            old_plugin_uid: uid.to_string(),
+            old_param_id: 0xDEAD_BEEF,
+        };
+        let json = serde_json::to_string(&command).expect("serialize RemapParameterId");
+        match serde_json::from_str::<HostCommand>(&json).expect("deserialize RemapParameterId") {
+            HostCommand::RemapParameterId {
+                old_plugin_uid,
+                old_param_id,
+            } => {
+                assert_eq!(old_plugin_uid, uid);
+                assert_eq!(old_param_id, 0xDEAD_BEEF);
+                assert!(crate::internal::utils::parse_class_uid(&old_plugin_uid).is_some());
+            }
+            other => panic!("RemapParameterId round-trip changed the variant: {other:?}"),
+        }
+
+        for id in [Some(42), None] {
+            let response = HostResponse::RemappedParameter { id };
+            let json = serde_json::to_string(&response).expect("serialize RemappedParameter");
+            match serde_json::from_str::<HostResponse>(&json)
+                .expect("deserialize RemappedParameter")
+            {
+                HostResponse::RemappedParameter { id: decoded } => assert_eq!(decoded, id),
+                other => panic!("RemappedParameter round-trip changed the variant: {other:?}"),
+            }
+        }
+
+        let invalid = HostCommand::RemapParameterId {
+            old_plugin_uid: "1234-not-a-uid".to_string(),
+            old_param_id: 1,
+        };
+        let json = serde_json::to_string(&invalid).expect("serialize invalid UID");
+        match serde_json::from_str::<HostCommand>(&json).expect("deserialize invalid UID") {
+            HostCommand::RemapParameterId { old_plugin_uid, .. } => {
+                assert!(crate::internal::utils::parse_class_uid(&old_plugin_uid).is_none());
+            }
+            other => panic!("invalid RemapParameterId changed the variant: {other:?}"),
+        }
+    }
+
+    #[test]
     fn parameter_edits_round_trip_across_the_wire() {
         // The ordered gesture log must survive the JSON transport host and helper share, both
         // the empty command and the populated reply.
@@ -1542,6 +2108,123 @@ mod wire_tests {
         {
             HostResponse::ParameterEdits { edits: back } => assert_eq!(back, edits),
             other => panic!("ParameterEdits round-trip changed the variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parameter_feedback_round_trips_losslessly_and_is_bounded() {
+        let command = serde_json::to_string(&HostCommand::TakeParameterChanges)
+            .expect("serialize TakeParameterChanges");
+        assert!(matches!(
+            serde_json::from_str::<HostCommand>(&command)
+                .expect("deserialize TakeParameterChanges"),
+            HostCommand::TakeParameterChanges
+        ));
+
+        let changes = vec![
+            (1, 0.25),
+            (2, -0.0),
+            (3, f64::NAN),
+            (4, f64::INFINITY),
+            (5, f64::NEG_INFINITY),
+        ];
+        let response = HostResponse::ParameterChanges {
+            changes: changes.clone(),
+        };
+        let json = serde_json::to_string(&response).expect("serialize parameter feedback");
+        let HostResponse::ParameterChanges { changes: decoded } =
+            serde_json::from_str::<HostResponse>(&json).expect("deserialize parameter feedback")
+        else {
+            panic!("parameter feedback changed response variant");
+        };
+        assert_eq!(
+            decoded
+                .iter()
+                .map(|&(id, value)| (id, value.to_bits()))
+                .collect::<Vec<_>>(),
+            changes
+                .iter()
+                .map(|&(id, value)| (id, value.to_bits()))
+                .collect::<Vec<_>>()
+        );
+
+        let over_limit = HostResponse::ParameterChanges {
+            changes: vec![(1, 0.5); MAX_WIRE_PARAMETER_CHANGES + 1],
+        };
+        assert!(
+            serde_json::to_string(&over_limit).is_err(),
+            "the helper must not emit an oversized feedback response"
+        );
+
+        let entries = (0..=MAX_WIRE_PARAMETER_CHANGES)
+            .map(|_| "[1,0]")
+            .collect::<Vec<_>>()
+            .join(",");
+        let oversized_json = format!("{{\"ParameterChanges\":{{\"changes\":[{entries}]}}}}");
+        assert!(
+            serde_json::from_str::<HostResponse>(&oversized_json).is_err(),
+            "the host must reject oversized feedback before collecting it"
+        );
+    }
+
+    #[test]
+    fn host_notifications_and_restart_requests_round_trip_across_the_wire() {
+        use crate::plugin::HostNotification;
+
+        for command in [
+            HostCommand::TakeHostNotifications,
+            HostCommand::ExecuteContextMenuItem {
+                menu_id: 19,
+                item_id: 3,
+            },
+            HostCommand::DismissContextMenu { menu_id: 20 },
+            HostCommand::TakeRestartFlags,
+            HostCommand::ServiceHostRequests,
+        ] {
+            let json = serde_json::to_string(&command).expect("serialize host request");
+            let decoded = serde_json::from_str::<HostCommand>(&json).expect("deserialize");
+            assert_eq!(
+                std::mem::discriminant(&decoded),
+                std::mem::discriminant(&command)
+            );
+        }
+
+        let notifications = vec![
+            HostNotification::DirtyChanged(true),
+            HostNotification::OpenEditorRequested {
+                name: Some("editor".to_string()),
+            },
+            HostNotification::GroupEditStarted,
+            HostNotification::GroupEditFinished,
+            HostNotification::ContextMenuRequested {
+                menu_id: 19,
+                parameter_id: Some(44),
+                x: 12,
+                y: 24,
+                items: vec![crate::plugin::ContextMenuItem {
+                    item_id: 0,
+                    name: "Reset".to_string(),
+                    tag: 7,
+                    flags: 0,
+                }],
+            },
+        ];
+        let response = HostResponse::HostNotifications {
+            notifications: notifications.clone(),
+        };
+        let json = serde_json::to_string(&response).expect("serialize notifications");
+        match serde_json::from_str::<HostResponse>(&json).expect("deserialize notifications") {
+            HostResponse::HostNotifications {
+                notifications: decoded,
+            } => assert_eq!(decoded, notifications),
+            other => panic!("HostNotifications changed variant: {other:?}"),
+        }
+
+        let response = HostResponse::RestartFlags { bits: 0x345 };
+        let json = serde_json::to_string(&response).expect("serialize restart flags");
+        match serde_json::from_str::<HostResponse>(&json).expect("deserialize restart flags") {
+            HostResponse::RestartFlags { bits } => assert_eq!(bits, 0x345),
+            other => panic!("RestartFlags changed variant: {other:?}"),
         }
     }
 
@@ -1657,7 +2340,7 @@ mod wire_tests {
         ];
         let resp = HostResponse::AudioOutput {
             outputs: vec![channel.clone(), vec![]],
-            output_midi: Vec::new(),
+            output_events: Vec::new(),
         };
         let json = serde_json::to_string(&resp).expect("serialize");
         assert!(
@@ -1688,6 +2371,51 @@ mod wire_tests {
                 assert_eq!(inputs[0][1], 1.0);
             }
             other => panic!("Process round-trip changed the variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bus_audio_wire_preserves_bus_boundaries_activation_and_sample_bits() {
+        let command = HostCommand::ProcessBuses {
+            inputs: vec![
+                crate::audio::AudioBusBuffer {
+                    active: true,
+                    channels: vec![vec![f32::NAN, 1.0], vec![2.0, 3.0]],
+                },
+                crate::audio::AudioBusBuffer {
+                    active: false,
+                    channels: vec![vec![99.0, 99.0]],
+                },
+            ],
+            outputs: vec![
+                crate::audio::AudioBusConfig {
+                    channel_count: 2,
+                    active: true,
+                },
+                crate::audio::AudioBusConfig {
+                    channel_count: 1,
+                    active: false,
+                },
+            ],
+            frames: 2,
+        };
+        let json = serde_json::to_string(&command).expect("serialize ProcessBuses");
+        match serde_json::from_str::<HostCommand>(&json).expect("deserialize ProcessBuses") {
+            HostCommand::ProcessBuses {
+                inputs,
+                outputs,
+                frames,
+            } => {
+                assert_eq!(frames, 2);
+                assert_eq!(inputs.len(), 2);
+                assert!(inputs[0].active);
+                assert!(!inputs[1].active);
+                assert!(inputs[0].channels[0][0].is_nan());
+                assert_eq!(inputs[1].channels[0], [99.0, 99.0]);
+                assert_eq!(outputs[1].channel_count, 1);
+                assert!(!outputs[1].active);
+            }
+            other => panic!("ProcessBuses round-trip changed the variant: {other:?}"),
         }
     }
 
@@ -1757,7 +2485,7 @@ mod wire_tests {
         let plain = serde_json::to_string(&block).expect("plain json").len();
         let encoded = serde_json::to_string(&HostResponse::AudioOutput {
             outputs: block,
-            output_midi: Vec::new(),
+            output_events: Vec::new(),
         })
         .expect("encoded json")
         .len();
@@ -1793,7 +2521,7 @@ mod wire_tests {
             .map(|_| audio_codec::encode_channel(&[0.0]))
             .collect();
         let json = serde_json::to_string(&serde_json::json!({
-            "AudioOutput": { "outputs": channels, "output_midi": [] }
+            "AudioOutput": { "outputs": channels, "output_events": [] }
         }))
         .expect("serialize");
         match serde_json::from_str::<HostResponse>(&json).expect("deserialize") {
@@ -1826,7 +2554,10 @@ mod wire_tests {
     #[test]
     fn slow_commands_are_classified_apart_from_the_per_block_ones() {
         assert!(is_slow_command(&HostCommand::SaveState));
-        assert!(is_slow_command(&HostCommand::LoadState { data: vec![] }));
+        assert!(is_slow_command(&HostCommand::LoadState {
+            data: vec![],
+            context: crate::plugin::StateContext::Project,
+        }));
         assert!(is_slow_command(&HostCommand::LoadPlugin {
             path: "x".into(),
             sample_rate: 44100.0,
@@ -1834,6 +2565,7 @@ mod wire_tests {
             tempo: 120.0,
             time_sig_numerator: 4,
             time_sig_denominator: 4,
+            class_id: None,
         }));
         assert!(!is_slow_command(&HostCommand::Process {
             inputs: vec![],
@@ -1880,6 +2612,161 @@ mod wire_tests {
         assert!(proc.send_command(HostCommand::Shutdown).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A helper that dies on its Nth load and answers otherwise, so a test can pin exactly how
+    /// many load attempts the host makes. `crashing_loads` is how many of the first loads —
+    /// counted across every process spawned from this script — end in a killed helper.
+    #[cfg(unix)]
+    struct FlakyLoadHelper {
+        dir: std::path::PathBuf,
+        script: std::path::PathBuf,
+        attempts: std::path::PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl FlakyLoadHelper {
+        fn new(name: &str, crashing_loads: u32) -> Self {
+            use std::io::Write;
+            use std::os::unix::fs::PermissionsExt;
+
+            let dir = std::env::temp_dir().join(format!(
+                "vst3_flaky_{name}_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            let script = dir.join("flaky-helper");
+            let attempts = dir.join("attempts");
+
+            let mut f = std::fs::File::create(&script).expect("create script");
+            // Every LoadPlugin bumps a shared counter; the first `crashing_loads` of them make
+            // the helper exit without answering, which is what a plugin crashing inside its own
+            // initialization looks like from the host's side.
+            write!(
+                f,
+                "#!/bin/sh\n\
+                 while IFS= read -r line; do\n\
+                 \x20 case \"$line\" in\n\
+                 \x20   *LoadPlugin*)\n\
+                 \x20     n=$(cat '{attempts}' 2>/dev/null || echo 0)\n\
+                 \x20     n=$((n+1))\n\
+                 \x20     printf '%s' \"$n\" > '{attempts}'\n\
+                 \x20     if [ \"$n\" -le {crashing_loads} ]; then exit 3; fi\n\
+                 \x20     printf '%s\\n' '{{\"PluginInfo\":{{\"vendor\":\"v\",\"name\":\"n\",\"version\":\"1\",\"category\":\"\",\"uid\":\"u\",\"has_gui\":false,\"audio_inputs\":0,\"audio_outputs\":1,\"output_channels\":2,\"has_midi_input\":true,\"has_midi_output\":false}}}}' ;;\n\
+                 \x20   *) exit 3 ;;\n\
+                 \x20 esac\n\
+                 done\n",
+                attempts = attempts.display(),
+                crashing_loads = crashing_loads,
+            )
+            .expect("write script");
+            drop(f);
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+            Self {
+                dir,
+                script,
+                attempts,
+            }
+        }
+
+        fn load_attempts(&self) -> u32 {
+            std::fs::read_to_string(&self.attempts)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0)
+        }
+
+        fn load_command() -> HostCommand {
+            HostCommand::LoadPlugin {
+                path: "/tmp/flaky.vst3".to_string(),
+                sample_rate: 44100.0,
+                block_size: 512,
+                tempo: 120.0,
+                time_sig_numerator: 4,
+                time_sig_denominator: 4,
+                class_id: None,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for FlakyLoadHelper {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Real plugins lose races inside their own cold-start initialization and take the helper
+    /// down with them. A fresh helper is an independent roll and the dead one held nothing, so
+    /// the load is replayed rather than reported.
+    #[cfg(unix)]
+    #[test]
+    fn a_load_that_kills_the_helper_is_replayed_against_a_fresh_one() {
+        let fake = FlakyLoadHelper::new("recovers", 1);
+        let mut proc = PluginHostProcess::spawn(fake.script.clone(), Duration::from_secs(5))
+            .expect("spawn flaky helper");
+        let first_pid = proc.helper_pid().expect("helper pid");
+
+        let response = proc
+            .send_command(FlakyLoadHelper::load_command())
+            .expect("a crashed load must be retried, not reported");
+        assert!(matches!(response, HostResponse::PluginInfo { .. }));
+        assert_eq!(fake.load_attempts(), 2, "the load should be tried twice");
+        assert_ne!(
+            proc.helper_pid().expect("helper pid after retry"),
+            first_pid,
+            "the retry must run against a freshly spawned helper"
+        );
+        assert!(proc.is_alive(), "the handle must be usable after the retry");
+    }
+
+    /// The retry is bounded: a plugin that genuinely cannot load reports that after one extra
+    /// attempt rather than respawning forever.
+    #[cfg(unix)]
+    #[test]
+    fn a_load_that_always_crashes_gives_up_after_one_retry() {
+        let fake = FlakyLoadHelper::new("always", 99);
+        let mut proc = PluginHostProcess::spawn(fake.script.clone(), Duration::from_secs(5))
+            .expect("spawn flaky helper");
+
+        let error = proc
+            .send_command(FlakyLoadHelper::load_command())
+            .expect_err("a load that always crashes must still fail");
+        assert!(
+            error.to_lowercase().contains("crash") || error.to_lowercase().contains("exited"),
+            "the reported failure must still read as a crash, got {error}"
+        );
+        assert_eq!(
+            fake.load_attempts(),
+            1 + LOAD_CRASH_RETRIES,
+            "exactly one retry, no more"
+        );
+    }
+
+    /// Only the load is replayed. Every other command runs against a helper holding live
+    /// plugin state, which a fresh process would not have — silently redoing those would hand
+    /// the caller a default-initialized plugin dressed up as a success.
+    #[cfg(unix)]
+    #[test]
+    fn a_crash_on_any_other_command_is_reported_not_retried() {
+        let fake = FlakyLoadHelper::new("other", 0);
+        let mut proc = PluginHostProcess::spawn(fake.script.clone(), Duration::from_secs(5))
+            .expect("spawn flaky helper");
+        let pid = proc.helper_pid().expect("helper pid");
+
+        assert!(
+            proc.send_command(HostCommand::GetAllParameters).is_err(),
+            "a helper that dies mid-command must surface as an error"
+        );
+        assert_eq!(
+            proc.helper_pid(),
+            Some(pid),
+            "no other command may respawn the helper"
+        );
+        assert!(!proc.is_alive());
     }
 }
 

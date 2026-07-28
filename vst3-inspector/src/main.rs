@@ -729,6 +729,10 @@ impl eframe::App for VST3Inspector {
         // Resolve a file dialog the user has answered.
         self.poll_file_dialog();
 
+        // Give the editor window its per-frame service slot: plugin-initiated resizes (a VSTGUI
+        // zoom asks the host to grow the window) and, on Windows, queued DPI changes.
+        self.service_plugin_window();
+
         // The plugin's editor window has its own close button, which tells neither the plugin nor
         // us. Poll it so the header button and `gui_attached` follow the window that is actually
         // on screen, and so the editor is detached properly rather than left on a dead window.
@@ -971,6 +975,20 @@ impl VST3Inspector {
     /// or respond when the host services them — `update()` runs at the monitor refresh rate (see
     /// the unconditional `request_repaint()` below), which is the cadence the library asks for.
     /// A no-op on other platforms, so the call stays platform-agnostic here.
+    /// Let the editor window apply the window-level work that has to reach the plugin: a resize
+    /// the plugin asked for through `IPlugFrame`, and (on Windows) a queued DPI change. The
+    /// library call is non-blocking — it skips a frame rather than stall behind the audio
+    /// callback — so this is safe to run unconditionally at UI cadence.
+    fn service_plugin_window(&mut self) {
+        let Some(window) = self.plugin_window.as_ref() else {
+            return;
+        };
+        let outcome = window.service_platform_events();
+        if let Err(e) = outcome {
+            self.set_error(format!("Editor window update failed: {e}"));
+        }
+    }
+
     fn service_plugin_run_loop(&mut self) {
         if self.plugin_window.is_none() {
             return;

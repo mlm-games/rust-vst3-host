@@ -218,9 +218,32 @@ impl Vst3Host {
         }
 
         if self.use_process_isolation {
-            self.load_plugin_isolated(path)
+            self.load_plugin_isolated(path, None)
         } else {
-            self.load_plugin_internal(path)
+            self.load_plugin_internal(path, None)
+        }
+    }
+
+    /// Load a particular audio class from a VST3 bundle.
+    ///
+    /// `class_id` may be either a current class id exported by the factory or a retired id
+    /// mapped to its replacement by the bundle's validated `moduleinfo.json`. This is useful
+    /// when restoring a session whose plugin id predates a vendor's UID migration.
+    pub fn load_plugin_class<P: AsRef<Path>>(&mut self, path: P, class_id: &str) -> Result<Plugin> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Err(Error::PluginNotFound(path.display().to_string()));
+        }
+        crate::internal::utils::parse_class_uid(class_id).ok_or_else(|| {
+            Error::PluginLoadFailed(
+                "class id must be exactly 32 hexadecimal characters".to_string(),
+            )
+        })?;
+
+        if self.use_process_isolation {
+            self.load_plugin_isolated(path, Some(class_id))
+        } else {
+            self.load_plugin_internal(path, Some(class_id))
         }
     }
 
@@ -249,6 +272,7 @@ impl Vst3Host {
             tempo: self.config.tempo,
             time_sig_numerator: self.config.time_sig_numerator,
             time_sig_denominator: self.config.time_sig_denominator,
+            class_id: None,
         }) {
             Ok(HostResponse::PluginInfo { .. }) => ProbeResult::Ok,
             Ok(HostResponse::Error { message }) => ProbeResult::Failed(message),
@@ -260,9 +284,12 @@ impl Vst3Host {
     }
 
     /// Load a plugin in-process
-    fn load_plugin_internal(&mut self, path: &Path) -> Result<Plugin> {
+    fn load_plugin_internal(&mut self, path: &Path, class_id: Option<&str>) -> Result<Plugin> {
         // Load the plugin implementation directly - it will handle path resolution
-        let mut plugin_impl = crate::internal::plugin_impl::PluginImpl::load(path)?;
+        let mut plugin_impl = match class_id {
+            Some(class_id) => crate::internal::plugin_impl::PluginImpl::load_class(path, class_id)?,
+            None => crate::internal::plugin_impl::PluginImpl::load(path)?,
+        };
 
         // Apply the builder's audio config (sample rate / block size) so the plugin actually
         // processes at the requested settings, not the internal defaults.
@@ -278,6 +305,7 @@ impl Vst3Host {
 
         // Get the updated info from the plugin implementation (has_gui might have been updated)
         let updated_info = plugin_impl.info.clone();
+        let compatibility = plugin_impl.compatibility.clone();
 
         // Size meters to the plugin's real output channel count (bus-aware), not a stereo
         // assumption; fall back to 2 only when the plugin reports no output channels.
@@ -288,6 +316,7 @@ impl Vst3Host {
 
         let plugin = Plugin {
             info: updated_info,
+            compatibility,
             is_processing: false,
             sample_rate: self.config.sample_rate,
             block_size: self.config.block_size,
@@ -301,7 +330,7 @@ impl Vst3Host {
     }
 
     /// Load a plugin in an isolated process
-    fn load_plugin_isolated(&mut self, path: &Path) -> Result<Plugin> {
+    fn load_plugin_isolated(&mut self, path: &Path, class_id: Option<&str>) -> Result<Plugin> {
         use crate::process_isolation::{HostCommand, HostResponse, PluginHostProcess};
 
         // Create and start the isolated plugin process
@@ -318,12 +347,13 @@ impl Vst3Host {
                 tempo: self.config.tempo,
                 time_sig_numerator: self.config.time_sig_numerator,
                 time_sig_denominator: self.config.time_sig_denominator,
+                class_id: class_id.map(str::to_owned),
             })
             .map_err(|e| Error::Other(format!("Failed to load plugin in isolation: {}", e)))?;
 
         // Verify the plugin loaded successfully. Metadata comes straight from the helper's
         // accurate introspection, so the isolated path matches the in-process one.
-        let (loaded_info, output_channels) = match response {
+        let (loaded_info, compatibility, output_channels) = match response {
             HostResponse::PluginInfo {
                 vendor,
                 name,
@@ -336,6 +366,7 @@ impl Vst3Host {
                 output_channels,
                 has_midi_input,
                 has_midi_output,
+                compatibility,
             } => {
                 let info = PluginInfo {
                     path: path.to_path_buf(),
@@ -351,7 +382,7 @@ impl Vst3Host {
                     has_midi_output,
                 };
                 let channels = clamp_output_channels(output_channels);
-                (info, channels)
+                (info, compatibility, channels)
             }
             HostResponse::Error { message } => {
                 return Err(Error::Other(format!("Failed to load plugin: {}", message)));
@@ -381,6 +412,7 @@ impl Vst3Host {
 
         let plugin = Plugin {
             info: loaded_info,
+            compatibility,
             is_processing: false,
             sample_rate: self.config.sample_rate,
             block_size: self.config.block_size,

@@ -148,6 +148,7 @@ fn handle(
             tempo,
             time_sig_numerator,
             time_sig_denominator,
+            class_id,
         } => {
             *sample_rate = sr;
             let mut host = match Vst3Host::builder()
@@ -160,9 +161,14 @@ fn handle(
                 Ok(h) => h,
                 Err(e) => return err("Failed to build host", e),
             };
-            match host.load_plugin(&path) {
+            let loaded = match class_id {
+                Some(class_id) => host.load_plugin_class(&path, &class_id),
+                None => host.load_plugin(&path),
+            };
+            match loaded {
                 Ok(p) => {
                     let info = p.info().clone();
+                    let compatibility = p.class_compatibility().to_vec();
                     let output_channels = p.output_channel_count() as i32;
                     *plugin.lock().unwrap() = Some(p);
                     HostResponse::PluginInfo {
@@ -177,6 +183,7 @@ fn handle(
                         output_channels,
                         has_midi_input: info.has_midi_input,
                         has_midi_output: info.has_midi_output,
+                        compatibility,
                     }
                 }
                 Err(e) => err("Failed to load plugin", e),
@@ -290,6 +297,20 @@ fn handle(
                 Err(e) => err("SendMidiAt", e),
             }
         }),
+        HostCommand::SendPluginEvent { event } => {
+            with(plugin, |p| match p.send_plugin_event(event) {
+                Ok(()) => HostResponse::Success {
+                    message: "plugin event sent".to_string(),
+                },
+                Err(e) => err("SendPluginEvent", e),
+            })
+        }
+        HostCommand::MidiPanic => with(plugin, |p| match p.midi_panic() {
+            Ok(()) => HostResponse::Success {
+                message: "MIDI panic queued".to_string(),
+            },
+            Err(e) => err("MidiPanic", e),
+        }),
         HostCommand::SetBusActive {
             media_type,
             direction,
@@ -319,6 +340,109 @@ fn handle(
             Ok(units) => HostResponse::Units { units },
             Err(e) => err("GetUnits", e),
         }),
+        HostCommand::GetSelectedUnit => with(plugin, |p| match p.selected_unit() {
+            Ok(unit_id) => HostResponse::SelectedUnit { unit_id },
+            Err(e) => err("GetSelectedUnit", e),
+        }),
+        HostCommand::SelectUnit { unit_id } => with(plugin, |p| match p.select_unit(unit_id) {
+            Ok(()) => HostResponse::Success {
+                message: "unit selected".to_string(),
+            },
+            Err(e) => err("SelectUnit", e),
+        }),
+        HostCommand::ProgramPitchNames {
+            program_list_id,
+            program_index,
+        } => with(plugin, |p| {
+            match p.program_pitch_names(program_list_id, program_index) {
+                Ok(names) => HostResponse::ProgramPitchNames { names },
+                Err(e) => err("ProgramPitchNames", e),
+            }
+        }),
+        HostCommand::GetProgramData {
+            program_list_id,
+            program_index,
+        } => with(plugin, |p| {
+            match p.get_program_data(program_list_id, program_index) {
+                Ok(data) => HostResponse::OpaqueData {
+                    supported: data.is_some(),
+                    data: data.unwrap_or_default(),
+                },
+                Err(e) => err("GetProgramData", e),
+            }
+        }),
+        HostCommand::SetProgramData {
+            program_list_id,
+            program_index,
+            data,
+        } => with(plugin, |p| {
+            match p.set_program_data(program_list_id, program_index, &data) {
+                Ok(()) => HostResponse::Success {
+                    message: "program data restored".to_string(),
+                },
+                Err(e) => err("SetProgramData", e),
+            }
+        }),
+        HostCommand::GetUnitData { unit_id } => with(plugin, |p| match p.get_unit_data(unit_id) {
+            Ok(data) => HostResponse::OpaqueData {
+                supported: data.is_some(),
+                data: data.unwrap_or_default(),
+            },
+            Err(e) => err("GetUnitData", e),
+        }),
+        HostCommand::SetUnitData { unit_id, data } => {
+            with(plugin, |p| match p.set_unit_data(unit_id, &data) {
+                Ok(()) => HostResponse::Success {
+                    message: "unit data restored".to_string(),
+                },
+                Err(e) => err("SetUnitData", e),
+            })
+        }
+        HostCommand::BeginHostEdit { parameter_id } => {
+            with(plugin, |p| match p.begin_host_edit(parameter_id) {
+                Ok(()) => HostResponse::Success {
+                    message: "host edit begun".to_string(),
+                },
+                Err(e) => err("BeginHostEdit", e),
+            })
+        }
+        HostCommand::EndHostEdit { parameter_id } => {
+            with(plugin, |p| match p.end_host_edit(parameter_id) {
+                Ok(()) => HostResponse::Success {
+                    message: "host edit ended".to_string(),
+                },
+                Err(e) => err("EndHostEdit", e),
+            })
+        }
+        HostCommand::SendMidiLearn {
+            bus,
+            channel,
+            controller,
+        } => with(plugin, |p| {
+            match p.send_midi_learn(bus, channel, controller) {
+                Ok(()) => HostResponse::Success {
+                    message: "MIDI learn notified".to_string(),
+                },
+                Err(e) => err("SendMidiLearn", e),
+            }
+        }),
+        HostCommand::SetAutomationState { state } => {
+            with(plugin, |p| match p.set_automation_state(state) {
+                Ok(()) => HostResponse::Success {
+                    message: "automation state set".to_string(),
+                },
+                Err(e) => err("SetAutomationState", e),
+            })
+        }
+        HostCommand::RemapParameterId {
+            old_plugin_uid,
+            old_param_id,
+        } => with(plugin, |p| {
+            match p.remap_parameter_id(&old_plugin_uid, old_param_id) {
+                Ok(id) => HostResponse::RemappedParameter { id },
+                Err(e) => err("RemapParameterId", e),
+            }
+        }),
         HostCommand::LatencySamples => with(plugin, |p| HostResponse::LatencySamples {
             samples: p.latency_samples(),
         }),
@@ -345,21 +469,67 @@ fn handle(
                 match p.process_audio(&mut buffers) {
                     Ok(()) => HostResponse::AudioOutput {
                         outputs: buffers.outputs,
-                        output_midi: p.take_output_midi(),
+                        output_events: p.take_output_events(),
                     },
                     Err(e) => err("Process", e),
                 }
             })
         }
+        HostCommand::ProcessBuses {
+            inputs,
+            outputs,
+            frames,
+        } => {
+            if inputs.len() > 256
+                || outputs.len() > 256
+                || frames as usize > (1 << 20)
+                || outputs.iter().any(|bus| bus.channel_count > 256)
+            {
+                return HostResponse::Error {
+                    message: "ProcessBuses: bus shape exceeds wire limits".to_string(),
+                };
+            }
+            let sr = *sample_rate;
+            with(plugin, |p| {
+                let mut buffers = vst3_host::BusAudioBuffers {
+                    inputs,
+                    outputs: outputs
+                        .iter()
+                        .map(|config| {
+                            vst3_host::AudioBusBuffer::new(
+                                config.channel_count,
+                                frames as usize,
+                                config.active,
+                            )
+                        })
+                        .collect(),
+                    sample_rate: sr,
+                    block_size: frames as usize,
+                };
+                match p.process_bus_audio(&mut buffers) {
+                    Ok(()) => HostResponse::BusAudioOutput {
+                        outputs: buffers.outputs,
+                        output_events: p.take_output_events(),
+                    },
+                    Err(e) => err("ProcessBuses", e),
+                }
+            })
+        }
+        HostCommand::AudioBusLayout => with(plugin, |p| match p.audio_bus_layout() {
+            Ok(layout) => HostResponse::AudioBusLayout { layout },
+            Err(e) => err("AudioBusLayout", e),
+        }),
         HostCommand::SaveState => with(plugin, |p| match p.save_state() {
             Ok(data) => HostResponse::State { data },
             Err(e) => err("SaveState", e),
         }),
-        HostCommand::LoadState { data } => with(plugin, |p| match p.load_state(&data) {
-            Ok(()) => HostResponse::Success {
-                message: "state restored".to_string(),
-            },
-            Err(e) => err("LoadState", e),
+        HostCommand::LoadState { data, context } => with(plugin, |p| {
+            match p.load_state_with_context(&data, &context) {
+                Ok(()) => HostResponse::Success {
+                    message: "state restored".to_string(),
+                },
+                Err(e) => err("LoadState", e),
+            }
         }),
         HostCommand::NoteOn {
             channel,
@@ -426,6 +596,38 @@ fn handle(
         }),
         HostCommand::TakeParameterEdits => with(plugin, |p| HostResponse::ParameterEdits {
             edits: p.take_parameter_edits(),
+        }),
+        HostCommand::TakeParameterChanges => with(plugin, |p| HostResponse::ParameterChanges {
+            changes: p.get_parameter_changes(),
+        }),
+        HostCommand::TakeHostNotifications => with(plugin, |p| HostResponse::HostNotifications {
+            notifications: p.take_host_notifications(),
+        }),
+        HostCommand::TakeDataExchangeBlocks => with(plugin, |p| HostResponse::DataExchangeBlocks {
+            blocks: p.take_data_exchange_blocks(),
+        }),
+        HostCommand::ExecuteContextMenuItem { menu_id, item_id } => with(plugin, |p| {
+            match p.execute_context_menu_item(menu_id, item_id) {
+                Ok(()) => HostResponse::Success {
+                    message: "context-menu item executed".to_string(),
+                },
+                Err(error) => err("ExecuteContextMenuItem", error),
+            }
+        }),
+        HostCommand::DismissContextMenu { menu_id } => {
+            with(plugin, |p| match p.dismiss_context_menu(menu_id) {
+                Ok(()) => HostResponse::Success {
+                    message: "context menu dismissed".to_string(),
+                },
+                Err(error) => err("DismissContextMenu", error),
+            })
+        }
+        HostCommand::TakeRestartFlags => with(plugin, |p| HostResponse::RestartFlags {
+            bits: p.take_restart_flags().bits(),
+        }),
+        HostCommand::ServiceHostRequests => with(plugin, |p| match p.service_host_requests() {
+            Ok(flags) => HostResponse::RestartFlags { bits: flags.bits() },
+            Err(error) => err("ServiceHostRequests", error),
         }),
         HostCommand::CreateGui => gui_request(gui, true),
         HostCommand::CloseGui => gui_request(gui, false),

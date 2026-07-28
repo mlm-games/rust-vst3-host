@@ -40,11 +40,8 @@ impl Parameter {
     /// Convert normalized value (0.0-1.0) to plain value
     pub fn normalized_to_plain(&self, normalized: f64) -> f64 {
         if self.step_count >= 1 {
-            // Stepped parameter: snap to the nearest step. Includes toggles (`step_count == 1`),
-            // which snap to exactly min or max.
-            let steps = self.step_count as f64;
-            let step = (normalized * steps).round();
-            self.min + (step / steps) * (self.max - self.min)
+            let step = self.step_index(normalized).unwrap_or_default() as f64;
+            self.min + (step / self.step_count as f64) * (self.max - self.min)
         } else {
             // Continuous parameter
             self.min + normalized * (self.max - self.min)
@@ -55,7 +52,11 @@ impl Parameter {
     /// (so `step_count + 1` possible values). `None` for a continuous parameter.
     pub fn step_index(&self, normalized: f64) -> Option<i32> {
         if self.step_count >= 1 {
-            Some((normalized.clamp(0.0, 1.0) * self.step_count as f64).round() as i32)
+            let value = normalized.clamp(0.0, 1.0);
+            // `step_count` comes straight from the plugin, so the "+1 values" arithmetic is done
+            // in `f64` — `step_count + 1` on an `i32` overflows for a plugin that reports
+            // `i32::MAX`. The float-to-int cast saturates, and `min` puts it back in range.
+            Some(((value * (f64::from(self.step_count) + 1.0)) as i32).min(self.step_count))
         } else {
             None
         }
@@ -423,6 +424,49 @@ mod tests {
             .collect();
         assert_eq!(finite, vec![0.0, 1.0]);
         assert!(auto.points.last().unwrap().time.is_nan());
+    }
+
+    fn stepped(step_count: i32) -> Parameter {
+        Parameter {
+            id: 0,
+            name: "stepped".to_string(),
+            value: 0.0,
+            min: 0.0,
+            max: 1.0,
+            default: 0.0,
+            unit: String::new(),
+            step_count,
+            can_automate: true,
+            is_read_only: false,
+            is_bypass: false,
+            flags: 0,
+        }
+    }
+
+    /// `step_count` is whatever the plugin reported, so the `+ 1` for "step_count + 1 values"
+    /// has to survive `i32::MAX` — in `i32` that arithmetic overflows and panics in debug.
+    #[test]
+    fn step_index_survives_an_absurd_step_count() {
+        let param = stepped(i32::MAX);
+        for normalized in [0.0, 0.5, 1.0] {
+            let index = param.step_index(normalized).expect("stepped");
+            assert!(
+                (0..=i32::MAX).contains(&index),
+                "step_index({normalized}) = {index}"
+            );
+        }
+        assert_eq!(param.step_index(1.0), Some(i32::MAX));
+        // And `format_value`, which goes through the same maths, still renders.
+        assert!(!param.format_value(1.0).is_empty());
+    }
+
+    #[test]
+    fn step_index_covers_every_value_of_an_ordinary_stepped_parameter() {
+        let param = stepped(2); // three values
+        assert_eq!(param.step_index(0.0), Some(0));
+        assert_eq!(param.step_index(0.5), Some(1));
+        assert_eq!(param.step_index(1.0), Some(2));
+        assert_eq!(stepped(0).step_index(0.5), None);
     }
 
     #[test]

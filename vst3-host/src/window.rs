@@ -16,15 +16,21 @@ use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
 #[cfg(target_os = "windows")]
 use winapi::{
-    shared::minwindef::{HINSTANCE, LPARAM, LRESULT, UINT, WPARAM},
+    shared::minwindef::{LPARAM, LRESULT, UINT, WPARAM},
     shared::windef::{HWND, RECT},
     um::libloaderapi::GetModuleHandleW,
     um::winuser::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, LoadCursorW, RegisterClassExW, ShowWindow,
-        UpdateWindow, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, IDC_ARROW, SW_SHOW, WM_CLOSE,
-        WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
+        CreateWindowExW, DefWindowProcW, DestroyWindow, LoadCursorW, RegisterClassExW,
+        SetWindowPos, ShowWindow, UpdateWindow, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, IDC_ARROW,
+        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SW_SHOW, WM_CLOSE, WM_DPICHANGED, WNDCLASSEXW,
+        WS_OVERLAPPEDWINDOW,
     },
 };
+
+#[cfg(any(test, target_os = "windows"))]
+fn dpi_scale_factor(dpi: u32) -> Option<f32> {
+    (dpi > 0).then_some(dpi as f32 / 96.0)
+}
 
 /// Editor windows whose window procedure has seen `WM_CLOSE`, keyed by `HWND` (as `usize`,
 /// since `HWND` is a raw pointer and not `Send`).
@@ -39,8 +45,27 @@ fn close_requests() -> &'static Mutex<std::collections::HashSet<usize>> {
     REQUESTS.get_or_init(Mutex::default)
 }
 
-/// Window procedure for plugin editor windows: record `WM_CLOSE` and swallow it, defer the rest
-/// to the default handler.
+/// Latest pending DPI for each editor window. The window procedure cannot call into the plugin:
+/// `setContentScaleFactor` may synchronously enter arbitrary plugin/UI code, while callers often
+/// hold the plugin mutex when Windows dispatches a message. The procedure records only the
+/// newest DPI and [`PluginWindow::service_platform_events`] applies it after the callback returns.
+#[cfg(target_os = "windows")]
+fn dpi_changes() -> &'static Mutex<std::collections::HashMap<usize, u32>> {
+    static CHANGES: std::sync::OnceLock<Mutex<std::collections::HashMap<usize, u32>>> =
+        std::sync::OnceLock::new();
+    CHANGES.get_or_init(Mutex::default)
+}
+
+#[cfg(target_os = "windows")]
+fn dpi_from_wparam(wparam: WPARAM) -> Option<u32> {
+    // WM_DPICHANGED packs the new X DPI into LOWORD and Y DPI into HIWORD. VST3 has one content
+    // scale, and Windows normally reports both equally, so use X as Microsoft recommends.
+    let dpi = (wparam & 0xffff) as u32;
+    (dpi > 0).then_some(dpi)
+}
+
+/// Window procedure for plugin editor windows: record control-plane work and defer plugin calls
+/// until after Windows returns from the callback.
 ///
 /// # Safety
 ///
@@ -56,6 +81,28 @@ unsafe extern "system" fn plugin_window_proc(
     if msg == WM_CLOSE {
         if let Ok(mut requests) = close_requests().lock() {
             requests.insert(hwnd as usize);
+        }
+        return 0;
+    }
+    if msg == WM_DPICHANGED {
+        // The suggested rectangle is valid only for this callback and must be applied
+        // synchronously. Do that before taking any host mutex: SetWindowPos may dispatch more
+        // window messages reentrantly.
+        if let Some(suggested) = (lparam as *const RECT).as_ref() {
+            SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                suggested.left,
+                suggested.top,
+                suggested.right - suggested.left,
+                suggested.bottom - suggested.top,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+        if let Some(dpi) = dpi_from_wparam(wparam) {
+            if let Ok(mut changes) = dpi_changes().lock() {
+                changes.insert(hwnd as usize, dpi);
+            }
         }
         return 0;
     }
@@ -76,6 +123,10 @@ pub struct PluginWindow {
     plugin: Arc<Mutex<Plugin>>,
     #[cfg(target_os = "macos")]
     native_window: Option<Retained<NSWindow>>,
+    /// The view the plugin attached its editor into. Kept so a plugin-initiated resize can
+    /// grow the container along with the window.
+    #[cfg(target_os = "macos")]
+    container_view: Option<Retained<NSView>>,
     #[cfg(target_os = "windows")]
     native_window: Option<HWND>,
     #[cfg(target_os = "linux")]
@@ -96,6 +147,8 @@ impl PluginWindow {
                 target_os = "android"
             ))]
             native_window: None,
+            #[cfg(target_os = "macos")]
+            container_view: None,
         }
     }
 
@@ -201,6 +254,7 @@ impl PluginWindow {
             window.center();
 
             self.native_window = Some(window);
+            self.container_view = Some(container_view);
         }
 
         #[cfg(target_os = "windows")]
@@ -268,18 +322,24 @@ impl PluginWindow {
                 // after the editor is detached (in `close()`, or the error arm below).
                 let window_handle =
                     crate::plugin::WindowHandle::from_hwnd(hwnd as *mut std::ffi::c_void);
-                match self
-                    .plugin
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .open_editor(window_handle)
-                {
+                let mut plugin = self.plugin.lock().unwrap_or_else(|p| p.into_inner());
+                let dpi = winapi::um::winuser::GetDpiForWindow(hwnd);
+                if let Some(scale_factor) = dpi_scale_factor(dpi) {
+                    if let Err(error) = plugin.set_editor_scale_factor(scale_factor) {
+                        drop(plugin);
+                        DestroyWindow(hwnd);
+                        return Err(error);
+                    }
+                }
+                match plugin.open_editor(window_handle) {
                     Ok(()) => {
+                        drop(plugin);
                         ShowWindow(hwnd, SW_SHOW);
                         UpdateWindow(hwnd);
                         self.native_window = Some(hwnd);
                     }
                     Err(e) => {
+                        drop(plugin);
                         DestroyWindow(hwnd);
                         return Err(e);
                     }
@@ -356,6 +416,147 @@ impl PluginWindow {
         Ok(())
     }
 
+    /// Pump the editor's window-level traffic that has to cross into the plugin.
+    ///
+    /// **Call this from your UI event loop, once per frame, while the window is open.** Two
+    /// things depend on it:
+    ///
+    /// - **Plugin-initiated resizes.** A resizable editor (VSTGUI zoom, a "big view" toggle)
+    ///   asks the host to resize through `IPlugFrame::resizeView`. This applies the request to
+    ///   the native window, so the editor is not clipped by a window that never grew.
+    /// - **Windows DPI changes.** `WM_DPICHANGED` applies its suggested native rectangle
+    ///   immediately in the window procedure and queues the new content scale for here; making
+    ///   the COM call outside the window procedure prevents reentrant deadlocks on the plugin
+    ///   mutex.
+    ///
+    /// Deliberately non-blocking: if the plugin mutex is held elsewhere (the audio callback
+    /// holds it per block) this returns without doing anything, and the pending work is picked
+    /// up on the next call.
+    ///
+    /// [`Self::is_open`] and [`Self::closed_by_user`] do *not* run this — they stay lock-free
+    /// so they are safe to call while holding the plugin lock.
+    pub fn service_platform_events(&self) -> Result<()> {
+        if self.native_window.is_none() {
+            return Ok(());
+        }
+        let Some(mut plugin) = self.try_lock_plugin() else {
+            return Ok(());
+        };
+
+        let scale_result = self
+            .take_pending_scale_factor()
+            .map(|factor| plugin.set_editor_scale_factor(factor));
+        let resize = plugin.take_editor_resize_request();
+
+        // Released before touching the native window: on Windows, resizing it may synchronously
+        // dispatch window messages back into host code that wants this same lock.
+        drop(plugin);
+
+        if let Some((width, height)) = resize {
+            self.resize_native_window(width, height);
+        }
+        match scale_result {
+            Some(Err(error)) => Err(error),
+            _ => Ok(()),
+        }
+    }
+
+    /// Take the plugin lock without blocking, recovering a lock poisoned by an unrelated panic
+    /// (a poisoned mutex is permanent, and treating it as failure would stop servicing the
+    /// editor for the rest of the session).
+    fn try_lock_plugin(&self) -> Option<std::sync::MutexGuard<'_, Plugin>> {
+        match self.plugin.try_lock() {
+            Ok(guard) => Some(guard),
+            Err(std::sync::TryLockError::Poisoned(poison)) => Some(poison.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
+    }
+
+    /// The newest DPI the window procedure recorded for this window, as a VST3 content scale.
+    #[cfg(target_os = "windows")]
+    fn take_pending_scale_factor(&self) -> Option<f32> {
+        let hwnd = self.native_window?;
+        dpi_changes()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(&(hwnd as usize))
+            .and_then(dpi_scale_factor)
+    }
+
+    /// Only Windows reports DPI changes through the window procedure.
+    #[cfg(not(target_os = "windows"))]
+    fn take_pending_scale_factor(&self) -> Option<f32> {
+        None
+    }
+
+    /// Resize the native window so it fits an editor of `width` x `height` pixels.
+    ///
+    /// The plugin has already resized its own view (the host answered `resizeView` with
+    /// `onSize`); this catches the window up.
+    fn resize_native_window(&self, width: i32, height: i32) {
+        if width <= 0 || height <= 0 {
+            return;
+        }
+        log::debug!("editor asked the host to resize its window to {width}x{height}");
+
+        #[cfg(target_os = "macos")]
+        {
+            let Some(window) = self.native_window.as_ref() else {
+                return;
+            };
+            let size = NSSize::new(width as f64, height as f64);
+            if let Some(container) = self.container_view.as_ref() {
+                container.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), size));
+            }
+            window.setContentSize(size);
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            let Some(hwnd) = self.native_window else {
+                return;
+            };
+            // The plugin sizes its *client* area; grow the frame by the window's chrome, the
+            // same way `open()` sizes the window to the editor in the first place.
+            let mut rect = RECT {
+                left: 0,
+                top: 0,
+                right: width,
+                bottom: height,
+            };
+            unsafe {
+                winapi::um::winuser::AdjustWindowRectEx(&mut rect, WS_OVERLAPPEDWINDOW, 0, 0);
+                SetWindowPos(
+                    hwnd,
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top,
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let Some(state) = self.native_window.as_ref() else {
+                return;
+            };
+            state.connection.send_request(&xcb::x::ConfigureWindow {
+                window: state.window,
+                value_list: &[
+                    xcb::x::ConfigWindow::Width(width as u32),
+                    xcb::x::ConfigWindow::Height(height as u32),
+                ],
+            });
+            let _ = state.connection.flush();
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+        let _ = (width, height);
+    }
+
     /// Close the plugin window
     pub fn close(&mut self) {
         // Detach the plugin editor first — it must never outlive the window it is embedded in.
@@ -371,6 +572,7 @@ impl PluginWindow {
         // Then close the native window
         #[cfg(target_os = "macos")]
         {
+            self.container_view = None;
             if let Some(window) = self.native_window.take() {
                 window.close();
             }
@@ -381,6 +583,9 @@ impl PluginWindow {
             if let Some(hwnd) = self.native_window.take() {
                 if let Ok(mut requests) = close_requests().lock() {
                     requests.remove(&(hwnd as usize));
+                }
+                if let Ok(mut changes) = dpi_changes().lock() {
+                    changes.remove(&(hwnd as usize));
                 }
                 unsafe {
                     DestroyWindow(hwnd);
@@ -411,16 +616,23 @@ impl PluginWindow {
     ///
     /// Reports `false` once the user has dismissed the window themselves, even though the
     /// handle is still around — see [`Self::closed_by_user`].
+    ///
+    /// Reads native window state only: it never takes the plugin lock, so it is safe to call
+    /// while holding it. Pair it with [`Self::service_platform_events`], which does the work
+    /// that has to reach the plugin.
     pub fn is_open(&self) -> bool {
-        self.native_window.is_some() && !self.closed_by_user()
+        self.native_window.is_some() && !self.native_window_dismissed()
     }
 
     /// Whether the user closed the window themselves, through its title-bar close button.
     ///
     /// Neither the plugin nor the host is told when that happens, so a host that tracks "the
-    /// editor is open" in its own UI should poll this each frame (the check is cheap) and drop
-    /// or [`close`](Self::close) the window when it reports `true`. Otherwise the editor stays
+    /// editor is open" in its own UI should poll this each frame and drop or
+    /// [`close`](Self::close) the window when it reports `true`. Otherwise the editor stays
     /// attached to a window that is gone from the screen.
+    ///
+    /// Cheap and lock-free in the same sense as [`Self::is_open`]: native window state only,
+    /// never the plugin lock.
     pub fn closed_by_user(&self) -> bool {
         self.native_window_dismissed()
     }
@@ -486,5 +698,27 @@ impl PluginWindowBuilder {
         let mut window = PluginWindow::new(self.plugin.clone());
         window.open()?;
         Ok(window)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dpi_scale_factor;
+
+    #[test]
+    fn windows_dpi_converts_to_vst_content_scale() {
+        assert_eq!(dpi_scale_factor(0), None);
+        assert_eq!(dpi_scale_factor(96), Some(1.0));
+        assert_eq!(dpi_scale_factor(120), Some(1.25));
+        assert_eq!(dpi_scale_factor(144), Some(1.5));
+        assert_eq!(dpi_scale_factor(192), Some(2.0));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn wm_dpi_wparam_uses_horizontal_dpi() {
+        let packed = (192usize << 16) | 144;
+        assert_eq!(super::dpi_from_wparam(packed), Some(144));
+        assert_eq!(super::dpi_from_wparam(0), None);
     }
 }

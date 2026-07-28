@@ -23,6 +23,184 @@ pub struct FactoryInfo {
     pub flags: i32,
 }
 
+/// Factory capability flags declared by `moduleinfo.json`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModuleFactoryFlags {
+    /// Factory and class strings use Unicode.
+    pub unicode: bool,
+    /// Class objects may be discarded after use.
+    pub classes_discardable: bool,
+    /// The factory performs a license check.
+    pub license_check: bool,
+    /// Component objects must not be discarded.
+    pub component_non_discardable: bool,
+}
+
+/// Factory metadata declared by a bundle's `moduleinfo.json`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModuleFactoryInfo {
+    /// Vendor / manufacturer name.
+    pub vendor: String,
+    /// Vendor URL.
+    pub url: String,
+    /// Vendor contact email.
+    pub email: String,
+    /// Factory capabilities.
+    pub flags: ModuleFactoryFlags,
+}
+
+/// One class declared by a bundle's `moduleinfo.json`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ModuleClassInfo {
+    /// Canonical, uppercase 32-hex-character class id.
+    pub class_id: String,
+    /// VST3 class category, such as `Audio Module Class`.
+    pub category: String,
+    /// Display name.
+    pub name: String,
+    /// Class vendor.
+    pub vendor: String,
+    /// Class version.
+    pub version: String,
+    /// VST3 SDK version used to build the class.
+    pub sdk_version: String,
+    /// Declared VST3 sub-categories.
+    pub sub_categories: Vec<String>,
+    /// Raw class flags.
+    pub class_flags: i32,
+    /// Instantiation cardinality.
+    pub cardinality: i32,
+    /// UI snapshots declared for this class, with paths resolved inside the bundle.
+    pub snapshots: Vec<PluginSnapshot>,
+}
+
+/// A pre-rendered VST3 plug-in UI snapshot.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct PluginSnapshot {
+    /// Current canonical audio-processor class id represented by the image.
+    pub class_id: String,
+    /// Display scale factor (`1.0` for the unscaled snapshot).
+    pub scale_factor: f64,
+    /// Snapshot PNG path inside the VST3 bundle.
+    pub path: PathBuf,
+}
+
+/// A `moduleinfo.json` class-id migration from one or more retired ids to a current id.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClassCompatibility {
+    /// Current replacement class id.
+    pub new_class_id: String,
+    /// Retired class ids replaced by [`Self::new_class_id`].
+    pub old_class_ids: Vec<String>,
+}
+
+/// Validated metadata from a VST3 bundle's `moduleinfo.json`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ModuleInfo {
+    /// The moduleinfo file that was read.
+    pub source: PathBuf,
+    /// Module display name.
+    pub name: String,
+    /// Module version.
+    pub version: String,
+    /// Factory identity.
+    pub factory: ModuleFactoryInfo,
+    /// Classes declared by the module.
+    pub classes: Vec<ModuleClassInfo>,
+    /// Replacement mappings for retired class ids.
+    pub compatibility: Vec<ClassCompatibility>,
+}
+
+impl ModuleInfo {
+    /// Resolve a current or retired class id to the current class id exported by this module.
+    pub fn resolve_class_id(&self, requested_class_id: &str) -> Option<&str> {
+        if let Some(class) = self.classes.iter().find(|class| {
+            crate::internal::utils::class_uid_matches(&class.class_id, requested_class_id)
+        }) {
+            return Some(&class.class_id);
+        }
+        self.compatibility.iter().find_map(|mapping| {
+            mapping
+                .old_class_ids
+                .iter()
+                .any(|old| crate::internal::utils::class_uid_matches(old, requested_class_id))
+                .then_some(mapping.new_class_id.as_str())
+        })
+    }
+
+    /// Return the retired class ids replaced by `current_class_id`.
+    pub fn replaced_class_ids(&self, current_class_id: &str) -> &[String] {
+        self.compatibility
+            .iter()
+            .find(|mapping| {
+                crate::internal::utils::class_uid_matches(&mapping.new_class_id, current_class_id)
+            })
+            .map_or(&[], |mapping| mapping.old_class_ids.as_slice())
+    }
+}
+
+/// Read and validate the standard `moduleinfo.json` from a VST3 bundle.
+///
+/// Current bundles place it in `Contents/Resources`; the SDK 3.7.5
+/// `Contents/moduleinfo.json` location is accepted as a fallback. Returns `Ok(None)` when
+/// neither file exists. File size, collection counts, string sizes, integer ranges, class ids,
+/// and replacement mappings are bounded and validated before metadata is returned.
+pub fn read_module_info(path: &Path) -> Result<Option<ModuleInfo>> {
+    crate::internal::module_info::read(path)
+}
+
+/// Return the class-id replacement mappings advertised by a VST3 module.
+///
+/// A validated `moduleinfo.json` is authoritative. When it is absent, this loads the factory,
+/// locates its optional `Plugin Compatibility Class`, requests exactly
+/// `IPluginCompatibility`, and parses its bounded UTF-8 JSON5 stream.
+pub fn get_plugin_compatibility(path: &Path) -> Result<Vec<ClassCompatibility>> {
+    if let Some(module_info) = read_module_info(path)? {
+        return Ok(module_info.compatibility);
+    }
+
+    use vst3::{ComPtr, Steinberg::Vst::IHostApplication, Steinberg::*};
+    unsafe {
+        // Declared first so it outlives the module and factory — see `get_plugin_info` for
+        // why `setHostContext` makes this ordering load-bearing.
+        let host_app = crate::internal::com_implementations::create_host_application();
+        let host_ctx = host_app.to_com_ptr::<IHostApplication>();
+        let context = host_ctx
+            .as_ref()
+            .map(|pointer| pointer.as_ptr() as *mut FUnknown)
+            .unwrap_or(ptr::null_mut());
+
+        let module = crate::internal::module_loader::load_module(path)?;
+        let factory_ptr = module.get_factory()?;
+        let factory = ComPtr::<IPluginFactory>::from_raw(factory_ptr).ok_or_else(|| {
+            crate::Error::PluginLoadFailed("Failed to create factory ComPtr".to_string())
+        })?;
+        if let Some(factory3) = factory.cast::<IPluginFactory3>() {
+            let result = factory3.setHostContext(context);
+            if result != kResultOk && result != kResultTrue {
+                log::warn!(
+                    "IPluginFactory3::setHostContext failed during compatibility discovery: \
+                     {result:#x}"
+                );
+            }
+        }
+        crate::internal::module_info::read_factory_compatibility(&factory)
+    }
+}
+
+/// Discover standard UI snapshot PNGs for a current audio-processor class id.
+///
+/// Only files in `Contents/Resources/Snapshots` whose names follow
+/// `<CID>_snapshot.png` or `<CID>_snapshot_<scale>x.png` are returned. This reads directory
+/// metadata only; it does not open or decode images. Retired compatibility ids are not
+/// resolved here—the caller must provide the current canonical class id.
+pub fn discover_plugin_snapshots(
+    path: &Path,
+    current_class_id: &str,
+) -> Result<Vec<PluginSnapshot>> {
+    crate::internal::module_info::discover_snapshots(path, current_class_id)
+}
+
 /// One class exported by a plugin's factory.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ClassInfo {
@@ -78,6 +256,12 @@ pub struct DetailedPluginInfo {
     pub classes: Vec<ClassInfo>,
     /// Full audio + event bus layout.
     pub buses: BusLayout,
+    /// Validated static bundle metadata and class-id replacement mappings, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub module_info: Option<ModuleInfo>,
+    /// Effective current/retired class-id mappings (moduleinfo, or runtime fallback).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compatibility: Vec<ClassCompatibility>,
 }
 
 /// A complete, serializable report of a plugin: static introspection plus its parameter
@@ -213,6 +397,18 @@ pub fn get_plugin_info(path: &Path) -> Result<PluginInfo> {
     use vst3::{ComPtr, Interface, Steinberg::Vst::*, Steinberg::*};
 
     unsafe {
+        // Declared before the module and factory so it drops *after* them: locals drop in
+        // reverse declaration order, and `IPluginFactory3::setHostContext` stores this pointer
+        // in a module-global without an addRef (the SDK's `CPluginFactory` keeps it in
+        // `gPluginContext`). Releasing the host application before the module unloads would
+        // leave that global dangling for the rest of the plugin's teardown.
+        let host_app = crate::internal::com_implementations::create_host_application();
+        let host_ctx = host_app.to_com_ptr::<IHostApplication>();
+        let context = host_ctx
+            .as_ref()
+            .map(|p| p.as_ptr() as *mut FUnknown)
+            .unwrap_or(ptr::null_mut());
+
         // Load the module using our VST3-compliant module loader
         let module = crate::internal::module_loader::load_module(path)?;
 
@@ -222,6 +418,12 @@ pub fn get_plugin_info(path: &Path) -> Result<PluginInfo> {
         let factory = ComPtr::<IPluginFactory>::from_raw(factory_ptr).ok_or_else(|| {
             crate::Error::PluginLoadFailed("Failed to create factory ComPtr".to_string())
         })?;
+        if let Some(factory3) = factory.cast::<IPluginFactory3>() {
+            let result = factory3.setHostContext(context);
+            if result != kResultOk && result != kResultTrue {
+                log::warn!("IPluginFactory3::setHostContext failed during discovery: {result:#x}");
+            }
+        }
 
         // Get factory info
         let mut factory_info: PFactoryInfo = std::mem::zeroed();
@@ -260,14 +462,31 @@ pub fn get_plugin_info(path: &Path) -> Result<PluginInfo> {
                                 crate::internal::utils::c_str_to_string(&info2.subCategories);
                         }
                     }
+                    if let Some(f3) = factory.cast::<IPluginFactory3>() {
+                        let mut info3: PClassInfoW = std::mem::zeroed();
+                        if f3.getClassInfoUnicode(i, &mut info3) == kResultOk {
+                            let utf16 = |value: &[u16]| {
+                                let end =
+                                    value.iter().position(|&ch| ch == 0).unwrap_or(value.len());
+                                String::from_utf16_lossy(&value[..end])
+                            };
+                            let unicode_name = utf16(&info3.name);
+                            let unicode_version = utf16(&info3.version);
+                            if !unicode_name.is_empty() {
+                                plugin_name = unicode_name;
+                            }
+                            if !unicode_version.is_empty() {
+                                version = unicode_version;
+                            }
+                            let unicode_category =
+                                crate::internal::utils::c_str_to_string(&info3.subCategories);
+                            if !unicode_category.is_empty() {
+                                category = unicode_category;
+                            }
+                        }
+                    }
 
-                    // Convert UID to string
-                    // cid is an array of bytes, convert to hex string
-                    uid = class_info
-                        .cid
-                        .iter()
-                        .map(|b| format!("{:02X}", b))
-                        .collect::<String>();
+                    uid = crate::internal::utils::format_class_uid(&class_info.cid);
 
                     // Try to create component to get more info
                     let mut component_ptr: *mut IComponent = ptr::null_mut();
@@ -284,13 +503,6 @@ pub fn get_plugin_info(path: &Path) -> Result<PluginInfo> {
                             })?;
 
                         // Initialize with a host context (null crashes u-he/Waves plugins).
-                        let host_app =
-                            crate::internal::com_implementations::create_host_application();
-                        let host_ctx = host_app.to_com_ptr::<IHostApplication>();
-                        let context = host_ctx
-                            .as_ref()
-                            .map(|p| p.as_ptr() as *mut FUnknown)
-                            .unwrap_or(ptr::null_mut());
                         component.initialize(context);
 
                         // Get bus counts
@@ -365,15 +577,41 @@ pub fn get_detailed_plugin_info(path: &Path) -> Result<DetailedPluginInfo> {
     use vst3::Steinberg::Vst::MediaTypes_::*;
     use vst3::{ComPtr, Interface, Steinberg::Vst::*, Steinberg::*};
 
+    // Static metadata is read before loading code so malformed or hostile metadata is rejected
+    // by the bounded parser. Runtime bus information still comes from the component.
+    let module_info = read_module_info(path)?;
+
     // Reuse the lightweight pass for the basic info.
     let info = get_plugin_info(path)?;
 
     unsafe {
+        // Declared first so it outlives the module and factory — see `get_plugin_info` for
+        // why `setHostContext` makes this ordering load-bearing.
+        let host_app = crate::internal::com_implementations::create_host_application();
+        let host_ctx = host_app.to_com_ptr::<IHostApplication>();
+        let context = host_ctx
+            .as_ref()
+            .map(|p| p.as_ptr() as *mut FUnknown)
+            .unwrap_or(ptr::null_mut());
+
         let module = crate::internal::module_loader::load_module(path)?;
         let factory_ptr = module.get_factory()?;
         let factory = ComPtr::<IPluginFactory>::from_raw(factory_ptr).ok_or_else(|| {
             crate::Error::PluginLoadFailed("Failed to create factory ComPtr".to_string())
         })?;
+        if let Some(factory3) = factory.cast::<IPluginFactory3>() {
+            let result = factory3.setHostContext(context);
+            if result != kResultOk && result != kResultTrue {
+                log::warn!(
+                    "IPluginFactory3::setHostContext failed during detailed discovery: \
+                     {result:#x}"
+                );
+            }
+        }
+        let compatibility = match module_info.as_ref() {
+            Some(module_info) => module_info.compatibility.clone(),
+            None => crate::internal::module_info::read_factory_compatibility(&factory)?,
+        };
 
         // Factory identity.
         let mut fi: PFactoryInfo = std::mem::zeroed();
@@ -393,20 +631,37 @@ pub fn get_detailed_plugin_info(path: &Path) -> Result<DetailedPluginInfo> {
             let mut ci: PClassInfo = std::mem::zeroed();
             if factory.getClassInfo(i, &mut ci) == kResultOk {
                 let category = crate::internal::utils::c_str_to_string(&ci.category);
-                let class_id = ci
-                    .cid
-                    .iter()
-                    .map(|b| format!("{:02X}", b))
-                    .collect::<String>();
+                let class_id = crate::internal::utils::format_class_uid(&ci.cid);
                 if category.contains("Audio Module Class") && audio_cid.is_none() {
                     audio_cid = Some(ci.cid);
                 }
+                let mut name = crate::internal::utils::c_str_to_string(&ci.name);
+                let mut version = String::new();
+                if let Some(factory3) = factory.cast::<IPluginFactory3>() {
+                    let mut info3: PClassInfoW = std::mem::zeroed();
+                    if factory3.getClassInfoUnicode(i, &mut info3) == kResultOk {
+                        let utf16 = |value: &[u16]| {
+                            let end = value.iter().position(|&ch| ch == 0).unwrap_or(value.len());
+                            String::from_utf16_lossy(&value[..end])
+                        };
+                        let unicode_name = utf16(&info3.name);
+                        if !unicode_name.is_empty() {
+                            name = unicode_name;
+                        }
+                        version = utf16(&info3.version);
+                    }
+                } else if let Some(factory2) = factory.cast::<IPluginFactory2>() {
+                    let mut info2: PClassInfo2 = std::mem::zeroed();
+                    if factory2.getClassInfo2(i, &mut info2) == kResultOk {
+                        version = crate::internal::utils::c_str_to_string(&info2.version);
+                    }
+                }
                 classes.push(ClassInfo {
-                    name: crate::internal::utils::c_str_to_string(&ci.name),
+                    name,
                     category,
                     class_id,
                     cardinality: ci.cardinality,
-                    version: String::new(), // not available in PClassInfo
+                    version,
                 });
             }
         }
@@ -423,12 +678,6 @@ pub fn get_detailed_plugin_info(path: &Path) -> Result<DetailedPluginInfo> {
             if result == kResultOk && !component_ptr.is_null() {
                 if let Some(component) = ComPtr::<IComponent>::from_raw(component_ptr) {
                     // Initialize with a host context (null crashes u-he/Waves plugins).
-                    let host_app = crate::internal::com_implementations::create_host_application();
-                    let host_ctx = host_app.to_com_ptr::<IHostApplication>();
-                    let context = host_ctx
-                        .as_ref()
-                        .map(|p| p.as_ptr() as *mut FUnknown)
-                        .unwrap_or(ptr::null_mut());
                     component.initialize(context);
 
                     let collect = |media: i32, dir: i32| -> Vec<crate::discovery::BusInfo> {
@@ -463,6 +712,8 @@ pub fn get_detailed_plugin_info(path: &Path) -> Result<DetailedPluginInfo> {
             factory: factory_info,
             classes,
             buses,
+            module_info,
+            compatibility,
         })
     }
 }
@@ -945,6 +1196,8 @@ mod report_tests {
                 ..Default::default()
             }],
             buses: BusLayout::default(),
+            module_info: None,
+            compatibility: Vec::new(),
         };
         let report = PluginReport::new(detail, Vec::new());
         let json = report.to_json().expect("to_json");
