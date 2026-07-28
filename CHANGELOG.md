@@ -4,7 +4,7 @@ All notable changes to `vst3-host` are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims to follow
 [Semantic Versioning](https://semver.org/) (pre-1.0: new features bump the minor version).
 
-## [Unreleased]
+## [0.9.0] - 2026-07-28
 
 ### Changed (VST3 spec-compliance pass — behavior, some breaking)
 
@@ -769,6 +769,7 @@ offline audio I/O, richer process isolation, metering, and a much more capable i
   save/restore, and process isolation.
 
 [Unreleased]: https://github.com/HelgeSverre/rust-vst3-host/compare/v0.8.0...HEAD
+[0.9.0]: https://github.com/HelgeSverre/rust-vst3-host/releases/tag/v0.9.0
 [0.8.0]: https://github.com/HelgeSverre/rust-vst3-host/releases/tag/v0.8.0
 [0.7.0]: https://github.com/HelgeSverre/rust-vst3-host/releases/tag/v0.7.0
 [0.6.1]: https://github.com/HelgeSverre/rust-vst3-host/releases/tag/v0.6.1

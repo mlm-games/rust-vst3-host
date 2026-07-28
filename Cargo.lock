@@ -3939,7 +3939,7 @@ dependencies = [
 
 [[package]]
 name = "vst3-host"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "core-foundation 0.10.1",
  "cpal",
