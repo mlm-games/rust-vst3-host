@@ -30,7 +30,7 @@ helper:
 test:
     cargo test --workspace --all-features
 
-# Build the deterministic test synth and bundle it into test_plugins/TestSynth.vst3 (macOS)
+# Build the deterministic test synth and bundle it into test_plugins/TestSynth.vst3
 [group('build')]
 test-plugin:
     cargo build -p vst3-host-testplug --release
@@ -66,6 +66,20 @@ trance-gui PLUGIN_PATH="test_plugins/TestSynth.vst3": test-plugin
 [group('test')]
 selftest PLUGIN_PATH=PLUGIN:
     cargo run -p vst3-inspector --bin vst3-inspector -- --selftest "{{ PLUGIN_PATH }}"
+
+# Open, service, and close a real plugin editor window (catches GUI-open regressions)
+[group('test')]
+editor-smoke PLUGIN_PATH=PLUGIN:
+    cargo run -p vst3-host --example editor_smoke -- "{{ PLUGIN_PATH }}"
+
+# TestSynth verifies the whole handshake through its instrumentation params; Dexed is a real
+# third-party JUCE editor. Both, then the ignored editor + resize regression tests
+[group('test')]
+editor-smoke-all: test-plugin
+    cargo run -p vst3-host --example editor_smoke -- test_plugins/TestSynth.vst3
+    cargo run -p vst3-host --example editor_smoke -- "{{ PLUGIN }}"
+    cargo test -p vst3-host --all-features --test editor_open_tests -- --ignored --nocapture
+    cargo test -p vst3-host --all-features --test feature_coverage_tests -- --ignored --test-threads=1 testsynth_editor
 
 # Generate a plugin compatibility matrix (Markdown) for installed plugins (crash-safe)
 [group('test')]

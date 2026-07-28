@@ -27,6 +27,22 @@
 //! exercising per-channel event routing in the host.
 //! Defaults keep the old behavior (sine, sustain 1, env amount 0) so tests stay deterministic.
 //!
+//! The factory exports **two** audio classes so the host's multi-class handling
+//! (`Vst3Host::load_plugin_class`) has something to resolve against: the dual-object synth above
+//! (class index 0, the one a plain `load_plugin` picks) and a **single-component** variant
+//! ([`TestSynthSingle`], class index 3) — one object implementing both `IComponent` and
+//! `IEditController`, whose `getControllerClassId` reports none. It shares this file's DSP and
+//! state format and exposes five parameters, so the host's single-component state path (one
+//! stream, no controller half, applied exactly once) is verifiable end to end.
+//!
+//! The dual synth's controller also implements a real `IPlugView` — no drawing, but the whole
+//! embedding protocol: platform-type negotiation, attach/remove tracking, `getSize`/`onSize`,
+//! `checkSizeConstraint` clamping and `IPlugViewContentScaleSupport`. Right after it is
+//! attached it asks the host to resize it once through `IPlugFrame::resizeView`, which closes
+//! the loop on the host's resize chain. What the view saw — and what the host said about the
+//! streams it restores state from — is republished as read-only parameters (ids 1000+, see
+//! "Editor and state instrumentation" below) so a host test can assert on it without a GUI.
+//!
 //! Modeled on the `vst3` crate's `gain.rs` example. The only non-obvious detail: the macOS
 //! bundle-entry symbols must be lowercase `bundleEntry`/`bundleExit` (the SDK convention our
 //! CFBundle loader looks up), so we override the export names.
@@ -37,19 +53,26 @@
 // casts are needed cross-platform even where clippy sees them as redundant (matches the host).
 #![allow(clippy::unnecessary_cast)]
 
-use std::ffi::{c_char, c_void, CString};
+use std::ffi::{c_char, c_void, CStr, CString};
 use std::ptr;
 use std::slice;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 
 use vst3::{uid, Class, ComRef, ComWrapper, Steinberg::Vst::*, Steinberg::*};
 
 const PLUGIN_NAME: &str = "VST3 Host Test Synth";
+/// Display name of the single-component audio class (factory class index 3).
+const SINGLE_PLUGIN_NAME: &str = "VST3 Host Test Synth (Single)";
 
 /// Advertised latency/tail (samples). Nonzero on purpose — host tests assert these exact
 /// values to prove the accessors really reach the plugin (in-process and over IPC).
 const TEST_LATENCY_SAMPLES: u32 = 32;
 const TEST_TAIL_SAMPLES: u32 = 4800;
+/// Class id of a deterministic fictional predecessor used to exercise `IRemapParamID`.
+/// Canonical text: `4F4C44504C5547494E43494400000001`.
+const REPLACED_PLUGIN_UID: TUID = uid(0x4F4C4450, 0x4C554749, 0x4E434944, 0x00000001);
+const REPLACED_CUTOFF_PARAM_ID: u32 = 0xCAFE_BABE;
 
 /// Parameter id for the crude low-pass cutoff (normalized 0..1, 1.0 = fully open).
 const CUTOFF_PARAM_ID: u32 = 0;
@@ -152,6 +175,206 @@ const PRESETS: [(&str, [f64; 14]); 4] = [
 
 /// State blob header: `TSY1` magic + little-endian param count, then `count` LE f64 values.
 const STATE_MAGIC: u32 = 0x5453_5931;
+/// Controller-only state: `TSC1` magic followed by a little-endian edit revision.
+const CONTROLLER_STATE_MAGIC: u32 = 0x5453_4331;
+
+// --- Editor and state instrumentation ---------------------------------------------------
+//
+// The editor handshake and the stream metadata a host attaches to `setState` are both invisible
+// from a host's safe API: they are pure side effects inside the plugin. So the plugin records
+// what it saw and republishes it as **read-only parameters**, which a host test reads back with
+// `Plugin::get_parameter`. Ids start at 1000, well clear of the synth parameters (0..=17).
+//
+// Every encoding divides by a power of two, so the normalized value round-trips exactly through
+// f64 and a test can decode it with `(value * SCALE).round()` and no tolerance.
+//
+// | id   | name            | encoding                                                        |
+// |------|-----------------|-----------------------------------------------------------------|
+// | 1000 | Editor Attached | 0.0 detached, 1.0 attached                                      |
+// | 1001 | Editor Width    | last `onSize` width  / `EDITOR_SIZE_SCALE` (0.0 = no `onSize`)  |
+// | 1002 | Editor Height   | last `onSize` height / `EDITOR_SIZE_SCALE`                      |
+// | 1003 | Editor Scale    | content scale factor / `EDITOR_SCALE_SCALE` (0.0 = never set)   |
+// | 1004 | State Type Seen | `StateType` code / `STATE_PROBE_SCALE`, see `state_type_seen`   |
+// | 1005 | State Path Seen | path bitmask / `STATE_PROBE_SCALE`, see `STATE_PATH_*`          |
+// | 1010 | State Applies   | `setState`+`setComponentState` count / `STATE_APPLY_SCALE`      |
+//
+// 1000..=1005 live on the dual synth's controller; 1010 lives on the single-component class.
+
+/// Whether the view is currently attached to a host window.
+const EDITOR_ATTACHED_PARAM_ID: u32 = 1000;
+/// Width of the most recent `IPlugView::onSize`.
+const EDITOR_WIDTH_PARAM_ID: u32 = 1001;
+/// Height of the most recent `IPlugView::onSize`.
+const EDITOR_HEIGHT_PARAM_ID: u32 = 1002;
+/// The most recent `IPlugViewContentScaleSupport::setContentScaleFactor` argument.
+const EDITOR_SCALE_PARAM_ID: u32 = 1003;
+/// Which `StateType` the last `IComponent::setState` stream advertised.
+const STATE_TYPE_PARAM_ID: u32 = 1004;
+/// Which file-path metadata the last `IComponent::setState` stream carried.
+const STATE_PATH_PARAM_ID: u32 = 1005;
+/// How often the single-component class has had component state applied to it.
+const STATE_APPLY_PARAM_ID: u32 = 1010;
+
+/// Divisor turning a pixel count into a normalized parameter value (and back).
+const EDITOR_SIZE_SCALE: f64 = 4096.0;
+/// Divisor turning a content scale factor into a normalized parameter value (and back).
+const EDITOR_SCALE_SCALE: f64 = 8.0;
+/// Divisor for the two small state-probe codes.
+const STATE_PROBE_SCALE: f64 = 4.0;
+/// Divisor for the single-component state-apply counter.
+const STATE_APPLY_SCALE: f64 = 64.0;
+
+/// `StateType` codes reported through [`STATE_TYPE_PARAM_ID`].
+mod state_type_seen {
+    /// The stream published no `StateType` attribute (or one this plugin does not know).
+    pub const NONE: u32 = 0;
+    /// `Steinberg::Vst::StateType::kDefault`.
+    pub const DEFAULT: u32 = 1;
+    /// `Steinberg::Vst::StateType::kProject`.
+    pub const PROJECT: u32 = 2;
+    /// `Steinberg::Vst::StateType::kTrackPreset`.
+    pub const TRACK_PRESET: u32 = 3;
+}
+
+/// [`STATE_PATH_PARAM_ID`] bit 0: the stream published `PresetAttributes::kFilePathStringType`.
+const STATE_PATH_ATTRIBUTE: u32 = 0b01;
+/// [`STATE_PATH_PARAM_ID`] bit 1: `IStreamAttributes::getFileName` returned a non-empty name.
+const STATE_PATH_FILE_NAME: u32 = 0b10;
+
+/// The size `IPlugView::getSize` reports before the host has resized anything.
+const EDITOR_SIZE: (i32, i32) = (480, 320);
+/// Smallest size `checkSizeConstraint` will agree to.
+const EDITOR_MIN_SIZE: (i32, i32) = (240, 160);
+/// Largest size `checkSizeConstraint` will agree to.
+const EDITOR_MAX_SIZE: (i32, i32) = (960, 640);
+/// The one size the view asks the host for through `IPlugFrame::resizeView` after it attaches.
+/// Deliberately different from [`EDITOR_SIZE`] so the host's container really has to move.
+const EDITOR_SELF_RESIZE: (i32, i32) = (560, 400);
+
+/// The `IPlugView` platform type this build embeds into.
+#[cfg(target_os = "macos")]
+const HOST_PLATFORM_TYPE: FIDString = kPlatformTypeNSView;
+/// The `IPlugView` platform type this build embeds into.
+#[cfg(target_os = "windows")]
+const HOST_PLATFORM_TYPE: FIDString = kPlatformTypeHWND;
+/// The `IPlugView` platform type this build embeds into.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const HOST_PLATFORM_TYPE: FIDString = kPlatformTypeX11EmbedWindowID;
+
+/// Does `candidate` name the platform window type this build can embed into?
+///
+/// # Safety
+/// `candidate` must be null or a NUL-terminated C string.
+unsafe fn platform_type_matches(candidate: FIDString) -> bool {
+    !candidate.is_null() && CStr::from_ptr(candidate) == CStr::from_ptr(HOST_PLATFORM_TYPE)
+}
+
+/// What the plugin's editor view saw during the host's embedding handshake.
+///
+/// Shared between the view (which records) and the controller (which publishes it as read-only
+/// parameters). Everything is an atomic on purpose: the host answers `IPlugFrame::resizeView`
+/// with `IPlugView::onSize` *in the same callstack*, so the view must never hold a lock across
+/// a call into the host.
+#[derive(Default)]
+struct EditorProbe {
+    attached: AtomicBool,
+    /// Size of the most recent `onSize`, or `(0, 0)` if there has not been one.
+    last_size: (AtomicI32, AtomicI32),
+    /// Content scale factor times 256, or 0 when the host never offered one. 256ths keep the
+    /// usual factors (1, 1.25, 1.5, 2, 3) exact.
+    scale_x256: AtomicU32,
+}
+
+impl EditorProbe {
+    fn record_size(&self, width: i32, height: i32) {
+        self.last_size.0.store(width, Ordering::Release);
+        self.last_size.1.store(height, Ordering::Release);
+    }
+
+    /// The normalized value of one instrumentation parameter, or `None` if `id` is not one.
+    fn parameter(&self, id: u32) -> Option<f64> {
+        let value = match id {
+            EDITOR_ATTACHED_PARAM_ID => f64::from(self.attached.load(Ordering::Acquire)),
+            EDITOR_WIDTH_PARAM_ID => {
+                f64::from(self.last_size.0.load(Ordering::Acquire)) / EDITOR_SIZE_SCALE
+            }
+            EDITOR_HEIGHT_PARAM_ID => {
+                f64::from(self.last_size.1.load(Ordering::Acquire)) / EDITOR_SIZE_SCALE
+            }
+            EDITOR_SCALE_PARAM_ID => {
+                f64::from(self.scale_x256.load(Ordering::Acquire)) / 256.0 / EDITOR_SCALE_SCALE
+            }
+            _ => return None,
+        };
+        Some(value.clamp(0.0, 1.0))
+    }
+}
+
+/// The `StateType` the last `IComponent::setState` stream advertised (a `state_type_seen` code).
+///
+/// Process-global because the dual synth's component and controller are separate COM objects and
+/// VST3 gives them no channel for this — the controller has to republish something the component
+/// observed. Sound here because the host drives one TestSynth instance at a time in these tests;
+/// two concurrent instances would share the observation.
+static OBSERVED_STATE_TYPE: AtomicU32 = AtomicU32::new(state_type_seen::NONE);
+/// File-path metadata on that same stream: a mask of [`STATE_PATH_ATTRIBUTE`] and
+/// [`STATE_PATH_FILE_NAME`]. Process-global for the same reason as [`OBSERVED_STATE_TYPE`].
+static OBSERVED_STATE_PATH: AtomicU32 = AtomicU32::new(0);
+
+/// Read one string attribute, or `None` when it is absent or empty.
+///
+/// # Safety
+/// `list` must be a live `IAttributeList` and `key` a NUL-terminated C string.
+unsafe fn attribute_string(
+    list: &vst3::ComPtr<IAttributeList>,
+    key: *const c_char,
+) -> Option<String> {
+    let mut buf = [0 as TChar; 128];
+    let size_in_bytes = std::mem::size_of_val(&buf) as u32;
+    if list.getString(key, buf.as_mut_ptr(), size_in_bytes) != kResultOk {
+        return None;
+    }
+    let len = buf.iter().position(|unit| *unit == 0).unwrap_or(buf.len());
+    (len > 0).then(|| String::from_utf16_lossy(&buf[..len]))
+}
+
+/// Record what the host said about a state stream before reading it, into [`OBSERVED_STATE_TYPE`]
+/// and [`OBSERVED_STATE_PATH`].
+///
+/// A host that hands over an untagged stream is recorded as such (`NONE` / empty mask) rather
+/// than leaving a stale reading behind.
+///
+/// # Safety
+/// `stream` must be null or a live `IBStream`.
+unsafe fn record_state_stream_context(stream: *mut IBStream) {
+    let attributes = ComRef::from_raw(stream).and_then(|s| s.cast::<IStreamAttributes>());
+    let Some(attributes) = attributes else {
+        OBSERVED_STATE_TYPE.store(state_type_seen::NONE, Ordering::Release);
+        OBSERVED_STATE_PATH.store(0, Ordering::Release);
+        return;
+    };
+
+    let mut state_type = state_type_seen::NONE;
+    let mut path_mask = 0u32;
+    if let Some(list) = ComRef::from_raw(attributes.getAttributes()).map(|list| list.to_com_ptr()) {
+        state_type = match attribute_string(&list, PresetAttributes::kStateType).as_deref() {
+            Some("Default") => state_type_seen::DEFAULT,
+            Some("Project") => state_type_seen::PROJECT,
+            Some("TrackPreset") => state_type_seen::TRACK_PRESET,
+            _ => state_type_seen::NONE,
+        };
+        if attribute_string(&list, PresetAttributes::kFilePathStringType).is_some() {
+            path_mask |= STATE_PATH_ATTRIBUTE;
+        }
+    }
+    let mut file_name: String128 = std::mem::zeroed();
+    if attributes.getFileName(&mut file_name) == kResultOk && file_name[0] != 0 {
+        path_mask |= STATE_PATH_FILE_NAME;
+    }
+
+    OBSERVED_STATE_TYPE.store(state_type, Ordering::Release);
+    OBSERVED_STATE_PATH.store(path_mask, Ordering::Release);
+}
 
 /// Cutoff keyboard tracking: how far the (normalized, 3-decade) cutoff follows the note.
 const KEYTRACK: f64 = 0.4;
@@ -672,6 +895,11 @@ unsafe fn render_voices(
 
 struct TestSynthProcessor {
     state: Mutex<SynthState>,
+    data_exchange_handler: Mutex<Option<vst3::ComPtr<IDataExchangeHandler>>>,
+    data_exchange_handler_ptr: AtomicPtr<IDataExchangeHandler>,
+    data_exchange_queue: AtomicU32,
+    data_exchange_sequence: AtomicU32,
+    processor_ptr: AtomicPtr<IAudioProcessor>,
 }
 
 impl Class for TestSynthProcessor {
@@ -688,6 +916,11 @@ impl TestSynthProcessor {
                 voices: Vec::new(),
                 params: PARAM_DEFAULTS, // sine, sustain 1, env amount 0 — deterministic
             }),
+            data_exchange_handler: Mutex::new(None),
+            data_exchange_handler_ptr: AtomicPtr::new(ptr::null_mut()),
+            data_exchange_queue: AtomicU32::new(InvalidDataExchangeQueueID),
+            data_exchange_sequence: AtomicU32::new(0),
+            processor_ptr: AtomicPtr::new(ptr::null_mut()),
         }
     }
 }
@@ -752,8 +985,310 @@ fn note_freq(pitch: f64) -> f64 {
     440.0 * 2f64.powf((pitch - 69.0) / 12.0)
 }
 
+/// The bus layout both audio classes present: one stereo audio output and one 16-channel
+/// event input.
+fn synth_bus_count(media_type: MediaType, dir: BusDirection) -> i32 {
+    match media_type as MediaTypes {
+        MediaTypes_::kAudio => i32::from(dir as BusDirections == BusDirections_::kOutput),
+        MediaTypes_::kEvent => i32::from(dir as BusDirections == BusDirections_::kInput),
+        _ => 0,
+    }
+}
+
+/// Describe one of the buses [`synth_bus_count`] advertises.
+///
+/// # Safety
+/// `bus` must point to a writable `BusInfo`.
+unsafe fn synth_bus_info(
+    media_type: MediaType,
+    dir: BusDirection,
+    index: i32,
+    bus: *mut BusInfo,
+) -> tresult {
+    if index != 0 || synth_bus_count(media_type, dir) == 0 {
+        return kInvalidArgument;
+    }
+    let is_audio = media_type as MediaTypes == MediaTypes_::kAudio;
+    let bus = &mut *bus;
+    bus.mediaType = media_type;
+    bus.direction = dir;
+    bus.channelCount = if is_audio { 2 } else { 16 };
+    copy_wstring(if is_audio { "Output" } else { "Event In" }, &mut bus.name);
+    bus.busType = BusTypes_::kMain as BusType;
+    bus.flags = BusInfo_::BusFlags_::kDefaultActive as u32;
+    kResultOk
+}
+
+/// Render one process block: the engine shared by both exported audio classes.
+///
+/// Parses the input events (keeping their sample offsets), applies queued parameter changes and
+/// echoes them back through `outputParameterChanges`, then splits the block at the event offsets
+/// so notes start and stop sample-accurately.
+///
+/// # Safety
+/// `data` must be the host's live `ProcessData` for this call, with valid output buffers.
+unsafe fn process_synth_block(state: &Mutex<SynthState>, data: &ProcessData) -> tresult {
+    let Ok(mut state) = state.lock() else {
+        return kResultOk;
+    };
+
+    // Parse input events — note on/off (keyed by noteId) and Tuning note-expression —
+    // keeping their sample offsets so they can be applied segment-accurately below.
+    let mut events: Vec<(usize, ParsedEvent)> = Vec::new();
+    if let Some(in_events) = ComRef::from_raw(data.inputEvents) {
+        let count = in_events.getEventCount();
+        for i in 0..count {
+            let mut ev: Event = std::mem::zeroed();
+            if in_events.getEvent(i, &mut ev) != kResultOk {
+                continue;
+            }
+            let offset = ev.sampleOffset.max(0) as usize;
+            let parsed = match ev.r#type as u32 {
+                t if t == Event_::EventTypes_::kNoteOnEvent as u32 => {
+                    let n = ev.__field0.noteOn;
+                    ParsedEvent::NoteOn {
+                        note_id: n.noteId,
+                        pitch: n.pitch,
+                        velocity: n.velocity,
+                        channel: n.channel,
+                    }
+                }
+                t if t == Event_::EventTypes_::kNoteOffEvent as u32 => {
+                    let n = ev.__field0.noteOff;
+                    ParsedEvent::NoteOff {
+                        note_id: n.noteId,
+                        pitch: n.pitch,
+                        channel: n.channel,
+                    }
+                }
+                t if t == Event_::EventTypes_::kLegacyMIDICCOutEvent as u32 => {
+                    let cc = ev.__field0.midiCCOut;
+                    match cc.controlNumber {
+                        120 | 123 => ParsedEvent::AllNotesOff,
+                        _ => continue,
+                    }
+                }
+                t if t == Event_::EventTypes_::kNoteExpressionValueEvent as u32 => {
+                    let nx = ev.__field0.noteExpressionValue;
+                    if nx.typeId != NoteExpressionTypeIDs_::kTuningTypeID as u32 {
+                        continue;
+                    }
+                    ParsedEvent::Tuning {
+                        note_id: nx.noteId,
+                        value: nx.value,
+                    }
+                }
+                _ => continue,
+            };
+            events.push((offset, parsed));
+        }
+        // Stable sort: same-offset events keep their input order (note-off before a
+        // retriggered note-on, etc).
+        events.sort_by_key(|(o, _)| *o);
+    }
+
+    // Read parameter changes the host queued, routed through `set_param` (which also
+    // fans a program change out into its preset). We take the last point of each queue
+    // for the block — parameters stay block-granular; events are sample-accurate.
+    if let Some(changes) = ComRef::from_raw(data.inputParameterChanges) {
+        for i in 0..changes.getParameterCount() {
+            let queue = changes.getParameterData(i);
+            let Some(queue) = ComRef::from_raw(queue) else {
+                continue;
+            };
+            let points = queue.getPointCount();
+            if points <= 0 {
+                continue;
+            }
+            let mut offset = 0i32;
+            let mut value = 0f64;
+            if queue.getPoint(points - 1, &mut offset, &mut value) != kResultOk {
+                continue;
+            }
+            let param_id = queue.getParameterId();
+            state.set_param(param_id, value);
+
+            // Echo the processor-applied value through outputParameterChanges. This is a
+            // deterministic host-conformance probe: a host that provides but never drains
+            // this list silently loses the feedback.
+            if let Some(output) = ComRef::from_raw(data.outputParameterChanges) {
+                let mut queue_index = -1;
+                let output_queue = output.addParameterData(&param_id, &mut queue_index);
+                if let Some(output_queue) = ComRef::from_raw(output_queue) {
+                    let mut point_index = -1;
+                    output_queue.addPoint(offset, value, &mut point_index);
+                }
+            }
+        }
+    }
+
+    let num_samples = data.numSamples as usize;
+    if data.numOutputs < 1 || num_samples == 0 {
+        // No audio to render this call, but the events still count.
+        for (_, ev) in &events {
+            state.apply_event(ev);
+        }
+        state
+            .voices
+            .retain(|v| v.gate || v.amp_env.level > ENV_SILENCE);
+        return kResultOk;
+    }
+    let out_buses = slice::from_raw_parts(data.outputs, data.numOutputs as usize);
+    if out_buses[0].numChannels < 1 {
+        return kResultOk;
+    }
+    // Raw per-channel output pointers (channelBuffers32 is *mut *mut f32). We write through
+    // these directly rather than building overlapping &mut slices (which would be UB).
+    let out_ptrs: Vec<*mut f32> = slice::from_raw_parts(
+        out_buses[0].__field0.channelBuffers32,
+        out_buses[0].numChannels as usize,
+    )
+    .to_vec();
+
+    // Clear output.
+    for &p in &out_ptrs {
+        for s in 0..num_samples {
+            *p.add(s) = 0.0;
+        }
+    }
+
+    let sr = state.sample_rate.max(1.0);
+    // Two timbres: part 0 plays the live parameters (channel 1), part 1 plays the
+    // Ch2 Program preset at Ch2 Level (channel 2).
+    let part1: [f64; 14] = state.params[0..14].try_into().unwrap_or([0.0; 14]);
+    let parts = [
+        BlockParams::from_values(&part1, state.params[CH1_LEVEL_PARAM_ID as usize], sr),
+        BlockParams::from_values(
+            &preset_values(state.params[CH2_PROGRAM_PARAM_ID as usize]),
+            state.params[CH2_LEVEL_PARAM_ID as usize],
+            sr,
+        ),
+    ];
+
+    // Split the block at event offsets so notes start/stop sample-accurately: apply
+    // everything due at the segment start, render up to the next event (or block end).
+    let mut seg_start = 0usize;
+    let mut ev_idx = 0usize;
+    while seg_start < num_samples {
+        while ev_idx < events.len() && events[ev_idx].0 <= seg_start {
+            let (_, ev) = &events[ev_idx];
+            state.apply_event(ev);
+            ev_idx += 1;
+        }
+        let seg_end = events
+            .get(ev_idx)
+            .map(|(o, _)| (*o).min(num_samples))
+            .unwrap_or(num_samples)
+            .max(seg_start + 1);
+        render_voices(&mut state.voices, &parts, &out_ptrs, seg_start, seg_end);
+        seg_start = seg_end;
+    }
+    // Anything scheduled at/after the block end (defensive) still takes effect.
+    for (_, ev) in &events[ev_idx..] {
+        state.apply_event(ev);
+    }
+
+    // Drop voices whose release has decayed to silence.
+    state
+        .voices
+        .retain(|v| v.gate || v.amp_env.level > ENV_SILENCE);
+    kResultOk
+}
+
+/// Render one parameter's value the way the plugin itself would display it.
+fn format_param_value(id: u32, v: f64) -> String {
+    if id == WAVEFORM_PARAM_ID {
+        (if v < 1.0 / 3.0 {
+            "Sine"
+        } else if v < 2.0 / 3.0 {
+            "Saw"
+        } else {
+            "Super Saw"
+        })
+        .to_string()
+    } else if id == PROGRAM_PARAM_ID || id == CH2_PROGRAM_PARAM_ID {
+        let last = PRESETS.len() - 1;
+        let idx = ((v.clamp(0.0, 1.0) * last as f64).round() as usize).min(last);
+        PRESETS[idx].0.to_string()
+    } else if is_time_param(id) {
+        let secs = env_time_secs(v);
+        if secs < 1.0 {
+            format!("{:.0} ms", secs * 1000.0)
+        } else {
+            format!("{secs:.2} s")
+        }
+    } else {
+        format!("{:.0}%", v * 100.0)
+    }
+}
+
+/// Fill `info` with a synth parameter's descriptor (ids 0..[`PARAM_COUNT`]).
+///
+/// # Safety
+/// `info` must point to a writable `ParameterInfo`.
+unsafe fn write_synth_parameter_info(id: u32, info: *mut ParameterInfo) -> tresult {
+    let Some(name) = PARAM_NAMES.get(id as usize) else {
+        return kInvalidArgument;
+    };
+    let info = &mut *info;
+    let automate = ParameterInfo_::ParameterFlags_::kCanAutomate as i32;
+    info.id = id;
+    copy_wstring(name, &mut info.title);
+    copy_wstring(name, &mut info.shortTitle);
+    copy_wstring("", &mut info.units);
+    info.defaultNormalizedValue = PARAM_DEFAULTS[id as usize];
+    info.unitId = 0;
+    if id == WAVEFORM_PARAM_ID {
+        copy_wstring("Wave", &mut info.shortTitle);
+        info.stepCount = 2; // three discrete values: Sine / Saw / Super Saw
+        info.flags = automate | ParameterInfo_::ParameterFlags_::kIsList as i32;
+    } else if id == PROGRAM_PARAM_ID {
+        copy_wstring("Prog", &mut info.shortTitle);
+        info.stepCount = PRESETS.len() as i32 - 1;
+        info.flags = automate
+            | ParameterInfo_::ParameterFlags_::kIsList as i32
+            | ParameterInfo_::ParameterFlags_::kIsProgramChange as i32;
+    } else if id == CH2_PROGRAM_PARAM_ID {
+        copy_wstring("Ch2Prg", &mut info.shortTitle);
+        info.stepCount = PRESETS.len() as i32 - 1;
+        info.flags = automate | ParameterInfo_::ParameterFlags_::kIsList as i32;
+    } else {
+        info.stepCount = 0; // continuous
+        info.flags = automate;
+    }
+    kResultOk
+}
+
+/// Fill `info` with an instrumentation parameter's descriptor: read-only, never automatable,
+/// and reported as a plain 0..1 value the test decodes with the scales documented above.
+///
+/// # Safety
+/// `info` must point to a writable `ParameterInfo`.
+unsafe fn write_probe_parameter_info(id: u32, title: &str, info: *mut ParameterInfo) -> tresult {
+    let info = &mut *info;
+    info.id = id;
+    copy_wstring(title, &mut info.title);
+    copy_wstring(title, &mut info.shortTitle);
+    copy_wstring("", &mut info.units);
+    info.defaultNormalizedValue = 0.0;
+    info.unitId = 0;
+    info.stepCount = 0;
+    info.flags = ParameterInfo_::ParameterFlags_::kIsReadOnly as i32;
+    kResultOk
+}
+
 impl IPluginBaseTrait for TestSynthProcessor {
-    unsafe fn initialize(&self, _context: *mut FUnknown) -> tresult {
+    unsafe fn initialize(&self, context: *mut FUnknown) -> tresult {
+        if let Some(context) = ComRef::from_raw(context) {
+            if let Some(handler) = context.cast::<IDataExchangeHandler>() {
+                self.data_exchange_handler_ptr
+                    .store(handler.as_ptr(), Ordering::Release);
+                *self
+                    .data_exchange_handler
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = Some(handler);
+            }
+        }
         kResultOk
     }
     unsafe fn terminate(&self) -> tresult {
@@ -770,17 +1305,7 @@ impl IComponentTrait for TestSynthProcessor {
         kResultOk
     }
     unsafe fn getBusCount(&self, media_type: MediaType, dir: BusDirection) -> i32 {
-        match media_type as MediaTypes {
-            MediaTypes_::kAudio => match dir as BusDirections {
-                BusDirections_::kOutput => 1,
-                _ => 0,
-            },
-            MediaTypes_::kEvent => match dir as BusDirections {
-                BusDirections_::kInput => 1,
-                _ => 0,
-            },
-            _ => 0,
-        }
+        synth_bus_count(media_type, dir)
     }
     unsafe fn getBusInfo(
         &self,
@@ -789,29 +1314,7 @@ impl IComponentTrait for TestSynthProcessor {
         index: i32,
         bus: *mut BusInfo,
     ) -> tresult {
-        let mt = media_type as MediaTypes;
-        let d = dir as BusDirections;
-        if mt == MediaTypes_::kAudio && d == BusDirections_::kOutput && index == 0 {
-            let bus = &mut *bus;
-            bus.mediaType = MediaTypes_::kAudio as MediaType;
-            bus.direction = BusDirections_::kOutput as BusDirection;
-            bus.channelCount = 2;
-            copy_wstring("Output", &mut bus.name);
-            bus.busType = BusTypes_::kMain as BusType;
-            bus.flags = BusInfo_::BusFlags_::kDefaultActive as u32;
-            kResultOk
-        } else if mt == MediaTypes_::kEvent && d == BusDirections_::kInput && index == 0 {
-            let bus = &mut *bus;
-            bus.mediaType = MediaTypes_::kEvent as MediaType;
-            bus.direction = BusDirections_::kInput as BusDirection;
-            bus.channelCount = 16;
-            copy_wstring("Event In", &mut bus.name);
-            bus.busType = BusTypes_::kMain as BusType;
-            bus.flags = BusInfo_::BusFlags_::kDefaultActive as u32;
-            kResultOk
-        } else {
-            kInvalidArgument
-        }
+        synth_bus_info(media_type, dir, index, bus)
     }
     unsafe fn getRoutingInfo(&self, _i: *mut RoutingInfo, _o: *mut RoutingInfo) -> tresult {
         kNotImplemented
@@ -819,10 +1322,29 @@ impl IComponentTrait for TestSynthProcessor {
     unsafe fn activateBus(&self, _m: MediaType, _d: BusDirection, _i: i32, _s: TBool) -> tresult {
         kResultOk
     }
-    unsafe fn setActive(&self, _state: TBool) -> tresult {
+    unsafe fn setActive(&self, state: TBool) -> tresult {
+        if state == 0 {
+            let queue = self
+                .data_exchange_queue
+                .swap(InvalidDataExchangeQueueID, Ordering::AcqRel);
+            if queue != InvalidDataExchangeQueueID {
+                if let Some(handler) = self
+                    .data_exchange_handler
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .as_ref()
+                {
+                    let _ = handler.closeQueue(queue);
+                }
+            }
+        }
         kResultOk
     }
     unsafe fn setState(&self, stream: *mut IBStream) -> tresult {
+        // Observe the host's stream tagging before consuming the stream: a project load and a
+        // preset load carry different `IStreamAttributes` metadata, and the host's safe API has
+        // no other way to prove it sets them.
+        record_state_stream_context(stream);
         let Some(values) = read_state_params(stream) else {
             return kResultFalse;
         };
@@ -898,6 +1420,26 @@ impl IAudioProcessorTrait for TestSynthProcessor {
             s.sample_rate = (*setup).sampleRate;
             s.voices.clear();
         }
+        if self.data_exchange_queue.load(Ordering::Acquire) == InvalidDataExchangeQueueID {
+            let handler = self
+                .data_exchange_handler
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(handler) = handler.as_ref() {
+                let mut queue = InvalidDataExchangeQueueID;
+                if handler.openQueue(
+                    self.processor_ptr.load(Ordering::Acquire),
+                    8,
+                    4,
+                    4,
+                    0x5453_0001,
+                    &mut queue,
+                ) == kResultTrue
+                {
+                    self.data_exchange_queue.store(queue, Ordering::Release);
+                }
+            }
+        }
         kResultOk
     }
     unsafe fn setProcessing(&self, _state: TBool) -> tresult {
@@ -905,158 +1447,27 @@ impl IAudioProcessorTrait for TestSynthProcessor {
     }
     unsafe fn process(&self, data: *mut ProcessData) -> tresult {
         let data = &*data;
-        let Ok(mut state) = self.state.lock() else {
-            return kResultOk;
-        };
-
-        // Parse input events — note on/off (keyed by noteId) and Tuning note-expression —
-        // keeping their sample offsets so they can be applied segment-accurately below.
-        let mut events: Vec<(usize, ParsedEvent)> = Vec::new();
-        if let Some(in_events) = ComRef::from_raw(data.inputEvents) {
-            let count = in_events.getEventCount();
-            for i in 0..count {
-                let mut ev: Event = std::mem::zeroed();
-                if in_events.getEvent(i, &mut ev) != kResultOk {
-                    continue;
+        let queue = self.data_exchange_queue.load(Ordering::Acquire);
+        let handler_ptr = self.data_exchange_handler_ptr.load(Ordering::Acquire);
+        if queue != InvalidDataExchangeQueueID {
+            if let Some(handler) = ComRef::from_raw(handler_ptr) {
+                let mut block: vst3::Steinberg::Vst::DataExchangeBlock = std::mem::zeroed();
+                if handler.lockBlock(queue, &mut block) == kResultTrue
+                    && !block.data.is_null()
+                    && block.size >= 8
+                {
+                    let sequence = self.data_exchange_sequence.fetch_add(1, Ordering::Relaxed);
+                    ptr::copy_nonoverlapping(b"DXB1".as_ptr(), block.data.cast::<u8>(), 4);
+                    ptr::copy_nonoverlapping(
+                        sequence.to_le_bytes().as_ptr(),
+                        block.data.cast::<u8>().add(4),
+                        4,
+                    );
+                    let _ = handler.freeBlock(queue, block.blockID, 1);
                 }
-                let offset = ev.sampleOffset.max(0) as usize;
-                let parsed = match ev.r#type as u32 {
-                    t if t == Event_::EventTypes_::kNoteOnEvent as u32 => {
-                        let n = ev.__field0.noteOn;
-                        ParsedEvent::NoteOn {
-                            note_id: n.noteId,
-                            pitch: n.pitch,
-                            velocity: n.velocity,
-                            channel: n.channel,
-                        }
-                    }
-                    t if t == Event_::EventTypes_::kNoteOffEvent as u32 => {
-                        let n = ev.__field0.noteOff;
-                        ParsedEvent::NoteOff {
-                            note_id: n.noteId,
-                            pitch: n.pitch,
-                            channel: n.channel,
-                        }
-                    }
-                    t if t == Event_::EventTypes_::kLegacyMIDICCOutEvent as u32 => {
-                        let cc = ev.__field0.midiCCOut;
-                        match cc.controlNumber {
-                            120 | 123 => ParsedEvent::AllNotesOff,
-                            _ => continue,
-                        }
-                    }
-                    t if t == Event_::EventTypes_::kNoteExpressionValueEvent as u32 => {
-                        let nx = ev.__field0.noteExpressionValue;
-                        if nx.typeId != NoteExpressionTypeIDs_::kTuningTypeID as u32 {
-                            continue;
-                        }
-                        ParsedEvent::Tuning {
-                            note_id: nx.noteId,
-                            value: nx.value,
-                        }
-                    }
-                    _ => continue,
-                };
-                events.push((offset, parsed));
-            }
-            // Stable sort: same-offset events keep their input order (note-off before a
-            // retriggered note-on, etc).
-            events.sort_by_key(|(o, _)| *o);
-        }
-
-        // Read parameter changes the host queued, routed through `set_param` (which also
-        // fans a program change out into its preset). We take the last point of each queue
-        // for the block — parameters stay block-granular; events are sample-accurate.
-        if let Some(changes) = ComRef::from_raw(data.inputParameterChanges) {
-            for i in 0..changes.getParameterCount() {
-                let queue = changes.getParameterData(i);
-                let Some(queue) = ComRef::from_raw(queue) else {
-                    continue;
-                };
-                let points = queue.getPointCount();
-                if points <= 0 {
-                    continue;
-                }
-                let mut offset = 0i32;
-                let mut value = 0f64;
-                if queue.getPoint(points - 1, &mut offset, &mut value) != kResultOk {
-                    continue;
-                }
-                state.set_param(queue.getParameterId(), value);
             }
         }
-
-        let num_samples = data.numSamples as usize;
-        if data.numOutputs < 1 || num_samples == 0 {
-            // No audio to render this call, but the events still count.
-            for (_, ev) in &events {
-                state.apply_event(ev);
-            }
-            state
-                .voices
-                .retain(|v| v.gate || v.amp_env.level > ENV_SILENCE);
-            return kResultOk;
-        }
-        let out_buses = slice::from_raw_parts(data.outputs, data.numOutputs as usize);
-        if out_buses[0].numChannels < 1 {
-            return kResultOk;
-        }
-        // Raw per-channel output pointers (channelBuffers32 is *mut *mut f32). We write through
-        // these directly rather than building overlapping &mut slices (which would be UB).
-        let out_ptrs: Vec<*mut f32> = slice::from_raw_parts(
-            out_buses[0].__field0.channelBuffers32,
-            out_buses[0].numChannels as usize,
-        )
-        .to_vec();
-
-        // Clear output.
-        for &p in &out_ptrs {
-            for s in 0..num_samples {
-                *p.add(s) = 0.0;
-            }
-        }
-
-        let sr = state.sample_rate.max(1.0);
-        // Two timbres: part 0 plays the live parameters (channel 1), part 1 plays the
-        // Ch2 Program preset at Ch2 Level (channel 2).
-        let part1: [f64; 14] = state.params[0..14].try_into().unwrap_or([0.0; 14]);
-        let parts = [
-            BlockParams::from_values(&part1, state.params[CH1_LEVEL_PARAM_ID as usize], sr),
-            BlockParams::from_values(
-                &preset_values(state.params[CH2_PROGRAM_PARAM_ID as usize]),
-                state.params[CH2_LEVEL_PARAM_ID as usize],
-                sr,
-            ),
-        ];
-
-        // Split the block at event offsets so notes start/stop sample-accurately: apply
-        // everything due at the segment start, render up to the next event (or block end).
-        let mut seg_start = 0usize;
-        let mut ev_idx = 0usize;
-        while seg_start < num_samples {
-            while ev_idx < events.len() && events[ev_idx].0 <= seg_start {
-                let (_, ev) = &events[ev_idx];
-                state.apply_event(ev);
-                ev_idx += 1;
-            }
-            let seg_end = events
-                .get(ev_idx)
-                .map(|(o, _)| (*o).min(num_samples))
-                .unwrap_or(num_samples)
-                .max(seg_start + 1);
-            render_voices(&mut state.voices, &parts, &out_ptrs, seg_start, seg_end);
-            seg_start = seg_end;
-        }
-        // Anything scheduled at/after the block end (defensive) still takes effect.
-        for (_, ev) in &events[ev_idx..] {
-            state.apply_event(ev);
-        }
-
-        // Drop voices whose release has decayed to silence.
-        state
-            .voices
-            .retain(|v| v.gate || v.amp_env.level > ENV_SILENCE);
-        kResultOk
+        process_synth_block(&self.state, data)
     }
     unsafe fn getTailSamples(&self) -> u32 {
         // Fixed, nonzero advertisement, same rationale as getLatencySamples.
@@ -1070,8 +1481,182 @@ impl IProcessContextRequirementsTrait for TestSynthProcessor {
     }
 }
 
+/// A minimal but protocol-complete `IPlugView`.
+///
+/// It draws nothing — `attached` just records the parent and returns success, which is all the
+/// VST3 embedding contract actually requires of a view. What it *does* do is exercise every
+/// negotiation a host has to get right: platform-type matching, `getSize`/`onSize`,
+/// `checkSizeConstraint` clamping, content scaling, and one host-side resize request. That makes
+/// the host's editor path machine-checkable on all three platforms without any native widgets.
+struct TestPlugView {
+    probe: Arc<EditorProbe>,
+    /// The host's frame, from `setFrame`. VST3 requires the host to set it before `attached`.
+    frame: Mutex<Option<vst3::ComPtr<IPlugFrame>>>,
+    /// Current view size, reported by `getSize` and updated by `onSize`.
+    size: Mutex<(i32, i32)>,
+    /// This object's own `IPlugView` pointer. `IPlugFrame::resizeView` takes the view it is
+    /// about, and a COM object cannot otherwise name itself. Deliberately not a `ComPtr`: an
+    /// owning self-reference would be a refcount cycle the view could never escape.
+    self_view: AtomicPtr<IPlugView>,
+    /// The post-attach `resizeView` fires exactly once, however often the host re-attaches.
+    self_resize_done: AtomicBool,
+}
+
+impl Class for TestPlugView {
+    type Interfaces = (IPlugView, IPlugViewContentScaleSupport);
+}
+
+impl TestPlugView {
+    fn new(probe: Arc<EditorProbe>) -> Self {
+        Self {
+            probe,
+            frame: Mutex::new(None),
+            size: Mutex::new(EDITOR_SIZE),
+            self_view: AtomicPtr::new(ptr::null_mut()),
+            self_resize_done: AtomicBool::new(false),
+        }
+    }
+
+    /// Ask the host — once — to resize the window this view sits in.
+    ///
+    /// This is the half of the resize protocol only a plugin can start, and the host answers it
+    /// with `onSize` in the same callstack before resizing its container. Both halves are then
+    /// visible from outside: the request through the host's own resize plumbing, the answer
+    /// through this view's `onSize` instrumentation.
+    fn request_host_resize(&self) {
+        if self.self_resize_done.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        // Clone the frame out and drop the lock first: the host calls straight back into
+        // `onSize`, and on some paths into `setFrame`, from inside `resizeView`.
+        let frame = self
+            .frame
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        let Some(frame) = frame else { return };
+        let view = self.self_view.load(Ordering::Acquire);
+        if view.is_null() {
+            return;
+        }
+        let (width, height) = EDITOR_SELF_RESIZE;
+        let mut rect = ViewRect {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: height,
+        };
+        // SAFETY: `frame` is the host frame handed to `setFrame`, and `view` is this object's
+        // own interface pointer, which cannot outlive `self`.
+        unsafe { frame.resizeView(view, &mut rect) };
+    }
+}
+
+impl IPlugViewTrait for TestPlugView {
+    unsafe fn isPlatformTypeSupported(&self, r#type: FIDString) -> tresult {
+        if platform_type_matches(r#type) {
+            kResultTrue
+        } else {
+            kResultFalse
+        }
+    }
+
+    unsafe fn attached(&self, parent: *mut c_void, r#type: FIDString) -> tresult {
+        if parent.is_null() || !platform_type_matches(r#type) {
+            return kInvalidArgument;
+        }
+        self.probe.attached.store(true, Ordering::Release);
+        self.request_host_resize();
+        kResultOk
+    }
+
+    unsafe fn removed(&self) -> tresult {
+        self.probe.attached.store(false, Ordering::Release);
+        kResultOk
+    }
+
+    unsafe fn onWheel(&self, _distance: f32) -> tresult {
+        kResultFalse
+    }
+
+    unsafe fn onKeyDown(&self, _key: char16, _key_code: i16, _modifiers: i16) -> tresult {
+        kResultFalse
+    }
+
+    unsafe fn onKeyUp(&self, _key: char16, _key_code: i16, _modifiers: i16) -> tresult {
+        kResultFalse
+    }
+
+    unsafe fn getSize(&self, size: *mut ViewRect) -> tresult {
+        let Some(size) = size.as_mut() else {
+            return kInvalidArgument;
+        };
+        let (width, height) = *self.size.lock().unwrap_or_else(|p| p.into_inner());
+        size.left = 0;
+        size.top = 0;
+        size.right = width;
+        size.bottom = height;
+        kResultOk
+    }
+
+    unsafe fn onSize(&self, new_size: *mut ViewRect) -> tresult {
+        let Some(rect) = new_size.as_ref() else {
+            return kInvalidArgument;
+        };
+        let (width, height) = (rect.right - rect.left, rect.bottom - rect.top);
+        if width <= 0 || height <= 0 {
+            return kInvalidArgument;
+        }
+        *self.size.lock().unwrap_or_else(|p| p.into_inner()) = (width, height);
+        self.probe.record_size(width, height);
+        kResultOk
+    }
+
+    unsafe fn onFocus(&self, _state: TBool) -> tresult {
+        kResultOk
+    }
+
+    unsafe fn setFrame(&self, frame: *mut IPlugFrame) -> tresult {
+        let frame = ComRef::from_raw(frame).map(|frame| frame.to_com_ptr());
+        *self.frame.lock().unwrap_or_else(|p| p.into_inner()) = frame;
+        kResultOk
+    }
+
+    unsafe fn canResize(&self) -> tresult {
+        kResultTrue
+    }
+
+    unsafe fn checkSizeConstraint(&self, rect: *mut ViewRect) -> tresult {
+        let Some(rect) = rect.as_mut() else {
+            return kInvalidArgument;
+        };
+        let width = (rect.right - rect.left).clamp(EDITOR_MIN_SIZE.0, EDITOR_MAX_SIZE.0);
+        let height = (rect.bottom - rect.top).clamp(EDITOR_MIN_SIZE.1, EDITOR_MAX_SIZE.1);
+        rect.right = rect.left + width;
+        rect.bottom = rect.top + height;
+        kResultTrue
+    }
+}
+
+impl IPlugViewContentScaleSupportTrait for TestPlugView {
+    unsafe fn setContentScaleFactor(&self, factor: f32) -> tresult {
+        if !factor.is_finite() || factor <= 0.0 {
+            return kInvalidArgument;
+        }
+        self.probe.scale_x256.store(
+            (f64::from(factor) * 256.0).round() as u32,
+            Ordering::Release,
+        );
+        kResultOk
+    }
+}
+
 struct TestSynthController {
     values: Mutex<[f64; PARAM_COUNT as usize]>,
+    /// Deliberately controller-only persistence probe. Component state does not contain this.
+    edit_revision: Mutex<u32>,
+    /// What this controller's editor view has seen, republished as read-only parameters.
+    editor: Arc<EditorProbe>,
 }
 
 impl Class for TestSynthController {
@@ -1080,7 +1665,33 @@ impl Class for TestSynthController {
         INoteExpressionController,
         IUnitInfo,
         IMidiMapping,
+        IRemapParamID,
+        IDataExchangeReceiver,
     );
+}
+
+impl IDataExchangeReceiverTrait for TestSynthController {
+    unsafe fn queueOpened(
+        &self,
+        _user_context_id: u32,
+        _block_size: u32,
+        dispatch_on_background_thread: *mut TBool,
+    ) {
+        if !dispatch_on_background_thread.is_null() {
+            *dispatch_on_background_thread = 0;
+        }
+    }
+
+    unsafe fn queueClosed(&self, _user_context_id: u32) {}
+
+    unsafe fn onDataExchangeBlocksReceived(
+        &self,
+        _user_context_id: u32,
+        _num_blocks: u32,
+        _blocks: *mut vst3::Steinberg::Vst::DataExchangeBlock,
+        _on_background_thread: TBool,
+    ) {
+    }
 }
 
 impl TestSynthController {
@@ -1089,9 +1700,25 @@ impl TestSynthController {
     fn new() -> Self {
         Self {
             values: Mutex::new(PARAM_DEFAULTS),
+            edit_revision: Mutex::new(0),
+            editor: Arc::new(EditorProbe::default()),
         }
     }
 }
+
+/// The read-only instrumentation parameters the dual synth's controller publishes, in the order
+/// `getParameterInfo` reports them (right after the [`PARAM_COUNT`] synth parameters).
+const PROBE_PARAMS: [(u32, &str); 6] = [
+    (EDITOR_ATTACHED_PARAM_ID, "Editor Attached"),
+    (EDITOR_WIDTH_PARAM_ID, "Editor Width"),
+    (EDITOR_HEIGHT_PARAM_ID, "Editor Height"),
+    (EDITOR_SCALE_PARAM_ID, "Editor Scale"),
+    (STATE_TYPE_PARAM_ID, "State Type Seen"),
+    (STATE_PATH_PARAM_ID, "State Path Seen"),
+];
+
+/// Total parameter count the dual synth's controller reports.
+const CONTROLLER_PARAM_COUNT: i32 = PARAM_COUNT + PROBE_PARAMS.len() as i32;
 
 impl IPluginBaseTrait for TestSynthController {
     unsafe fn initialize(&self, _context: *mut FUnknown) -> tresult {
@@ -1099,6 +1726,26 @@ impl IPluginBaseTrait for TestSynthController {
     }
     unsafe fn terminate(&self) -> tresult {
         kResultOk
+    }
+}
+
+impl IRemapParamIDTrait for TestSynthController {
+    unsafe fn getCompatibleParamID(
+        &self,
+        plugin_to_replace_uid: *const TUID,
+        old_param_id: u32,
+        new_param_id: *mut u32,
+    ) -> tresult {
+        if plugin_to_replace_uid.is_null() || new_param_id.is_null() {
+            return kInvalidArgument;
+        }
+        if *plugin_to_replace_uid == REPLACED_PLUGIN_UID && old_param_id == REPLACED_CUTOFF_PARAM_ID
+        {
+            *new_param_id = CUTOFF_PARAM_ID;
+            kResultTrue
+        } else {
+            kResultFalse
+        }
     }
 }
 
@@ -1114,74 +1761,67 @@ impl IEditControllerTrait for TestSynthController {
         }
         kResultOk
     }
-    unsafe fn setState(&self, _s: *mut IBStream) -> tresult {
+    unsafe fn setState(&self, stream: *mut IBStream) -> tresult {
+        let Some(bytes) = stream_read_exact(stream, 8) else {
+            return kResultFalse;
+        };
+        if u32::from_le_bytes(bytes[0..4].try_into().unwrap()) != CONTROLLER_STATE_MAGIC {
+            return kResultFalse;
+        }
+        let revision = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        *self
+            .edit_revision
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = revision;
         kResultOk
     }
-    unsafe fn getState(&self, _s: *mut IBStream) -> tresult {
-        kResultOk
+    unsafe fn getState(&self, stream: *mut IBStream) -> tresult {
+        let revision = *self
+            .edit_revision
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut bytes = Vec::with_capacity(8);
+        bytes.extend_from_slice(&CONTROLLER_STATE_MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&revision.to_le_bytes());
+        if stream_write_all(stream, &bytes) {
+            kResultOk
+        } else {
+            kResultFalse
+        }
     }
     unsafe fn getParameterCount(&self) -> i32 {
-        PARAM_COUNT
+        CONTROLLER_PARAM_COUNT
     }
     unsafe fn getParameterInfo(&self, index: i32, info: *mut ParameterInfo) -> tresult {
-        if !(0..PARAM_COUNT).contains(&index) {
-            return kInvalidArgument;
+        if (0..PARAM_COUNT).contains(&index) {
+            // Synth parameter ids are contiguous and equal to the index.
+            return write_synth_parameter_info(index as u32, info);
         }
-        let id = index as u32; // parameter ids are contiguous and equal to the index
-        let info = &mut *info;
-        let automate = ParameterInfo_::ParameterFlags_::kCanAutomate as i32;
-        info.id = id;
-        copy_wstring(PARAM_NAMES[index as usize], &mut info.title);
-        copy_wstring(PARAM_NAMES[index as usize], &mut info.shortTitle);
-        copy_wstring("", &mut info.units);
-        info.defaultNormalizedValue = PARAM_DEFAULTS[index as usize];
-        info.unitId = 0;
-        if id == WAVEFORM_PARAM_ID {
-            copy_wstring("Wave", &mut info.shortTitle);
-            info.stepCount = 2; // three discrete values: Sine / Saw / Super Saw
-            info.flags = automate | ParameterInfo_::ParameterFlags_::kIsList as i32;
-        } else if id == PROGRAM_PARAM_ID {
-            copy_wstring("Prog", &mut info.shortTitle);
-            info.stepCount = PRESETS.len() as i32 - 1;
-            info.flags = automate
-                | ParameterInfo_::ParameterFlags_::kIsList as i32
-                | ParameterInfo_::ParameterFlags_::kIsProgramChange as i32;
-        } else if id == CH2_PROGRAM_PARAM_ID {
-            copy_wstring("Ch2Prg", &mut info.shortTitle);
-            info.stepCount = PRESETS.len() as i32 - 1;
-            info.flags = automate | ParameterInfo_::ParameterFlags_::kIsList as i32;
-        } else {
-            info.stepCount = 0; // continuous
-            info.flags = automate;
+        match PROBE_PARAMS.get((index - PARAM_COUNT) as usize) {
+            Some((id, title)) if index >= PARAM_COUNT => {
+                write_probe_parameter_info(*id, title, info)
+            }
+            _ => kInvalidArgument,
         }
-        kResultOk
     }
     unsafe fn getParamStringByValue(&self, id: u32, v: f64, s: *mut String128) -> tresult {
-        if id >= PARAM_COUNT as u32 {
-            return kNotImplemented;
-        }
-        let text = if id == WAVEFORM_PARAM_ID {
-            (if v < 1.0 / 3.0 {
-                "Sine"
-            } else if v < 2.0 / 3.0 {
-                "Saw"
-            } else {
-                "Super Saw"
-            })
-            .to_string()
-        } else if id == PROGRAM_PARAM_ID || id == CH2_PROGRAM_PARAM_ID {
-            let last = PRESETS.len() - 1;
-            let idx = ((v.clamp(0.0, 1.0) * last as f64).round() as usize).min(last);
-            PRESETS[idx].0.to_string()
-        } else if is_time_param(id) {
-            let secs = env_time_secs(v);
-            if secs < 1.0 {
-                format!("{:.0} ms", secs * 1000.0)
-            } else {
-                format!("{secs:.2} s")
+        let text = match id {
+            id if id < PARAM_COUNT as u32 => format_param_value(id, v),
+            EDITOR_ATTACHED_PARAM_ID => {
+                (if v >= 0.5 { "attached" } else { "detached" }).to_string()
             }
-        } else {
-            format!("{:.0}%", v * 100.0)
+            EDITOR_WIDTH_PARAM_ID | EDITOR_HEIGHT_PARAM_ID => {
+                format!("{} px", (v * EDITOR_SIZE_SCALE).round())
+            }
+            EDITOR_SCALE_PARAM_ID => format!("{:.2}x", v * EDITOR_SCALE_SCALE),
+            STATE_TYPE_PARAM_ID => match (v * STATE_PROBE_SCALE).round() as u32 {
+                state_type_seen::DEFAULT => "Default".to_string(),
+                state_type_seen::PROJECT => "Project".to_string(),
+                state_type_seen::TRACK_PRESET => "TrackPreset".to_string(),
+                _ => "none".to_string(),
+            },
+            STATE_PATH_PARAM_ID => format!("0b{:02b}", (v * STATE_PROBE_SCALE).round() as u32),
+            _ => return kNotImplemented,
         };
         copy_wstring(&text, &mut *s);
         kResultOk
@@ -1196,10 +1836,27 @@ impl IEditControllerTrait for TestSynthController {
         v
     }
     unsafe fn getParamNormalized(&self, id: u32) -> f64 {
+        if let Some(value) = self.editor.parameter(id) {
+            return value;
+        }
+        match id {
+            STATE_TYPE_PARAM_ID => {
+                return f64::from(OBSERVED_STATE_TYPE.load(Ordering::Acquire)) / STATE_PROBE_SCALE
+            }
+            STATE_PATH_PARAM_ID => {
+                return f64::from(OBSERVED_STATE_PATH.load(Ordering::Acquire)) / STATE_PROBE_SCALE
+            }
+            _ => {}
+        }
         let values = self.values.lock().unwrap_or_else(|p| p.into_inner());
         values.get(id as usize).copied().unwrap_or(0.0)
     }
     unsafe fn setParamNormalized(&self, id: u32, v: f64) -> tresult {
+        // The instrumentation parameters are read-only: a host that writes one gets told so,
+        // and — importantly — it does not bump the controller-only edit revision.
+        if id >= PROBE_PARAMS[0].0 {
+            return kResultFalse;
+        }
         let mut values = self.values.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(slot) = values.get_mut(id as usize) {
             *slot = v;
@@ -1210,13 +1867,29 @@ impl IEditControllerTrait for TestSynthController {
                 *slot = *pv;
             }
         }
+        drop(values);
+        let mut revision = self
+            .edit_revision
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        *revision = revision.wrapping_add(1);
         kResultOk
     }
     unsafe fn setComponentHandler(&self, _h: *mut IComponentHandler) -> tresult {
         kResultOk
     }
-    unsafe fn createView(&self, _name: *const c_char) -> *mut IPlugView {
-        ptr::null_mut()
+    unsafe fn createView(&self, name: *const c_char) -> *mut IPlugView {
+        if !name.is_null() && CStr::from_ptr(name) != c"editor" {
+            return ptr::null_mut();
+        }
+        let wrapper = ComWrapper::new(TestPlugView::new(self.editor.clone()));
+        let Some(self_ptr) = wrapper.as_com_ref::<IPlugView>().map(|view| view.as_ptr()) else {
+            return ptr::null_mut();
+        };
+        wrapper.self_view.store(self_ptr, Ordering::Release);
+        wrapper
+            .to_com_ptr::<IPlugView>()
+            .map_or(ptr::null_mut(), |view| view.into_raw())
     }
 }
 
@@ -1372,10 +2045,289 @@ impl IMidiMappingTrait for TestSynthController {
             72 => AMP_RELEASE_PARAM_ID,
             73 => AMP_ATTACK_PARAM_ID,
             74 => CUTOFF_PARAM_ID,
+            x if x == ControllerNumbers_::kAfterTouch as u32 => FILTER_SUSTAIN_PARAM_ID,
+            x if x == ControllerNumbers_::kPitchBend as u32 => MIX_PARAM_ID,
             _ => return kResultFalse,
         };
         *id = mapped;
         kResultOk
+    }
+}
+
+/// How many parameters the single-component class exposes: the first five synth parameters
+/// plus its state-apply counter.
+const SINGLE_SYNTH_PARAM_COUNT: i32 = 5;
+const SINGLE_PARAM_COUNT: i32 = SINGLE_SYNTH_PARAM_COUNT + 1;
+
+/// The factory's second audio class: **one object** that is both the component and the edit
+/// controller.
+///
+/// Most plugins split those in two (as [`TestSynthProcessor`] / [`TestSynthController`] do), but
+/// the single-object form is legal VST3 and takes a different path through a host: there is one
+/// state stream instead of two, `getControllerClassId` names nothing, and a host that also
+/// pushes the component stream through `setComponentState` would apply the same state twice.
+/// [`STATE_APPLY_PARAM_ID`] counts every such application so that last part is observable.
+///
+/// It reuses this file's DSP, parameter ids and state format wholesale; it only exposes a
+/// smaller parameter set and none of the optional interfaces (no units, note expression, MIDI
+/// mapping or editor).
+struct TestSynthSingle {
+    state: Mutex<SynthState>,
+    /// Combined `IComponent::setState` + `IEditController::setComponentState` count.
+    state_applies: AtomicU32,
+}
+
+impl Class for TestSynthSingle {
+    type Interfaces = (IComponent, IAudioProcessor, IEditController);
+}
+
+impl TestSynthSingle {
+    const CID: TUID = uid(0x54455354, 0x53594E54, 0x53494E47, 0x00000001);
+
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(SynthState {
+                sample_rate: 48_000.0,
+                voices: Vec::new(),
+                params: PARAM_DEFAULTS,
+            }),
+            state_applies: AtomicU32::new(0),
+        }
+    }
+
+    /// Apply a component state blob, counting the application.
+    ///
+    /// # Safety
+    /// `stream` must be null or a live `IBStream`.
+    unsafe fn apply_component_state(&self, stream: *mut IBStream) -> tresult {
+        record_state_stream_context(stream);
+        let Some(values) = read_state_params(stream) else {
+            return kResultFalse;
+        };
+        let Ok(mut state) = self.state.lock() else {
+            return kResultFalse;
+        };
+        for (id, v) in values.iter().enumerate().take(PARAM_COUNT as usize) {
+            if id as u32 == PROGRAM_PARAM_ID {
+                state.params[id] = v.clamp(0.0, 1.0);
+            } else {
+                state.set_param(id as u32, *v);
+            }
+        }
+        self.state_applies.fetch_add(1, Ordering::AcqRel);
+        kResultOk
+    }
+}
+
+impl IPluginBaseTrait for TestSynthSingle {
+    unsafe fn initialize(&self, _context: *mut FUnknown) -> tresult {
+        kResultOk
+    }
+    unsafe fn terminate(&self) -> tresult {
+        kResultOk
+    }
+}
+
+impl IComponentTrait for TestSynthSingle {
+    unsafe fn getControllerClassId(&self, _class_id: *mut TUID) -> tresult {
+        // Single-component: there is no separate controller class to name.
+        kNotImplemented
+    }
+    unsafe fn setIoMode(&self, _mode: IoMode) -> tresult {
+        kResultOk
+    }
+    unsafe fn getBusCount(&self, media_type: MediaType, dir: BusDirection) -> i32 {
+        synth_bus_count(media_type, dir)
+    }
+    unsafe fn getBusInfo(
+        &self,
+        media_type: MediaType,
+        dir: BusDirection,
+        index: i32,
+        bus: *mut BusInfo,
+    ) -> tresult {
+        synth_bus_info(media_type, dir, index, bus)
+    }
+    unsafe fn getRoutingInfo(&self, _i: *mut RoutingInfo, _o: *mut RoutingInfo) -> tresult {
+        kNotImplemented
+    }
+    unsafe fn activateBus(&self, _m: MediaType, _d: BusDirection, _i: i32, _s: TBool) -> tresult {
+        kResultOk
+    }
+    unsafe fn setActive(&self, _state: TBool) -> tresult {
+        kResultOk
+    }
+    unsafe fn setState(&self, stream: *mut IBStream) -> tresult {
+        self.apply_component_state(stream)
+    }
+    unsafe fn getState(&self, stream: *mut IBStream) -> tresult {
+        let Ok(state) = self.state.lock() else {
+            return kResultFalse;
+        };
+        let blob = encode_state(&state.params);
+        if stream_write_all(stream, &blob) {
+            kResultOk
+        } else {
+            kResultFalse
+        }
+    }
+}
+
+impl IAudioProcessorTrait for TestSynthSingle {
+    unsafe fn setBusArrangements(
+        &self,
+        _inputs: *mut SpeakerArrangement,
+        num_ins: i32,
+        outputs: *mut SpeakerArrangement,
+        num_outs: i32,
+    ) -> tresult {
+        if num_ins != 0 || num_outs != 1 || *outputs != SpeakerArr::kStereo {
+            return kResultFalse;
+        }
+        kResultTrue
+    }
+    unsafe fn getBusArrangement(
+        &self,
+        dir: BusDirection,
+        index: i32,
+        arr: *mut SpeakerArrangement,
+    ) -> tresult {
+        if dir as BusDirections == BusDirections_::kOutput && index == 0 {
+            *arr = SpeakerArr::kStereo;
+            kResultOk
+        } else {
+            kInvalidArgument
+        }
+    }
+    unsafe fn canProcessSampleSize(&self, size: i32) -> tresult {
+        match size as SymbolicSampleSizes {
+            SymbolicSampleSizes_::kSample32 => kResultOk,
+            _ => kNotImplemented,
+        }
+    }
+    unsafe fn getLatencySamples(&self) -> u32 {
+        0
+    }
+    unsafe fn setupProcessing(&self, setup: *mut ProcessSetup) -> tresult {
+        if let Ok(mut state) = self.state.lock() {
+            state.sample_rate = (*setup).sampleRate;
+            state.voices.clear();
+        }
+        kResultOk
+    }
+    unsafe fn setProcessing(&self, _state: TBool) -> tresult {
+        kResultOk
+    }
+    unsafe fn process(&self, data: *mut ProcessData) -> tresult {
+        process_synth_block(&self.state, &*data)
+    }
+    unsafe fn getTailSamples(&self) -> u32 {
+        0
+    }
+}
+
+impl IEditControllerTrait for TestSynthSingle {
+    unsafe fn setComponentState(&self, stream: *mut IBStream) -> tresult {
+        // A well-behaved host does not call this on a single-component plugin — the component
+        // it would be syncing *is* this object. Honoring it anyway (and counting it) is what
+        // makes a host that double-applies state visible from the outside.
+        self.apply_component_state(stream)
+    }
+    unsafe fn setState(&self, _stream: *mut IBStream) -> tresult {
+        // No controller-only state: everything lives in the component stream.
+        kNotImplemented
+    }
+    unsafe fn getState(&self, _stream: *mut IBStream) -> tresult {
+        kNotImplemented
+    }
+    unsafe fn getParameterCount(&self) -> i32 {
+        SINGLE_PARAM_COUNT
+    }
+    unsafe fn getParameterInfo(&self, index: i32, info: *mut ParameterInfo) -> tresult {
+        match index {
+            0..SINGLE_SYNTH_PARAM_COUNT => write_synth_parameter_info(index as u32, info),
+            i if i == SINGLE_SYNTH_PARAM_COUNT => {
+                write_probe_parameter_info(STATE_APPLY_PARAM_ID, "State Applies", info)
+            }
+            _ => kInvalidArgument,
+        }
+    }
+    unsafe fn getParamStringByValue(&self, id: u32, v: f64, s: *mut String128) -> tresult {
+        let text = match id {
+            id if id < SINGLE_SYNTH_PARAM_COUNT as u32 => format_param_value(id, v),
+            STATE_APPLY_PARAM_ID => format!("{}", (v * STATE_APPLY_SCALE).round()),
+            _ => return kNotImplemented,
+        };
+        copy_wstring(&text, &mut *s);
+        kResultOk
+    }
+    unsafe fn getParamValueByString(&self, _id: u32, _s: *mut TChar, _v: *mut f64) -> tresult {
+        kNotImplemented
+    }
+    unsafe fn normalizedParamToPlain(&self, _id: u32, v: f64) -> f64 {
+        v
+    }
+    unsafe fn plainParamToNormalized(&self, _id: u32, v: f64) -> f64 {
+        v
+    }
+    unsafe fn getParamNormalized(&self, id: u32) -> f64 {
+        if id == STATE_APPLY_PARAM_ID {
+            return (f64::from(self.state_applies.load(Ordering::Acquire)) / STATE_APPLY_SCALE)
+                .clamp(0.0, 1.0);
+        }
+        if id >= SINGLE_SYNTH_PARAM_COUNT as u32 {
+            return 0.0;
+        }
+        self.state
+            .lock()
+            .map(|state| state.params[id as usize])
+            .unwrap_or(0.0)
+    }
+    unsafe fn setParamNormalized(&self, id: u32, v: f64) -> tresult {
+        if id >= SINGLE_SYNTH_PARAM_COUNT as u32 {
+            return kResultFalse;
+        }
+        let Ok(mut state) = self.state.lock() else {
+            return kResultFalse;
+        };
+        state.set_param(id, v);
+        kResultOk
+    }
+    unsafe fn setComponentHandler(&self, _h: *mut IComponentHandler) -> tresult {
+        kResultOk
+    }
+    unsafe fn createView(&self, _name: *const c_char) -> *mut IPlugView {
+        ptr::null_mut()
+    }
+}
+
+struct TestSynthCompatibility;
+
+impl TestSynthCompatibility {
+    const CID: TUID = uid(0x54455354, 0x53594E54, 0x434F4D50, 0x00000001);
+}
+
+impl Class for TestSynthCompatibility {
+    type Interfaces = (IPluginCompatibility,);
+}
+
+impl IPluginCompatibilityTrait for TestSynthCompatibility {
+    unsafe fn getCompatibilityJSON(&self, stream: *mut IBStream) -> tresult {
+        // Array form is required by IPluginCompatibility. Comments and trailing commas prove
+        // the host takes the same bounded JSON5 path as moduleinfo.json.
+        let json = br#"[
+            {
+                "New": "5445535453594E5450524F4300000001",
+                "Old": [
+                    "4F4C44504C5547494E43494400000001",
+                ],
+            },
+        ]"#;
+        if stream_write_all(stream, json) {
+            kResultTrue
+        } else {
+            kResultFalse
+        }
     }
 }
 
@@ -1398,7 +2350,7 @@ impl IPluginFactoryTrait for Factory {
         kResultOk
     }
     unsafe fn countClasses(&self) -> i32 {
-        2
+        4
     }
     unsafe fn getClassInfo(&self, index: i32, info: *mut PClassInfo) -> tresult {
         let info = &mut *info;
@@ -1417,6 +2369,22 @@ impl IPluginFactoryTrait for Factory {
                 copy_cstring(PLUGIN_NAME, &mut info.name);
                 kResultOk
             }
+            2 => {
+                info.cid = TestSynthCompatibility::CID;
+                info.cardinality = 1;
+                copy_cstring("Plugin Compatibility Class", &mut info.category);
+                copy_cstring("TestSynth Compatibility", &mut info.name);
+                kResultOk
+            }
+            // The single-component variant deliberately comes last: a host that asks for no
+            // particular class must still get the dual-object synth at index 0.
+            3 => {
+                info.cid = TestSynthSingle::CID;
+                info.cardinality = PClassInfo_::ClassCardinality_::kManyInstances as i32;
+                copy_cstring("Audio Module Class", &mut info.category);
+                copy_cstring(SINGLE_PLUGIN_NAME, &mut info.name);
+                kResultOk
+            }
             _ => kInvalidArgument,
         }
     }
@@ -1427,16 +2395,36 @@ impl IPluginFactoryTrait for Factory {
         obj: *mut *mut c_void,
     ) -> tresult {
         let instance = match *(cid as *const TUID) {
-            TestSynthProcessor::CID => Some(
-                ComWrapper::new(TestSynthProcessor::new())
-                    .to_com_ptr::<FUnknown>()
-                    .unwrap(),
-            ),
+            TestSynthProcessor::CID => {
+                let wrapper = ComWrapper::new(TestSynthProcessor::new());
+                wrapper.processor_ptr.store(
+                    wrapper.as_com_ref::<IAudioProcessor>().unwrap().as_ptr(),
+                    Ordering::Release,
+                );
+                Some(wrapper.to_com_ptr::<FUnknown>().unwrap())
+            }
             TestSynthController::CID => Some(
                 ComWrapper::new(TestSynthController::new())
                     .to_com_ptr::<FUnknown>()
                     .unwrap(),
             ),
+            TestSynthSingle::CID => Some(
+                ComWrapper::new(TestSynthSingle::new())
+                    .to_com_ptr::<FUnknown>()
+                    .unwrap(),
+            ),
+            TestSynthCompatibility::CID => {
+                // This class intentionally refuses a generic FUnknown request: the host must
+                // instantiate it with the exact IPluginCompatibility IID.
+                if *(iid as *const TUID) != IPluginCompatibility_iid {
+                    return kNoInterface;
+                }
+                Some(
+                    ComWrapper::new(TestSynthCompatibility)
+                        .to_com_ptr::<FUnknown>()
+                        .unwrap(),
+                )
+            }
             _ => None,
         };
         if let Some(instance) = instance {

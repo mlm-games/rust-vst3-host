@@ -199,6 +199,31 @@ fn test_parameter_types() {
 }
 
 #[test]
+fn discrete_parameters_use_vst3_list_boundaries() {
+    let parameter = Parameter {
+        id: 9,
+        name: "Three-way".to_string(),
+        unit: String::new(),
+        value: 0.0,
+        min: 0.0,
+        max: 1.0,
+        default: 0.0,
+        step_count: 2,
+        can_automate: true,
+        is_read_only: false,
+        is_bypass: false,
+        flags: 0,
+    };
+
+    assert_eq!(parameter.step_index(0.0), Some(0));
+    assert_eq!(parameter.step_index(1.0 / 3.0 - f64::EPSILON), Some(0));
+    assert_eq!(parameter.step_index(1.0 / 3.0), Some(1));
+    assert_eq!(parameter.step_index(2.0 / 3.0 - f64::EPSILON), Some(1));
+    assert_eq!(parameter.step_index(2.0 / 3.0), Some(2));
+    assert_eq!(parameter.step_index(1.0), Some(2));
+}
+
+#[test]
 fn test_parameter_change() {
     let change = ParameterChange {
         id: 42,
