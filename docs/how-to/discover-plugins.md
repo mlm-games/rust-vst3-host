@@ -3,6 +3,10 @@
 Find VST3 plugins on the system. There are two ways, depending on whether you need
 metadata.
 
+For user-supplied or otherwise untrusted locations, prefer crash-resistant discovery. The
+metadata path loads native plugin code, and an ordinary in-process scan cannot contain a
+crash or bound a hang.
+
 ## List plugin paths (fast, no loading)
 
 `scan_plugin_paths()` walks the standard VST3 directories (plus any you add) and returns

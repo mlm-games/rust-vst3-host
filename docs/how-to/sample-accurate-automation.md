@@ -139,5 +139,5 @@ for (offset, value) in curve.points_for_block(block_start, frames, sr, 8) {
 - [`send_midi_event_at`](https://docs.rs/vst3-host/latest/vst3_host/plugin/struct.Plugin.html#method.send_midi_event_at)
   schedules a MIDI event at a sample offset within the next block — the MIDI counterpart to
   `set_parameter_at`. See [Send MIDI](send-midi.md).
-- The [`parameter_automation` example](https://github.com/Helge-Sverre/vst-host/blob/main/vst3-host/examples/parameter_automation.rs)
+- The [`parameter_automation` example](https://github.com/HelgeSverre/rust-vst3-host/blob/main/vst3-host/examples/parameter_automation.rs)
   drives several curve shapes against a live plugin.

@@ -24,6 +24,18 @@ Focused recipes. They assume you've done the getting-started tutorial.
 - [Monitor audio levels](how-to/monitor-audio-levels.md)
 - [Isolate plugin crashes](how-to/isolate-plugin-crashes.md)
 - [Use a custom audio backend](how-to/custom-audio-backend.md)
+- [Troubleshoot loading, audio, MIDI, and editors](how-to/troubleshoot.md)
+
+### Choose the right path
+
+| Goal | Start with | Why |
+| --- | --- | --- |
+| Hear a trusted synth quickly | [`simple::play`](how-to/play-a-plugin.md#the-quick-way) | Smallest setup; uses the default audio device. |
+| Host an effect on live input | [`simple::play_with_input`](how-to/play-a-plugin.md#effects-vs-instruments) | Opens input and output and routes input through the plugin. |
+| Avoid a control-thread lock in the audio callback | [`play_realtime`](how-to/realtime-playback.md) | Moves ownership to the audio thread and uses bounded queues. |
+| Render or route blocks yourself | [`process_audio`](how-to/custom-audio-backend.md#driving-the-plugin-yourself) | Full control without opening an audio device. |
+| Inspect unknown plugins safely | [Crash-resistant discovery](how-to/discover-plugins.md#crash-resistant-discovery) | A crashing probe does not terminate the scanner. |
+| Keep a loaded plugin outside your process | [Process isolation](how-to/isolate-plugin-crashes.md) | Contains crashes and bounds hangs, with IPC overhead. |
 
 ## Reference — look something up
 

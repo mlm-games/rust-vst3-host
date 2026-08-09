@@ -55,6 +55,10 @@ cargo run
 You should hear a chord. The program prints the plugin name, opens an audio stream, plays
 for a second, and exits.
 
+If it loads but stays silent, or fails while opening the device, follow
+[Troubleshoot loading, audio, MIDI, and editors](../how-to/troubleshoot.md). It separates
+plugin processing from audio-device setup so you can identify which layer failed.
+
 ## What just happened
 
 - `simple::load_plugin` loaded the plugin in-process and returned a [`Plugin`](https://docs.rs/vst3-host/latest/vst3_host/plugin/struct.Plugin.html).

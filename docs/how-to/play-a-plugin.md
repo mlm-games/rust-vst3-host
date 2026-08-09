@@ -3,6 +3,10 @@
 Drive a loaded plugin to the default audio output. Requires the `cpal-backend` feature
 (on by default).
 
+This is the friendly mutex-based path. Use [realtime playback](realtime-playback.md) when
+the audio callback must not wait on a control-thread lock. If loading succeeds but playback
+is silent, follow the [silent-playback checklist](troubleshoot.md#diagnose-silent-playback).
+
 ## The quick way
 
 ```rust

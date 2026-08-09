@@ -116,8 +116,12 @@ Only the in-process editor path reports resize requests.
   UI run loop — but that window is the helper's, not parented into yours, so you cannot embed
   it. On Windows and Linux, `open_editor` across the isolation boundary is not implemented
   and returns an error.
-- **Embedding is verified on macOS only.** `EmbeddedEditor` has Windows (child `HWND`) and
-  Linux/X11 (child window) implementations, but they are not yet verified; treat them as
-  experimental. On unsupported platforms `embed` returns an error.
+- **Embedding is verified interactively on macOS only.** `EmbeddedEditor` also has Windows
+  (child `HWND`) and Linux/X11 (child window) implementations, but those embedding paths are
+  not covered by the standalone-editor CI smoke tests; treat them as experimental. Wayland
+  and other unsupported window handles return an error.
 - **`get_editor_size` is a hint.** Some plugins report a size before the editor is open;
   fall back to a default (e.g. `400x300`) and let `take_editor_resize_request` correct it.
+
+If an editor fails to appear, use the
+[editor troubleshooting checklist](troubleshoot.md#diagnose-editor-failures).

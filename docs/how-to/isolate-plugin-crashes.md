@@ -84,7 +84,7 @@ if let Err(Error::PluginCrashed) = plugin.get_parameters() {
 ```
 
 The reloaded plugin starts from its default state — parameter values and any loaded preset
-are lost. Snapshot with [`save_state`](../how-to/control-parameters.md) beforehand and
+are lost. Snapshot with [`save_state`](save-and-restore-state.md) beforehand and
 `load_state` after recovering to preserve them. `Plugin::isolation_pid()` exposes the helper
 PID for monitoring.
 
@@ -101,3 +101,6 @@ PID for monitoring.
 
 See [Process isolation](../explanation/process-isolation.md) for how the IPC protocol
 works and why these limits exist.
+
+For helper lookup, timeout, and recovery diagnostics, see
+[Troubleshoot process-isolation failures](troubleshoot.md#diagnose-process-isolation-failures).
