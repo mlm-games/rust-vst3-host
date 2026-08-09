@@ -50,7 +50,7 @@ const MAX_TRACKED_NOTES: usize = 1024;
 /// whole backlog. The sibling of `MAX_QUEUED_EVENTS` on the MIDI side: pre-reserved so the audio
 /// path never reallocates, and changes past the cap are dropped (and counted).
 const MAX_PENDING_PARAM_CHANGES: usize = 4096;
-const MIDI_CONTROLLER_COUNT: usize = 130;
+const MIDI_CONTROLLER_COUNT: usize = ControllerNumbers_::kCtrlProgramChange as usize + 1;
 const MIDI_CHANNEL_COUNT: usize = 16;
 const MAX_OUTPUT_PARAMETER_FEEDBACK: usize = 4096;
 
@@ -2862,14 +2862,28 @@ impl PluginInternal for PluginImpl {
                     vst_event.__field0.polyPressure.pressure = pressure as f32 / 127.0;
                     vst_event.__field0.polyPressure.noteId = -1;
                 }
-                MidiEvent::ProgramChange { program, .. } => {
-                    // VST3 has no MIDI program-change event; a program change is routed to the
-                    // root unit's (id 0) program-change parameter via IUnitInfo. The MIDI
-                    // channel does not map cleanly to a VST3 unit, so we target the root unit
-                    // regardless of channel. select_program drives the controller + processor
-                    // queue itself, so we return directly rather than falling through to the
-                    // event-list add below.
+                MidiEvent::ProgramChange { channel, program } => {
+                    // Prefer the channel-aware IMidiMapping route. Multi-timbral instruments
+                    // commonly expose kCtrlProgramChange there without publishing their patch
+                    // banks through IUnitInfo (OsTIrus is one example).
                     self.service_control_thread_caches();
+                    let controller = ControllerNumbers_::kCtrlProgramChange as u16;
+                    if self
+                        .midi_mapping_cache
+                        .get(0, channel.as_index() as i16, controller)
+                        .is_some()
+                    {
+                        return self.queue_mapped_midi_controller(
+                            channel,
+                            controller,
+                            program as f64 / 127.0,
+                            sample_offset,
+                        );
+                    }
+
+                    // Otherwise use the root unit's IUnitInfo program-change parameter. A MIDI
+                    // channel cannot be mapped to a unit generically, so this compatibility path
+                    // targets the conventional root unit regardless of channel.
                     if let Some(mapping) = self.cached_program_change(0) {
                         let index = program as i32;
                         if index < mapping.program_count {
@@ -5327,7 +5341,7 @@ mod output_midi_tests {
 mod midi_mapping_cache_tests {
     use super::*;
 
-    /// The mapping table is `buses × 16 × 130` entries, so the bus count a plugin reports sizes
+    /// The mapping table is `buses × 16 × 131` entries, so the bus count a plugin reports sizes
     /// a host allocation. An implausible (or hostile) count must not be taken at face value.
     #[test]
     fn bus_count_is_clamped_to_a_sane_range() {
@@ -5335,6 +5349,21 @@ mod midi_mapping_cache_tests {
         assert_eq!(midi_mapping_bus_count(0), 0);
         assert_eq!(midi_mapping_bus_count(1), 1);
         assert_eq!(midi_mapping_bus_count(i32::MAX), MAX_MIDI_MAPPING_BUSES);
+    }
+
+    #[test]
+    fn mapping_table_includes_vst3_program_change_controller() {
+        let mut cache = MidiMappingCache {
+            buses: 1,
+            assignments: vec![None; MIDI_CHANNEL_COUNT * MIDI_CONTROLLER_COUNT],
+        };
+        let controller = ControllerNumbers_::kCtrlProgramChange as u16;
+        let index = cache
+            .index(0, MidiChannel::Ch16.as_index() as i16, controller)
+            .expect("program change must fit in the MIDI mapping table");
+        cache.assignments[index] = Some(42);
+
+        assert_eq!(cache.get(0, 15, controller), Some(42));
     }
 }
 
